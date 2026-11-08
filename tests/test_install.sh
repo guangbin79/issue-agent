@@ -520,6 +520,36 @@ assert_grep "$SAN/install.out" '拒绝覆盖'
 assert_grep "$FAKE_HOME/.config/repo-issue-agent/config.json" 'other-instance-repo'  # untouched
 assert_no "$STUB_STATE/curl.log"
 
+echo "== 16b. legacy config (no repo_path/canonical_path) + default-derived service -> update proceeds, schema migrated =="
+new_sandbox
+run_install
+python3 - "$FAKE_HOME/.config/repo-issue-agent/config.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p))
+for k in ("repo_path", "canonical_path"):
+    c.pop(k, None)
+json.dump(c, open(p, "w"))
+PY
+run_install
+assert_eq "$RC" "0" "legacy config in-place update exit code"
+python3 - "$FAKE_HOME/.config/repo-issue-agent/config.json" <<'PY' && ok "legacy config schema migrated on update" || fail "legacy config schema not migrated"
+import json, sys
+c = json.load(open(sys.argv[1]))
+assert c.get("repo_path", "").endswith("/repo"), c.get("repo_path")
+assert c.get("canonical_path", "").endswith("/repo"), c.get("canonical_path")
+PY
+
+echo "== 16c. legacy config + service name mismatched to canonical -> refuse =="
+new_sandbox
+mkdir -p "$FAKE_HOME/.config/repo-issue-agent" "$SAN/other-repo"
+printf '{"service_name": "repo-issue-agent", "project": "acme/repo", "port": 8642}
+' \
+  > "$FAKE_HOME/.config/repo-issue-agent/config.json"
+REPO="$SAN/other-repo" ISSUE_AGENT_SERVICE_NAME="repo-issue-agent" run_install
+assert_eq "$RC" "1" "legacy anti-clobber exit code"
+assert_grep "$SAN/install.out" '拒绝覆盖'
+
 echo "== 17. bare install never touches another instance's config =="
 new_sandbox
 SENTINEL="$FAKE_HOME/.config/other-svc-issue-agent/config.json"

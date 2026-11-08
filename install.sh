@@ -304,9 +304,6 @@ if actual != canonical:
 EOF
 )" || die "钉定路径校验执行失败（python3）"
 [ -z "$PIN_ERR" ] || die "$PIN_ERR"
-git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1 || die "不是 git 仓库：${REPO_PATH}"
-origin="$(git -C "$REPO_PATH" remote get-url origin 2>/dev/null || true)"
-[ -n "$origin" ] || die "仓库没有 origin remote：${REPO_PATH}"
 
 # service name: env > json > derived from the canonical path's basename,
 # lowercased + "-issue-agent" (the lowercase derivation is the core
@@ -320,12 +317,6 @@ else
   SERVICE_NAME="$(printf '%s' "${_BASE,,}" | tr -c 'a-z0-9._-' '-')-issue-agent"
 fi
 env_over_json ISSUE_AGENT_SERVICE_NAME "$SVC_JSON" service_name
-IDENTITY="${ISSUE_AGENT_IDENTITY:-${IDENT_JSON}}"
-env_over_json ISSUE_AGENT_IDENTITY "$IDENT_JSON" identity
-[ -n "$IDENTITY" ] || die "缺少必填项 identity：在 ${PROJ_JSON} 写 identity（项目一句话定位），或设 ISSUE_AGENT_IDENTITY"
-OUT_OF_SCOPE="${ISSUE_AGENT_OUT_OF_SCOPE:-${OOS_JSON}}"
-env_over_json ISSUE_AGENT_OUT_OF_SCOPE "$OOS_JSON" out_of_scope
-[ -n "$OUT_OF_SCOPE" ] || die "缺少必填项 out_of_scope：在 ${PROJ_JSON} 写 out_of_scope（范围外事项列表），或设 ISSUE_AGENT_OUT_OF_SCOPE（逗号分隔）"
 SNAPSHOT_DIR="${HOME}/.local/lib/${SERVICE_NAME}"
 CONFIG_DIR="${HOME}/.config/${SERVICE_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
@@ -350,13 +341,37 @@ VERIFY_COMMAND="${VERIFY_JSON}"
 if [ -f "$CONFIG_FILE" ]; then
   OLD_REPO="$(config_file="$CONFIG_FILE" python3 - <<'EOF'
 import json, os
-print(json.load(open(os.environ["config_file"]))["repo_path"])
+cfg = json.load(open(os.environ["config_file"]))
+print(cfg.get("repo_path") or cfg.get("canonical_path") or "")
 EOF
   )" || die "已存在配置无法解析，拒绝覆盖：${CONFIG_FILE}"
-  OLD_REAL="$(repo_path="$OLD_REPO" python3 -c 'import os; print(os.path.realpath(os.environ["repo_path"]))')"
-  CANONICAL_REAL="$(canonical="$CANONICAL" python3 -c 'import os; print(os.path.realpath(os.environ["canonical"]))')"
-  [ "$OLD_REAL" = "$CANONICAL_REAL" ] || die "已存在配置 ${CONFIG_FILE} 指向其它仓库（${OLD_REPO}）而非钉定目录 ${CANONICAL}——拒绝覆盖另一实例"
+  if [ -z "$OLD_REPO" ]; then
+    # legacy schema (only "project"): ownership unreadable offline — trust
+    # only the canonical's default-derived service name.
+    _BASE="$(basename "${CANONICAL%/}")"
+    DERIVED="$(printf '%s' "${_BASE,,}" | tr -c 'a-z0-9._-' '-')-issue-agent"
+    [ "$SERVICE_NAME" = "$DERIVED" ] || die "legacy config 缺 repo_path/canonical_path 且 SERVICE_NAME（${SERVICE_NAME}）非该 canonical 默认派生（${DERIVED}）——无法离线确认归属，拒绝覆盖：${CONFIG_FILE}"
+  else
+    OLD_REAL="$(repo_path="$OLD_REPO" python3 -c 'import os; print(os.path.realpath(os.environ["repo_path"]))')"
+    CANONICAL_REAL="$(canonical="$CANONICAL" python3 -c 'import os; print(os.path.realpath(os.environ["canonical"]))')"
+    [ "$OLD_REAL" = "$CANONICAL_REAL" ] || die "已存在配置 ${CONFIG_FILE} 指向其它仓库（${OLD_REPO}）而非钉定目录 ${CANONICAL}——拒绝覆盖另一实例"
+  fi
 fi
+
+# identity/out_of_scope validation sits below guard b: a legacy-schema
+# config must get the anti-clobber verdict before required-field errors.
+IDENTITY="${ISSUE_AGENT_IDENTITY:-${IDENT_JSON}}"
+env_over_json ISSUE_AGENT_IDENTITY "$IDENT_JSON" identity
+[ -n "$IDENTITY" ] || die "缺少必填项 identity：在 ${PROJ_JSON} 写 identity（项目一句话定位），或设 ISSUE_AGENT_IDENTITY"
+OUT_OF_SCOPE="${ISSUE_AGENT_OUT_OF_SCOPE:-${OOS_JSON}}"
+env_over_json ISSUE_AGENT_OUT_OF_SCOPE "$OOS_JSON" out_of_scope
+[ -n "$OUT_OF_SCOPE" ] || die "缺少必填项 out_of_scope：在 ${PROJ_JSON} 写 out_of_scope（范围外事项列表），或设 ISSUE_AGENT_OUT_OF_SCOPE（逗号分隔）"
+
+# repo validation sits below guard b: the legacy-schema anti-clobber branch
+# must get the chance to refuse before the target repo is validated at all.
+git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1 || die "不是 git 仓库：${REPO_PATH}"
+origin="$(git -C "$REPO_PATH" remote get-url origin 2>/dev/null || true)"
+[ -n "$origin" ] || die "仓库没有 origin remote：${REPO_PATH}"
 
 # TLS opt-out (F1): default -k (harmless on the plain-HTTP LAN Gitea, and
 # keeps self-signed https Giteas working); a CA bundle switches every curl
