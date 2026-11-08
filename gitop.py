@@ -1,0 +1,499 @@
+"""Issue-agent git operations — the daemon's thin guarantee layer.
+
+Per the delegated-worktree architecture the daemon NEVER creates, checks
+out, or manages any worktree: the opencode agent inside each turn does all
+of that in its own worktree (per its global rules). The daemon's git
+surface is exactly:
+
+- fetch_base: refresh refs/remotes/agent-remote/<default> IN the main repo
+  (forced refspec, no checkout, no working-copy contact) — the baseline the
+  agent branches from and the daemon compares against
+- has_new_commits_vs_ref: detect commits the agent landed on issue/<iid>-fix
+- push_fix_branch: push that branch (and nothing else) to the remote
+- fix_branch_pushed: read-only tip-equality probe (the repost precondition)
+- tracked_dirty: post-turn observability probe — did the agent illegally
+  modify the main working copy?
+- knowledge_changes_present: read-only diff probe — did the fix branch
+  touch docs/agents/knowledge/ (post-turn capture verification)?
+- prune_worktrees: best-effort stale-registration cleanup at startup
+- sweep_idle_review_worktrees: startup-only sweep of idle leftover review
+  worktrees (plain `git worktree remove`, never --force — git's own
+  dirty/untracked check is the gate; refusals come back as "kept").
+  Startup-only use, mandate relaxation user-approved 2026-10-09; scan
+  root = parent(config.repo_path), never touches ~/.dotfiles or anything
+  outside that parent
+
+Safety contract:
+- push accepts exactly one refspec shape, issue/<iid>-fix:issue/<iid>-fix;
+  anything else (notably any default-branch refspec) raises RefspecViolation
+  before a single git byte is executed
+- force pushes go only through push_fix_branch_resilient: plain push first;
+  on a non-fast-forward rejection (a later round rebased the branch onto a
+  moved baseline — the merge-time-rebase flow, issue#38) retry ONCE with
+  --force-with-lease anchored at the observed remote tip, and only after a
+  range-diff orphan check proves the rewrite lost no old-chain commit; any
+  uncertainty re-raises the original PushFailed (blocked + human note path
+  unchanged)
+- the remote URL carries the credentials (https://{user}:{PAT}@host/...); the
+  credential never reaches a git argv: fetch/push rewrite the URL without
+  userinfo and feed the PAT to git via a 0700 GIT_ASKPASS helper reading
+  the process env (only the owner can read /proc/<pid>/environ, unlike
+  the world-readable /proc/<pid>/cmdline); every message this module
+  raises is additionally scrubbed so the PAT never leaks
+
+The remote is always addressed by its explicit URL (never a named remote), so
+fetch/push hit exactly the URL the caller vetted. Every default-branch
+reference goes through a *default_branch* parameter (config-derived;
+"master" when unset).
+"""
+
+import atexit
+import os
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import NamedTuple, Union
+from urllib.parse import urlparse, urlunparse
+
+PathLike = Union[str, "os.PathLike[str]"]
+
+_REFSPEC_OK = re.compile(r"^issue/(\d+)-fix:issue/\1-fix$")
+
+_REVIEW_BRANCH_OK = re.compile(r"^refs/heads/issue/\d+-fix$")
+
+
+class GitopError(Exception):
+    """Any git failure; the message is always PAT-scrubbed."""
+
+
+class PushFailed(GitopError):
+    """Pushing the fix branch failed: orchestrator blocks and asks for help."""
+
+
+class RefspecViolation(GitopError):
+    """Refspec outside the issue/<iid>-fix whitelist (e.g. a default-branch refspec)."""
+
+
+def _scrub(text: str, remote_url: str) -> str:
+    """Replace credential material embedded in remote_url with ***."""
+    parsed = urlparse(remote_url)
+    if parsed.password:
+        secrets = [parsed.password]
+        if parsed.username:
+            secrets.append(f"{parsed.username}:{parsed.password}@")
+        for secret in secrets:
+            text = text.replace(secret, "***")
+    return text
+
+
+def _run(cmd, cwd, env=None):
+    """Run git with an explicit argv list; module-level so tests can swap it.
+
+    *env* (optional) carries extra variables (GIT_ASKPASS credential feed).
+    """
+    full_env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    if env:
+        full_env.update(env)
+    return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
+                         env=full_env)
+
+
+def _git(repo: PathLike, args, remote_url: str = None, env=None) -> str:
+    """Run a git subcommand; raise GitopError (scrubbed) on non-zero exit."""
+    proc = _run(["git", "-C", str(repo), *args], cwd=repo, env=env)
+    if proc.returncode != 0:
+        message = "git {} failed: {}".format(
+            " ".join(args), (proc.stderr or proc.stdout).strip()
+        )
+        if remote_url:
+            message = _scrub(message, remote_url)
+        raise GitopError(message)
+    return proc.stdout
+
+
+def _ssl_args(remote_url: str, ssl_verify: bool):
+    """http.sslVerify flag, only meaningful (and only injected) for http(s)."""
+    if remote_url.startswith(("http://", "https://")):
+        return ["-c", "http.sslVerify={}".format(str(bool(ssl_verify)).lower())]
+    return []
+
+
+_ASKPASS_PASSWORD_ENV = "UIA_GIT_PAT"
+_ASKPASS_USER_ENV = "UIA_GIT_USER"
+_askpass_path = None
+
+
+def _unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _askpass_helper() -> str:
+    """0700 helper script answering git's credential prompts from the
+    (owner-only) process env; created once per process (F14)."""
+    global _askpass_path
+    if _askpass_path is None:
+        fd, path = tempfile.mkstemp(prefix="issue-agent-askpass-", suffix=".sh")
+        with os.fdopen(fd, "w") as fh:
+            fh.write('#!/bin/sh\n'
+                      'case "$1" in\n'
+                      '  *Username*) echo "${UIA_GIT_USER:-git}" ;;\n'
+                      '  *) echo "$UIA_GIT_PAT" ;;\n'
+                      'esac\n')
+        os.chmod(path, 0o700)
+        atexit.register(_unlink_quiet, path)
+        _askpass_path = path
+    return _askpass_path
+
+
+def _net_env(remote_url: str):
+    """(env, clean_url) for a URL that may embed credentials (F14).
+
+    The credential-free URL goes onto the git argv; the PAT travels in
+    the subprocess env for GIT_ASKPASS, which only the owning user can
+    read. URLs without credentials pass through unchanged; a username
+    WITHOUT a password (token-as-username form) is refused — passing it
+    through would put the credential on the git argv.
+    """
+    parsed = urlparse(remote_url)
+    if parsed.username and parsed.password is None:
+        raise GitopError(
+            "remote URL embeds a username without a password "
+            "(token-as-username form); refusing to pass the credential "
+            "on the git argv")
+    if parsed.password is None:
+        return None, remote_url
+    env = {
+        "GIT_ASKPASS": _askpass_helper(),
+        _ASKPASS_PASSWORD_ENV: parsed.password,
+    }
+    if parsed.username:
+        env[_ASKPASS_USER_ENV] = parsed.username
+    netloc = parsed.netloc
+    at = netloc.rfind("@")
+    clean_netloc = netloc[at + 1:] if at != -1 else netloc
+    clean_url = urlunparse(parsed._replace(netloc=clean_netloc))
+    return env, clean_url
+
+
+def _branch_exists(repo: PathLike, branch: str) -> bool:
+    proc = _run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+         f"refs/heads/{branch}"],
+        cwd=repo,
+    )
+    return proc.returncode == 0
+
+
+def fix_branch(iid) -> str:
+    return f"issue/{iid}-fix"
+
+
+# --- the daemon's turn-path guarantee layer -----------------------------------
+
+AGENT_REMOTE_NS = "refs/remotes/agent-remote"
+
+
+def agent_tracking_ref(default_branch: str) -> str:
+    """Dedicated tracking ref for the turn baseline (never origin/*)."""
+    return f"{AGENT_REMOTE_NS}/{default_branch}"
+
+
+def fetch_base(main_repo: PathLike, remote_url: str,
+               default_branch: str = "master",
+               ssl_verify: bool = True) -> None:
+    """Refresh the agent-remote baseline ref, IN the main repo.
+
+    Fetch only: `+refs/heads/<default>:refs/remotes/agent-remote/<default>`
+    — no checkout, no worktree, no working-copy contact, and the forced
+    refspec means the baseline can never diverge. The agent branches
+    issue/<iid>-fix off this ref in its OWN worktree; has_new_commits_vs_ref
+    compares against it after the turn.
+    """
+    env, clean_url = _net_env(remote_url)
+    _git(main_repo,
+         [*_ssl_args(remote_url, ssl_verify), "fetch", clean_url,
+          f"+refs/heads/{default_branch}:{agent_tracking_ref(default_branch)}"],
+         remote_url=remote_url, env=env)
+
+
+def prune_worktrees(main_repo: PathLike) -> None:
+    """`git worktree prune` in the main repo: clear stale registrations the
+    agent may have left by deleting its worktree dir out-of-band. The daemon
+    itself creates no worktree; this is cheap startup hygiene only."""
+    _git(main_repo, ["worktree", "prune"])
+
+
+class SweepReport(NamedTuple):
+    """Startup sweep outcome: removed = worktrees successfully removed;
+    kept = candidates git refused (dirty/untracked — left in place, the
+    list is journalable); refused = candidates skipped WITHOUT attempting
+    removal because a live process cwd sits inside (occupied)."""
+
+    removed: list
+    kept: list
+    refused: list
+
+
+def _cwd_occupied(target: PathLike) -> bool:
+    """True when any live process has its cwd at/inside *target*.
+
+    Read-only /proc scan; prefix match with a trailing-slash boundary
+    (a cwd of <target>/sub counts as inside). Purely observational —
+    the sweep's cwd_probe parameter exists for test injection."""
+    target = os.path.normpath(str(target))
+    prefix = target + os.sep
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return False
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue
+        cwd = os.path.normpath(cwd)
+        if cwd == target or cwd.startswith(prefix):
+            return True
+    return False
+
+
+def _worktree_entries(main_repo: PathLike):
+    """(path, branch-or-None) per registered worktree; None = detached HEAD."""
+    out = _git(main_repo, ["worktree", "list", "--porcelain"])
+    entries = []
+    path = branch = None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path, branch = line[len("worktree "):], None
+        elif line.startswith("branch "):
+            branch = line[len("branch "):]
+        elif not line and path is not None:
+            entries.append((path, branch))
+            path = branch = None
+    if path is not None:
+        entries.append((path, branch))
+    return entries
+
+
+def sweep_idle_review_worktrees(main_repo: PathLike,
+                                cwd_probe=None) -> SweepReport:
+    """Remove idle leftover review worktrees; startup-only, never --force.
+
+    A candidate must be a REGISTERED worktree that is (1) not the main
+    repo, (2) a sibling of it (parent(main_repo)), (3) named
+    <main_repo>__wt-*, (4) checked out on issue/<iid>-fix (detached HEAD
+    is never a candidate), and (5) unoccupied per cwd_probe — probed
+    immediately before each removal (TOCTOU guard). Removal is plain
+    `git worktree remove`: git's own dirty/untracked check is the dirty
+    gate, refusals land in kept. Enumeration failure raises GitopError;
+    the daemon caller wraps in try/except like prune_worktrees.
+    """
+    if cwd_probe is None:
+        cwd_probe = _cwd_occupied
+    report = SweepReport([], [], [])
+    main_path = Path(os.path.abspath(str(main_repo)))
+    prefix = f"{main_path.name}__wt-"
+    for entry_path, branch in _worktree_entries(main_repo):
+        path = Path(entry_path)
+        if (path == main_path
+                or path.parent != main_path.parent
+                or not path.name.startswith(prefix)
+                or branch is None
+                or not _REVIEW_BRANCH_OK.match(branch)):
+            continue
+        if cwd_probe(entry_path):
+            report.refused.append(entry_path)
+            continue
+        try:
+            _git(main_repo, ["worktree", "remove", entry_path])
+        except GitopError:
+            report.kept.append(entry_path)
+        else:
+            report.removed.append(entry_path)
+    return report
+
+
+def tracked_dirty(repo: PathLike) -> bool:
+    """True when the repo has tracked local changes (untracked files are
+    ignored). Post-turn observability for the main copy: a True result means
+    the agent violated the protocol by editing it."""
+    return bool(_git(repo, ["status", "--porcelain", "--untracked-files=no"]).strip())
+
+
+def has_new_commits_vs_ref(repo: PathLike, iid, base_ref: str) -> bool:
+    """True when issue/<iid>-fix holds commits beyond *base_ref* (the
+    agent-remote ref fetch_base keeps fresh, not a stale local branch)."""
+    branch = fix_branch(iid)
+    if not _branch_exists(repo, branch):
+        return False
+    count = _git(repo, ["rev-list", "--count", f"{base_ref}..{branch}"]).strip()
+    return int(count) > 0
+
+
+def knowledge_changes_present(repo: PathLike, iid, base_ref: str) -> bool:
+    """True when the fix branch's branch-side changes since the merge-base
+    with *base_ref* touch docs/agents/knowledge/ — the post-turn capture
+    verification probe (read-only; a GitopError is left to the caller to
+    swallow as a journal warning). Three-dot range: knowledge files that
+    entered the base side (another issue's ingest merged in the meantime)
+    must not count as this branch's capture."""
+    branch = fix_branch(iid)
+    if not _branch_exists(repo, branch):
+        return False
+    changed = _git(repo, ["diff", "--name-only", f"{base_ref}...{branch}",
+                          "--", "docs/agents/knowledge/"])
+    return bool(changed.strip())
+
+
+def push(repo: PathLike, remote_url: str, refspec: str, ssl_verify: bool = True,
+         force_with_lease: str = "") -> None:
+    """Push to the explicit URL, restricted to the fix-branch refspec shape.
+
+    Any other refspec (in particular anything targeting the default
+    branch) raises RefspecViolation before git is invoked.
+
+    force_with_lease (optional) = "<branch>:<expected-remote-tip-sha>":
+    emits --force-with-lease so the update lands only if the remote is
+    still at the observed tip (never blind-overwrites a moved branch).
+    The branch part must match the whitelisted refspec shape; the tip
+    must be a full hex sha.
+    """
+    if not isinstance(refspec, str) or not _REFSPEC_OK.match(refspec):
+        raise RefspecViolation(
+            f"refspec {refspec!r} outside issue/<iid>-fix whitelist"
+        )
+    env, clean_url = _net_env(remote_url)
+    argv = ["git", "-C", str(repo), *_ssl_args(remote_url, ssl_verify),
+            "push"]
+    if force_with_lease:
+        lease_branch, _, lease_tip = force_with_lease.partition(":")
+        if not _REFSPEC_OK.match(lease_branch + ":" + lease_branch) \
+                or not re.fullmatch(r"[0-9a-f]{40}", lease_tip or ""):
+            raise RefspecViolation(
+                _scrub(f"force-with-lease {force_with_lease[:200]!r} "
+                       "outside whitelist/sha", remote_url)
+            )
+        argv.append("--force-with-lease=" + force_with_lease)
+    argv += [clean_url, refspec]
+    proc = _run(argv, cwd=repo, env=env)
+    if proc.returncode != 0:
+        raise PushFailed(
+            _scrub(
+                "push {} failed: {}".format(refspec, (proc.stderr or proc.stdout).strip()),
+                remote_url,
+            )
+        )
+
+
+def remote_branch_tip(repo: PathLike, remote_url: str, branch: str,
+                      ssl_verify: bool = True) -> str:
+    """Current tip of refs/heads/<branch> on the remote ('' when absent).
+
+    ls-remote failure (network/auth) raises GitopError — an empty result
+    means the branch is absent, not that the query failed (A-F1/B-F2).
+    """
+    env, clean_url = _net_env(remote_url)
+    ls = _run(["git", "-C", str(repo), *_ssl_args(remote_url, ssl_verify),
+               "ls-remote", clean_url, f"refs/heads/{branch}"],
+              cwd=repo, env=env)
+    if ls.returncode != 0:
+        raise GitopError(
+            _scrub("ls-remote {} failed: {}".format(
+                branch, (ls.stderr or ls.stdout).strip()), remote_url)
+        )
+    return ls.stdout.split()[0] if ls.stdout.strip() else ""
+
+
+def fix_branch_pushed(repo: PathLike, iid, remote_url: str,
+                      ssl_verify: bool = True) -> bool:
+    """True when the local issue/<iid>-fix tip is already on the remote.
+
+    The 「重发汇报」 precondition: the fix work is verifiably landed, so a
+    repost never needs to push. A missing local branch raises GitopError
+    (rev-parse --verify, existing semantics); a missing remote branch is a
+    plain False (never pushed); an ls-remote failure raises — a failed
+    query is never misread as "not pushed".
+    """
+    branch = fix_branch(iid)
+    local_tip = _git(repo, ["rev-parse", "--verify",
+                            f"refs/heads/{branch}"]).strip()
+    remote_tip = remote_branch_tip(repo, remote_url, branch, ssl_verify)
+    return bool(remote_tip) and local_tip == remote_tip
+
+
+def rebase_safe_to_force(repo: PathLike, branch: str, remote_tip: str,
+                         local_tip: str) -> tuple:
+    """True when rewriting remote <branch> to <local_tip> loses nothing.
+
+    Range-diff orphan check (issue#38): every commit of the pushed chain
+    (remote_tip, minus commits already in local via the moved baseline)
+    must have a counterpart (= or !) in the rewritten chain. Context drift
+    across upstream changes is expected and allowed; a lost commit is not.
+    Returns (ok, reason).
+    """
+    mb = _git(repo, ["merge-base", local_tip, remote_tip]).strip()
+    if mb == remote_tip:
+        # 远端侧为空 range：远端 tip 是本地 tip 的祖先，强推不丢任何提交
+        return True, "remote tip is ancestor of local tip"
+    if mb == local_tip:
+        # 本地严格落后远端：强推会抹掉远端独有提交（B-F1 空 range 崩溃场景）
+        return False, "local is behind remote; forcing would erase remote commits"
+    rd = _git(repo, ["range-diff", f"{mb}..{remote_tip}", f"{mb}..{local_tip}"])
+    for line in rd.splitlines():
+        # 行首锚定（B-F3）：孤儿行结构恒为 `N: <sha> < -: --------`，
+        # 配对行内主题引用 range-diff 文本不得误触发
+        if re.match(r"\s*\d+:\s*\S+\s*<\s*-+:\s*-", line):
+            return False, "old-chain commit lost in rewrite: " + line.strip()[:100]
+    return True, "range-diff: no old-chain commit lost"
+
+
+def push_fix_branch_resilient(repo: PathLike, iid, remote_url: str,
+                              ssl_verify: bool = True) -> str:
+    """push_fix_branch with a guarded rescue for the rebase blind spot.
+
+    Plain push first. On a non-fast-forward rejection — the signature of a
+    later round rebasing issue/<iid>-fix onto a moved baseline (the
+    merge-time-rebase flow) — verify the rewrite via rebase_safe_to_force
+    against the observed remote tip and retry ONCE with --force-with-lease.
+    Anything uncertain re-raises the original PushFailed (blocked + human
+    note). Returns "pushed" | "force-pushed".
+    """
+    try:
+        push_fix_branch(repo, iid, remote_url, ssl_verify)
+        return "pushed"
+    except PushFailed as exc:
+        if "non-fast-forward" not in str(exc):
+            raise
+    branch = fix_branch(iid)
+    local_tip = _git(repo, ["rev-parse", f"refs/heads/{branch}"]).strip()
+    remote_tip = remote_branch_tip(repo, remote_url, branch, ssl_verify)
+    if not remote_tip:
+        raise PushFailed(
+            _scrub("non-fast-forward but remote tip vanished; refusing "
+                   "force push", remote_url)
+        )
+    ok, reason = rebase_safe_to_force(repo, branch, remote_tip, local_tip)
+    if not ok:
+        raise PushFailed(
+            _scrub(f"rewrite unsafe, refusing force push: {reason}", remote_url)
+        )
+    push(repo, remote_url, f"{branch}:{branch}", ssl_verify,
+         force_with_lease=f"{branch}:{remote_tip}")
+    return "force-pushed"
+
+
+def push_fix_branch(repo: PathLike, iid, remote_url: str,
+                    ssl_verify: bool = True) -> None:
+    """Push issue/<iid>-fix and nothing else, to the explicit remote URL.
+
+    Safe to call from the main repo even while the branch is checked out
+    in the agent's worktree: pushing FROM a repository never touches any
+    working copy, and refs are shared across worktrees.
+    """
+    push(repo, remote_url, f"{fix_branch(iid)}:{fix_branch(iid)}", ssl_verify)
