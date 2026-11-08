@@ -1,6 +1,6 @@
 # issue-agent 部署与运维指南（共享基础设施实例，Gitea + opencode 自动修码）
 
-> 共享代码源在 `~/.dotfiles/.agent/issue-agent/`；每个项目写一份 `.issue-agent.json` 后用 `install.sh <project-path>` 一条命令接入。按本文配置即得：
+> 共享代码源在 `~/issue-agent`（独立仓，提取自 guangbin79/dotfiles）；每个项目写一份 `.issue-agent.json` 后用 `install.sh <project-path>` 一条命令接入。按本文配置即得：
 > **新 issue → ~1s 认领 → opencode 在 `issue/N-fix` 分支修码推送 → 在 issue 评论里与你多轮对话 → 推送后自动 `/review-loop` 评审（Trivial 修复自动续推）**；范围外 issue 自动拒收；评论「暂停/恢复」交接；TUI 随时接管；人工合并仍是终审。
 
 ## 1. 架构一览
@@ -69,7 +69,7 @@ loginctl show-user "$USER" -p Linger  # 期望 Linger=yes
 
 ### ④ 安装（两种方式）
 ```bash
-cd ~/.dotfiles/.agent/issue-agent
+cd ~/issue-agent
 bash install.sh                        # 交互式：依次问 API地址/PAT/仓库路径/回调URL
 # 或非交互（CI/e2e 用）：
 ISSUE_AGENT_SERVICE_NAME=<service>-issue-agent \

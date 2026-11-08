@@ -26,7 +26,7 @@
 # echoed, never logged, never on a curl argv (sent via a 0600 -H @file as
 # "Authorization: token <PAT>"). The git push URL is built from config as
 # =============================================================================
-# issue-agent installer — shared infrastructure (~/.dotfiles/.agent/issue-agent)
+# issue-agent installer — shared infrastructure (standalone repo ~/issue-agent; extracted from guangbin79/dotfiles)
 # =============================================================================
 # 用法 / usage:
 #   install.sh [project-path]

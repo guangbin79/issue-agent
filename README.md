@@ -9,7 +9,7 @@ Gitea issue → 自动拉起 opencode 在 `issue/<number>-fix` 分支修复 → 
 项目接入（在项目根写 `.issue-agent.json` 后）：
 
 ```bash
-bash ~/.dotfiles/.agent/issue-agent/install.sh /path/to/<project>
+bash ~/issue-agent/install.sh /path/to/<project>
 ```
 
 非交互（e2e/自动化；环境变量覆盖全部输入，缺哪项提示哪项）。完整环境组合示例：
@@ -20,7 +20,7 @@ ISSUE_AGENT_PORT=<port> \
 ISSUE_AGENT_DEFAULT_BRANCH=<default-branch> \
 ISSUE_AGENT_API_BASE=http://<gitea-host>:3000 \
 ISSUE_AGENT_CALLBACK_URL=http://<本机IP>:<port> \
-bash ~/.dotfiles/.agent/issue-agent/install.sh /path/to/<project>
+bash ~/issue-agent/install.sh /path/to/<project>
 ```
 
 `ISSUE_AGENT_PAT` 经环境变量传入或在交互提示下输入（不回显），**绝不出现在命令行参数上**——脚本只以静默方式读取并写入 0600 配置。
