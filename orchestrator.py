@@ -71,10 +71,8 @@ DEFAULT_SWEEP_INTERVAL_S = 1800  # 0 = off: 欠账巡检 (debt sweep) cadence
 # most this many sweeps before the flag clears (retry window for a missing
 # report / failed push probe: two sweeps, then journal + give up).
 MAX_REPORT_PROBES = 2
-# ag-21ea9f B4: steady-state reconcile pulls comments incrementally. The
-# since store holds the moment of the last successful fetch; each pull
-# rewinds it by the reconcile cadence + margin. Overlap is harmless —
-# replayed notes are deduped by is_note_processed before any fsm feed.
+# ag-21ea9f B4: steady-state reconcile pulls since the last success minus
+# this margin; the overlap is deduped by is_note_processed (harmless).
 RECONCILE_SINCE_OVERLAP_S = 660  # 600s reconcile cadence + 60s margin
 
 # Global experience-draft store (the agent-experience capture flow the
@@ -244,8 +242,7 @@ class Orchestrator:
         self._sweep_path = os.fspath(state_path) + ".sweep.json"
         self._sweep_guard = threading.Lock()
         self._sweep_thread = None
-        # ag-21ea9f B4: orchestrator-owned since store beside the ledger
-        # (same pattern as _sweep_path; state.py's schema stays frozen).
+        # ag-21ea9f B4: orchestrator-owned store beside the ledger (as _sweep_path).
         self._since_path = os.fspath(state_path) + ".since.json"
         self.callback_url = callback_url
         self._teardown = teardown
@@ -679,9 +676,8 @@ class Orchestrator:
                     # transient: the turn result stays in the ledger, reply deferred
                     self._defer(iid, result.session_id or session_id)
                     return
-                # B6: 协议第 0 步「范围外」判定 → 评论已投递后关单。fail-open：
-                # 关单失败只 journal 不上抛——回复送达优先，不因关单炸掉回合。
-                # 判定取一次共用（置位面下方同用），两处口径恒一致。
+                # B6: 「范围外」判定（out_of_scope，与置位面同口径）→ 评论已
+                # 投递后关单；fail-open 只 journal，回复送达优先。
                 out_of_scope = reply.lstrip().startswith("范围外")
                 if out_of_scope:
                     try:
@@ -691,8 +687,7 @@ class Orchestrator:
                             f"warning: issue#{iid} out-of-scope close failed: {exc!r}")
                 # ag-a9af5e 置位面（唯一）：回复上墙了但不是三段式汇报——
                 # 回合可能收队于汇报产出前，交给 sweep 预算内探测补发。
-                # 「范围外」开头是协议第 0 步的合法无汇报回复，不欠汇报
-                # （与上方关单判定同口径）。
+                # 「范围外」开头是协议第 0 步的合法无汇报回复，不欠汇报。
                 if (result.session_id and not runner.is_report(reply)
                         and not out_of_scope):
                     self._arm_report_probe(iid)
@@ -1219,9 +1214,8 @@ class Orchestrator:
         前置不满足/墙读失败＝非真探测：只 journal 并退还预算；未命中/瞬态
         失败预算内不清旗，预算耗尽则锁内清旗；送达或在墙立即锁内清旗。"""
         if not session_id:
-            # B7: 前置放宽为仅 session——报告补投不依赖分支推送/评审环状态
-            # （包裹外回合 server 侧续跑产报告不再被卡死；ag-92d1a0 的不烧
-            # 预算语义保持：前置不满足＝零成本退还待下轮）
+            # B7: 前置仅 session——补投不依赖推送/评审环状态（包裹外回合产
+            # 报告不再被卡死）；不烧预算语义保持（ag-92d1a0，零成本退还）。
             self._journal(f"probe: issue#{iid} precondition unmet "
                           f"(session={bool(session_id)}) — budget held")
             return self._probe_unburn(iid, count)
@@ -1591,10 +1585,8 @@ class Orchestrator:
                                  "（评审会话晚到提交已推送）。")
 
     def _since_iso_load(self):
-        """B4: the steady-state pull window — the stored last-success moment
-        minus RECONCILE_SINCE_OVERLAP_S, as ISO8601 UTC. A missing/corrupt
-        store journals and falls back to None (one full pull; the next
-        success rewrites the store)."""
+        """B4: steady-state pull window = stored moment − OVERLAP, ISO8601
+        UTC; a missing/corrupt store journals and returns None (full pull)."""
         try:
             with open(self._since_path, encoding="utf-8") as fh:
                 stored = datetime.fromisoformat(json.load(fh))
@@ -1604,10 +1596,8 @@ class Orchestrator:
         return (stored - timedelta(seconds=RECONCILE_SINCE_OVERLAP_S)).isoformat()
 
     def _since_store_save(self, moment):
-        """Atomic tmp+fsync+rename, state.py's write pattern. The tmp name
-        is writer-unique: reconcile passes can overlap (the worker-loop
-        pacing claim is not a full mutex), and a shared tmp name would let
-        one pass's os.replace crash the other's or interleave the bytes."""
+        """Atomic tmp+fsync+rename (state.py's pattern); writer-unique tmp
+        name — overlapping reconcile passes must not crash/interleave."""
         tmp = f"{self._since_path}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(moment.isoformat(), fh)
@@ -1630,9 +1620,7 @@ class Orchestrator:
         with self._ledger_lock:
             baselined = state.load_state(
                 self.state_path, warn=self._journal).get("baselined") is True
-        # B4: steady state pulls incrementally since the last success (minus
-        # overlap); the first run stays a full pull — the baseline snapshot
-        # must be complete, or old notes would replay as new events later.
+        # B4: 稳态增量拉取；首跑保持全量（基线快照必须完整）。
         since_iso = self._since_iso_load() if baselined else None
         fetch_ok = True
         for issue in issues:
@@ -1648,21 +1636,17 @@ class Orchestrator:
             except api.ApiTransientError as exc:
                 # 稳态单 issue 评论墙炸不拖垮整个 reconcile（issue#51：
                 # >2500 条评论触发分页超限，495 次 reconcile 全体流产），
-                # 置空列表继续。首跑例外：未 baselined 时快照必须全量，
-                # 残缺会毒化基线（旧评论日后被当新事件重放）——维持整体
-                # abort 不动。
+                # 置空列表继续，下轮 reconcile 自然重拉。首跑例外：未
+                # baselined 时快照必须全量，残缺会毒化基线（旧评论日后
+                # 被当新事件重放）——维持整体 abort 不动。
                 if not baselined:
                     self._journal(f"reconcile: aborted, API transient failure: {exc}")
                     return None
                 self._journal(f"reconcile: issue#{iid} comments unavailable: {exc}")
                 open_notes[int(iid)] = []
-                # 评审修复（ag-21ea9f）：有 issue 拉缺则游标不前移——下轮
-                # 从旧窗口重拉，「下轮自然重拉」的全量语义恢复（增量窗口
-                # 否则会永久跳过失败窗口内的评论）
-                fetch_ok = False
-        # B4: book NOW as the next pull window ONLY when every wall read
-        # succeeded (dedup makes the extra overlap free); auth/transient
-        # early-returns and skipped issues all leave the store untouched.
+                fetch_ok = False  # 拉缺则游标不前移，「下轮自然重拉」才成立
+        # B4: book the next pull window ONLY when every wall read succeeded
+        # (dedup makes the overlap free); early-returns/skips keep the old one.
         if fetch_ok:
             self._since_store_save(datetime.now(timezone.utc))
         return issues, open_notes
