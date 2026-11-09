@@ -931,6 +931,8 @@ def test_out_of_scope_reply_closes_issue(harness):
     harness.listener.queue.put(comment_event(iid=11, comment_id=101))
     assert wait_until(lambda: turn_done(harness, 11, 101)), harness.journal_msgs
     assert harness.api.closes == [11]
+    assert not harness.entry(11)["report_probe_pending"], (
+        "关单与不置位同口径：前导空白范围外回复不欠汇报")
 
 
 def test_normal_reply_does_not_close_issue(harness):
@@ -1242,6 +1244,36 @@ def test_fetch_corrupt_since_store_falls_back_to_full(harness, monkeypatch):
     assert harness.journal("since store unusable"), harness.journal_msgs
     with open(harness.orch._since_path, encoding="utf-8") as fh:
         json.load(fh)  # 不抛即已重写（下轮恢复增量）
+
+
+def test_fetch_partial_transient_holds_since_store(harness, monkeypatch):
+    """评审修复回归：稳态下某 issue 评论墙瞬态失败（置空继续）→ since 游标
+    不前移，下轮从旧窗口重拉（「下轮自然重拉」的全量语义不破）；下轮全好
+    才落新游标。"""
+    harness.api.issues = {7: [api_comment(101, "hello")],
+                          51: [api_comment(201, "late reply")]}
+    st = harness.ledger()
+    st["baselined"] = True
+    state.save_state(harness.state_path, st)
+    stored = datetime(2026, 11, 1, 12, 0, 0, tzinfo=timezone.utc)
+    harness.orch._since_store_save(stored)
+    real_comments = harness.api.list_issue_comments
+
+    def flaky_comments(project, iid, since_iso=None):
+        if int(iid) == 51:
+            raise api.ApiTransientError("gitea api unreachable")
+        return real_comments(project, iid, since_iso)
+
+    monkeypatch.setattr(harness.api, "list_issue_comments", flaky_comments)
+    issues, notes = harness.orch._fetch_open_issues_and_notes()
+    assert notes[51] == [] and notes[7], "失败置空继续、好 issue 照常"
+    with open(harness.orch._since_path, encoding="utf-8") as fh:
+        assert json.load(fh) == stored.isoformat(), "有拉缺 → 游标不前移"
+
+    monkeypatch.setattr(harness.api, "list_issue_comments", real_comments)
+    harness.orch._fetch_open_issues_and_notes()
+    with open(harness.orch._since_path, encoding="utf-8") as fh:
+        assert json.load(fh) != stored.isoformat(), "全量成功 → 落新游标"
 
 
 # --------------------------------------------------------------------------

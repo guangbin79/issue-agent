@@ -681,7 +681,9 @@ class Orchestrator:
                     return
                 # B6: 协议第 0 步「范围外」判定 → 评论已投递后关单。fail-open：
                 # 关单失败只 journal 不上抛——回复送达优先，不因关单炸掉回合。
-                if reply.lstrip().startswith("范围外"):
+                # 判定取一次共用（置位面下方同用），两处口径恒一致。
+                out_of_scope = reply.lstrip().startswith("范围外")
+                if out_of_scope:
                     try:
                         self.api.close_issue(self.project, iid)
                     except Exception as exc:
@@ -689,9 +691,10 @@ class Orchestrator:
                             f"warning: issue#{iid} out-of-scope close failed: {exc!r}")
                 # ag-a9af5e 置位面（唯一）：回复上墙了但不是三段式汇报——
                 # 回合可能收队于汇报产出前，交给 sweep 预算内探测补发。
-                # 「范围外」开头是协议第 0 步的合法无汇报回复，不欠汇报。
+                # 「范围外」开头是协议第 0 步的合法无汇报回复，不欠汇报
+                # （与上方关单判定同口径）。
                 if (result.session_id and not runner.is_report(reply)
-                        and not reply.startswith("范围外")):
+                        and not out_of_scope):
                     self._arm_report_probe(iid)
                 # task 8: post-push review phase — ONLY for turns that pushed
                 # bot fix commits; this is the single call site (no review-of-
@@ -1212,9 +1215,9 @@ class Orchestrator:
                 lock.release()
 
     def _sweep_report_probe_deliver(self, iid, count, session_id):
-        """锁外执行面：前置探测 → export → 评论墙去重 → 补发。前置不满足/
-        墙读失败＝非真探测：只 journal 并退还预算；未命中/瞬态失败预算内
-        不清旗，预算耗尽则锁内清旗；送达或在墙立即锁内清旗。"""
+        """锁外执行面：前置检查（仅 session）→ export → 评论墙去重 → 补发。
+        前置不满足/墙读失败＝非真探测：只 journal 并退还预算；未命中/瞬态
+        失败预算内不清旗，预算耗尽则锁内清旗；送达或在墙立即锁内清旗。"""
         if not session_id:
             # B7: 前置放宽为仅 session——报告补投不依赖分支推送/评审环状态
             # （包裹外回合 server 侧续跑产报告不再被卡死；ag-92d1a0 的不烧
@@ -1601,8 +1604,11 @@ class Orchestrator:
         return (stored - timedelta(seconds=RECONCILE_SINCE_OVERLAP_S)).isoformat()
 
     def _since_store_save(self, moment):
-        """Atomic tmp+fsync+rename, state.py's write pattern."""
-        tmp = self._since_path + ".tmp"
+        """Atomic tmp+fsync+rename, state.py's write pattern. The tmp name
+        is writer-unique: reconcile passes can overlap (the worker-loop
+        pacing claim is not a full mutex), and a shared tmp name would let
+        one pass's os.replace crash the other's or interleave the bytes."""
+        tmp = f"{self._since_path}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(moment.isoformat(), fh)
             fh.flush()
@@ -1628,6 +1634,7 @@ class Orchestrator:
         # overlap); the first run stays a full pull — the baseline snapshot
         # must be complete, or old notes would replay as new events later.
         since_iso = self._since_iso_load() if baselined else None
+        fetch_ok = True
         for issue in issues:
             iid = issue.get("number")
             if iid is None:
@@ -1641,17 +1648,23 @@ class Orchestrator:
             except api.ApiTransientError as exc:
                 # 稳态单 issue 评论墙炸不拖垮整个 reconcile（issue#51：
                 # >2500 条评论触发分页超限，495 次 reconcile 全体流产），
-                # 置空列表继续，下轮 reconcile 自然重拉。首跑例外：未
-                # baselined 时快照必须全量，残缺会毒化基线（旧评论日后
-                # 被当新事件重放）——维持整体 abort 不动。
+                # 置空列表继续。首跑例外：未 baselined 时快照必须全量，
+                # 残缺会毒化基线（旧评论日后被当新事件重放）——维持整体
+                # abort 不动。
                 if not baselined:
                     self._journal(f"reconcile: aborted, API transient failure: {exc}")
                     return None
                 self._journal(f"reconcile: issue#{iid} comments unavailable: {exc}")
                 open_notes[int(iid)] = []
-        # B4: the fetch succeeded — book NOW as the next pull window (auth
-        # early-returns above leave the store untouched).
-        self._since_store_save(datetime.now(timezone.utc))
+                # 评审修复（ag-21ea9f）：有 issue 拉缺则游标不前移——下轮
+                # 从旧窗口重拉，「下轮自然重拉」的全量语义恢复（增量窗口
+                # 否则会永久跳过失败窗口内的评论）
+                fetch_ok = False
+        # B4: book NOW as the next pull window ONLY when every wall read
+        # succeeded (dedup makes the extra overlap free); auth/transient
+        # early-returns and skipped issues all leave the store untouched.
+        if fetch_ok:
+            self._since_store_save(datetime.now(timezone.utc))
         return issues, open_notes
 
     @staticmethod
