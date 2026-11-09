@@ -518,8 +518,8 @@ class TestReportProbe:
         h.sweep()
         assert h.exports == [] and h.api.posts == []
         entry = state.load_state(h.state_path)["issues"]["7"]
-        assert entry["report_probe_pending"], "前置不满足不清旗（预算内再探）"
-        assert entry["report_probe_count"] == 1
+        assert entry["report_probe_pending"], "前置不满足不清旗（前置齐后零成本再探）"
+        assert entry["report_probe_count"] == 0, "前置不满足不烧预算（issue#65 空烧实证）"
 
     def test_push_probe_gitop_error_keeps_flag(self, tmp_path, monkeypatch):
         h = Harness(tmp_path, monkeypatch)
@@ -540,6 +540,7 @@ class TestReportProbe:
         assert h.exports == [] and h.api.posts == []
         entry = state.load_state(h.state_path)["issues"]["7"]
         assert entry["report_probe_pending"]
+        assert entry["report_probe_count"] == 0, "session 缺前置不烧预算"
 
     def test_paused_not_probed(self, tmp_path, monkeypatch):
         h = Harness(tmp_path, monkeypatch)
@@ -628,8 +629,9 @@ class TestReportProbe:
         assert entry["report_probe_count"] == 2
         assert h.journal("probe exhausted")
 
-    def test_wall_read_failure_keeps_flag(self, tmp_path, monkeypatch):
-        """评论墙读取失败（transient API）＝未送达：预算内不清旗。"""
+    def test_wall_read_failure_keeps_flag_and_budget(self, tmp_path, monkeypatch):
+        """评论墙读取失败（transient API）＝未送达且非真探测：不清旗也不烧
+        预算，API 恢复后下轮应原价再探（issue#65 空烧实证回归）。"""
         h = Harness(tmp_path, monkeypatch)
         _probe_ready(h)
         h.export_result = REPORT
@@ -637,12 +639,20 @@ class TestReportProbe:
         def broken_wall(project, iid):
             raise api.ApiTransientError("gitea api unreachable")
 
+        real_wall = h.api.list_issue_comments
         monkeypatch.setattr(h.api, "list_issue_comments", broken_wall)
         _seed_probe(h)
         h.sweep()
         assert h.api.posts == []
         entry = state.load_state(h.state_path)["issues"]["7"]
         assert entry["report_probe_pending"]
+        assert entry["report_probe_count"] == 0, "墙读失败不烧预算"
+        assert h.journal("comment wall read failed")
+        monkeypatch.setattr(h.api, "list_issue_comments", real_wall)
+        h.sweep()  # API 恢复：下轮照常探测并送达
+        assert len(h.api.posts) == 1 and REPORT in h.api.posts[0][1]
+        entry = state.load_state(h.state_path)["issues"]["7"]
+        assert not entry["report_probe_pending"]
         assert entry["report_probe_count"] == 1
 
 

@@ -1082,6 +1082,41 @@ def test_failed_reconcile_keeps_interval_pacing(harness):
 
 
 # --------------------------------------------------------------------------
+# 18b. issue#51: one issue's comment wall exploding (pagination cap) must not
+#      abort the whole reconcile — journal that issue, empty notes, keep going
+# --------------------------------------------------------------------------
+
+def test_fetch_notes_single_issue_transient_does_not_abort(harness, monkeypatch):
+    """稳态（已 baselined）单 issue 评论墙炸只损失该 issue 的评论：好 issue
+    照常返回、炸的置空列表继续；首跑（未 baselined）保持整体 abort 不动。"""
+    real_comments = harness.api.list_issue_comments
+
+    def flaky_comments(project, iid):
+        if int(iid) == 51:
+            raise api.ApiTransientError(
+                "gitea api pagination exceeded 50 pages: GET .../issues/51/comments")
+        return real_comments(project, iid)
+
+    monkeypatch.setattr(harness.api, "list_issue_comments", flaky_comments)
+    harness.api.issues = {7: [api_comment(101, "hello")],
+                          51: [api_comment(201, "late reply")]}
+    st = harness.ledger()
+    st["baselined"] = True
+    state.save_state(harness.state_path, st)
+    issues, notes = harness.orch._fetch_open_issues_and_notes()
+    assert sorted(i["number"] for i in issues) == [7, 51]
+    assert [c["id"] for c in notes[7]] == [101], "好 issue 照常返回"
+    assert notes[51] == [], "炸的 issue 置空列表继续"
+    assert harness.journal("reconcile: issue#51 comments unavailable")
+
+    st["baselined"] = False
+    state.save_state(harness.state_path, st)
+    assert harness.orch._fetch_open_issues_and_notes() is None, (
+        "首跑（未 baselined）快照必须全量：维持整体 abort 不动")
+    assert harness.journal("reconcile: aborted, API transient failure")
+
+
+# --------------------------------------------------------------------------
 # 19. polling fallback: issues opened AFTER the one-time baseline run turns
 # --------------------------------------------------------------------------
 

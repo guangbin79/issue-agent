@@ -1196,9 +1196,9 @@ class Orchestrator:
                 lock.release()
 
     def _sweep_report_probe_deliver(self, iid, count, session_id):
-        """锁外执行面：前置探测 → export → 评论墙去重 → 补发。未送达
-        （前置不满足/未命中/GitopError/瞬态失败）预算内不清旗，预算耗尽
-        则锁内清旗；送达或在墙则立即锁内清旗。"""
+        """锁外执行面：前置探测 → export → 评论墙去重 → 补发。前置不满足/
+        墙读失败＝非真探测：只 journal 并退还预算；未命中/GitopError/瞬态
+        失败预算内不清旗，预算耗尽则锁内清旗；送达或在墙立即锁内清旗。"""
         try:
             pushed = gitop.fix_branch_pushed(self.repo_path, iid, self.remote_url,
                                              self.ssl_verify)
@@ -1208,11 +1208,13 @@ class Orchestrator:
             return self._probe_exhausted(iid, count)
         review_ran = os.path.isdir(os.path.join(self.repo_path, ".review-loop"))
         if not pushed or not review_ran or not session_id:
+            # 前置不满足＝本次不是真探测：只 journal，不烧预算不清旗
+            # （worker 迟后会推分支/跑评审，届时零成本再探——issue#65
+            # 实证「precondition unmet...budget 1/2」空烧）
             self._journal(f"probe: issue#{iid} precondition unmet "
                           f"(pushed={pushed}, review_loop={review_ran}, "
-                          f"session={bool(session_id)}), "
-                          f"budget {count}/{MAX_REPORT_PROBES}")
-            return self._probe_exhausted(iid, count)
+                          f"session={bool(session_id)}) — budget held")
+            return self._probe_unburn(iid, count)
         report = runner.export_last_report(session_id, self.repo_path)
         if not report:
             self._journal(f"probe: issue#{iid} no report in session "
@@ -1223,9 +1225,11 @@ class Orchestrator:
         try:
             wall = self.api.list_issue_comments(self.project, iid)
         except Exception as exc:
-            self._journal(f"probe: issue#{iid} comment wall read failed "
-                          f"(budget {count}/{MAX_REPORT_PROBES}): {exc!r}")
-            return self._probe_exhausted(iid, count)
+            # 墙读失败＝未送达且未判命中：只 journal 不烧预算，API 恢复后
+            # 下轮再探（issue#65 空烧教训）
+            self._journal(f"probe: issue#{iid} comment wall read failed: "
+                          f"{exc!r} — budget held")
+            return self._probe_unburn(iid, count)
         if any(report in (c.get("body") or "") for c in wall):
             return self._probe_clear_flag(iid, "dup-skip")
         # 直连 api.post_note 而非 _post_note（同 _sweep_payoff flush 纪律）：
@@ -1249,6 +1253,17 @@ class Orchestrator:
         if count < MAX_REPORT_PROBES:
             return
         self._probe_clear_flag(iid, "probe exhausted")
+
+    def _probe_unburn(self, iid, count):
+        """本次消费作废（前置不满足/墙读失败＝非真探测）：锁内退还刚消费
+        的预算（CAS 同 _probe_clear_flag），旗保留待下轮 sweep 零成本再探。"""
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            entry = ledger["issues"].get(str(int(iid)))
+            if entry is None or not entry.get("report_probe_pending"):
+                return
+            entry["report_probe_count"] = max(0, count - 1)
+            state.save_state(self.state_path, ledger)
 
     def _probe_clear_flag(self, iid, reason):
         """锁内清旗（CAS：claim/blocked/close 已中途接管则不动账、不记因）。"""
@@ -1571,17 +1586,35 @@ class Orchestrator:
         open_notes = {}
         try:
             issues = self.api.list_open_issues(self.project)
-            for issue in issues:
-                iid = issue.get("number")
-                if iid is None:
-                    continue
-                open_notes[int(iid)] = self.api.list_issue_comments(self.project, iid)
         except api.ApiAuthError as exc:
             self._journal(f"CRITICAL: reconcile cannot read the API: {exc}")
             return None
         except api.ApiTransientError as exc:
             self._journal(f"reconcile: aborted, API transient failure: {exc}")
             return None
+        for issue in issues:
+            iid = issue.get("number")
+            if iid is None:
+                continue
+            try:
+                open_notes[int(iid)] = self.api.list_issue_comments(self.project, iid)
+            except api.ApiAuthError as exc:
+                self._journal(f"CRITICAL: reconcile cannot read the API: {exc}")
+                return None
+            except api.ApiTransientError as exc:
+                # 稳态单 issue 评论墙炸不拖垮整个 reconcile（issue#51：
+                # >2500 条评论触发分页超限，495 次 reconcile 全体流产），
+                # 置空列表继续，下轮 reconcile 自然重拉。首跑例外：未
+                # baselined 时快照必须全量，残缺会毒化基线（旧评论日后
+                # 被当新事件重放）——维持整体 abort 不动。
+                with self._ledger_lock:
+                    baselined = state.load_state(
+                        self.state_path, warn=self._journal).get("baselined") is True
+                if not baselined:
+                    self._journal(f"reconcile: aborted, API transient failure: {exc}")
+                    return None
+                self._journal(f"reconcile: issue#{iid} comments unavailable: {exc}")
+                open_notes[int(iid)] = []
         return issues, open_notes
 
     @staticmethod

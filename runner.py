@@ -113,28 +113,37 @@ def parse_ndjson(output_text, prefer_report=False):
     return session_id, last_text
 
 
-# 协议第 5 条汇报形状：三段头＋以「沉淀」开头的末行清单。三闸同过才算
-# 汇报——进度 ping、范围外回复至少缺一闸。第二项用子串「改动文件」：
-# 「改动文件清单」等清单形式仍命中（issue#65 实证短段头「改动文件」
-# 判负致干净终审报告不被识别）。
-_REPORT_HEADS = ("根因", "改动文件", "验证方式")
+# 协议第 5 条汇报形状：前两段头＋第三段验证闸＋以「沉淀」开头的末行清单。
+# 三闸同过才算汇报——进度 ping、范围外回复至少缺一闸。第二项用子串
+# 「改动文件」：「改动文件清单」等清单形式仍命中；第三闸用替代表：
+# 「验证方式」段头子串（老形态）OR 任一行剥装饰后以「验证」起始——
+# 实际报告写「**验证**：构建绿」等短段头曾判负（issue#65 两处实证）。
+_REPORT_HEADS = ("根因", "改动文件")
 
-# 沉淀行允许的行首 markdown/缩进装饰（issue#65 实证「**沉淀**：」粗体判负）。
+# 沉淀/验证行允许的行首 markdown/缩进装饰（issue#65 实证「**沉淀**：」
+# 粗体判负）。
 _LINE_DECOR = re.compile(r"^(?:\s|[>#*`-])*")
 
 
 def is_report(text):
-    """True when *text* is a protocol §5 report: all three section heads
-    present AND one line starting with 沉淀 after stripping leading
-    markdown decoration (bold/bullet/quote/indent). issue#65 实证：粗体
-    沉淀行/短段头判负致干净终审报告不被识别。Progress fragments
+    """True when *text* is a protocol §5 report: both fixed section heads
+    (根因/改动文件) present AND the verification gate — a 验证方式 head
+    substring, or any line starting with 验证 after stripping leading
+    markdown decoration (bold/bullet/quote/indent) — AND one line starting
+    with 沉淀 after the same strip. issue#65 实证：粗体沉淀行/短段头/
+    「**验证**：」第三段判负致干净终审报告不被识别。Progress fragments
     and out-of-scope replies miss at least one gate."""
     if not isinstance(text, str):
         return False
     if not all(head in text for head in _REPORT_HEADS):
         return False
+    lines = text.splitlines()
+    if not (("验证方式" in text)
+            or any(_LINE_DECOR.sub("", line).startswith("验证")
+                   for line in lines)):
+        return False
     return any(_LINE_DECOR.sub("", line).startswith("沉淀")
-               for line in text.splitlines())
+               for line in lines)
 
 
 def export_last_report(session_id, cwd, timeout_s=60, run=subprocess.run):

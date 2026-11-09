@@ -139,6 +139,33 @@ class TestIsReport:
         assert runner.is_report(
             _report(heads=("根因", "改动文件", "验证方式"))) is True
 
+    def test_issue65_bold_verify_head_hits(self):
+        # issue#65 后续实证判负形态：第三段写「**验证**：构建绿」（粗体
+        # 短段头，无「验证方式」子串）＋粗体沉淀行，报告曾整篇不被识别——
+        # 第三闸替代表：「验证方式」子串 OR 任一行剥装饰后以「验证」起始
+        text = "\n".join([
+            "根因：回合结束于汇报产出前",
+            "**验证**：构建绿",
+            "改动文件清单：- runner.py",
+            "**沉淀**：知识＝issue-agent 模块页；经验＝待人工审核",
+        ])
+        assert runner.is_report(text) is True
+
+    @pytest.mark.parametrize("verify_line", [
+        "验证方式：python3 -m pytest tests/ -q 全绿",
+        "- 验证：python3 -m pytest tests/ -q 全绿",
+        "**验证**：python3 -m pytest tests/ -q 全绿",
+    ])
+    def test_third_gate_forms_hit(self, verify_line):
+        # 第三闸三形态（段头子串/剥饰行首「验证」含列表粗体装饰）任一命中
+        text = "\n".join(["根因：……", "改动文件：……", verify_line, "沉淀：……"])
+        assert runner.is_report(text) is True
+
+    def test_third_gate_missing_misses(self):
+        # 第三闸两形态全缺（既无「验证方式」子串也无行首「验证」）→ 判负
+        text = "\n".join(["根因：……", "改动文件：……", "自测通过：全绿", "沉淀：……"])
+        assert runner.is_report(text) is False
+
 
 class TestParseNdjsonPreferReport:
     def test_report_displaced_by_progress_still_wins(self):

@@ -227,6 +227,25 @@ def test_list_issue_comments_paginates_until_short_page():
     assert [r["query"]["page"] for r in server.requests] == ["1", "2"]
 
 
+def test_list_issue_comments_since_forwarded_when_set():
+    """issue#65 后续：since_iso 非空 → since 查询参数原样直通分页基参
+    （服务端不支持则忽略该参数，无回归）；缺省不带 since（全量零回归）。"""
+    client = GitLabClient("http://gitea.lan:3000", "dummy-pat")
+    captured = {}
+
+    def stub_all_pages(path, base_params):
+        captured["path"], captured["base_params"] = path, base_params
+        return []
+
+    client._get_all_pages = stub_all_pages
+    client.list_issue_comments(PROJ, 42, since_iso="2026-11-05T00:00:00Z")
+    assert captured["base_params"] == {"since": "2026-11-05T00:00:00Z"}
+
+    captured.clear()
+    client.list_issue_comments(PROJ, 42)
+    assert captured["base_params"] == {}
+
+
 def test_pagination_stops_at_hard_page_cap():
     """R2: a stub that always returns a full page stops at MAX_PAGES and
     raises ApiTransientError (defer-later), never a silent partial list."""

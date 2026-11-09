@@ -125,10 +125,17 @@ class GitLabClient:
                  "body": i.get("body") or "", "state": i.get("state") or "open"}
                 for i in raw]
 
-    def list_issue_comments(self, project, number):
-        """All comments of issue *number*, aggregated across pages."""
+    def list_issue_comments(self, project, number, since_iso=None):
+        """All comments of issue *number*, aggregated across pages.
+
+        since_iso 非空时作为 since 查询参数并入分页基参（值原样直通，
+        服务端不支持则忽略该参数，无回归）——增量拉取的预留缝，orch
+        暂不使用（首跑全量拉取不动）。
+        """
+        base_params = {"since": since_iso} if since_iso else {}
         raw = self._get_all_pages(
-            f"/api/v1/repos/{_repo_path(project)}/issues/{int(number)}/comments", {})
+            f"/api/v1/repos/{_repo_path(project)}/issues/{int(number)}/comments",
+            base_params)
         return [{"id": c.get("id"), "body": c.get("body") or "",
                  "user": {"login": (c.get("user") or {}).get("login") or ""}}
                 for c in raw]
