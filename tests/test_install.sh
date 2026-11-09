@@ -549,6 +549,18 @@ printf '{"service_name": "repo-issue-agent", "project": "acme/repo", "port": 864
 REPO="$SAN/other-repo" ISSUE_AGENT_SERVICE_NAME="repo-issue-agent" run_install
 assert_eq "$RC" "1" "legacy anti-clobber exit code"
 assert_grep "$SAN/install.out" '拒绝覆盖'
+assert_grep "$SAN/install.out" 'legacy config 缺 repo_path'  # legacy guard, not the parse-failure verdict (16d)
+
+echo "== 16d. unparseable config (invalid JSON) -> refuse with parse-specific wording =="
+new_sandbox
+mkdir -p "$FAKE_HOME/.config/repo-issue-agent"
+printf '{not json' \
+  > "$FAKE_HOME/.config/repo-issue-agent/config.json"
+run_install
+assert_eq "$RC" "1" "unparseable config exit code"
+assert_grep "$SAN/install.out" '已存在配置无法解析'  # exact verdict, not the ports.json wording
+assert_nogrep "$SAN/install.out" 'legacy config'  # 16c's verdict, must not leak here
+assert_no "$STUB_STATE/curl.log"  # died before any network probe
 
 echo "== 17. bare install never touches another instance's config =="
 new_sandbox
