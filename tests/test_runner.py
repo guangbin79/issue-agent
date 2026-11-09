@@ -126,6 +126,19 @@ class TestIsReport:
     def test_non_string_misses(self):
         assert runner.is_report(None) is False
 
+    def test_markdown_bold_settlement_hits(self):
+        # issue#65: 终审报告沉淀行写「**沉淀**：」曾判负，报告不被识别
+        assert runner.is_report(_report().replace("沉淀：", "**沉淀**：")) is True
+
+    @pytest.mark.parametrize("decorated", ["- 沉淀：", "> 沉淀：", "  沉淀："])
+    def test_markdown_decorated_settlement_hits(self, decorated):
+        assert runner.is_report(_report().replace("沉淀：", decorated)) is True
+
+    def test_short_second_head_hits(self):
+        # issue#65: 实际报告写「改动文件」短段头曾判负
+        assert runner.is_report(
+            _report(heads=("根因", "改动文件", "验证方式"))) is True
+
 
 class TestParseNdjsonPreferReport:
     def test_report_displaced_by_progress_still_wins(self):

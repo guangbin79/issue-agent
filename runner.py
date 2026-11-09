@@ -114,19 +114,27 @@ def parse_ndjson(output_text, prefer_report=False):
 
 
 # 协议第 5 条汇报形状：三段头＋以「沉淀」开头的末行清单。三闸同过才算
-# 汇报——进度 ping、范围外回复至少缺一闸。
-_REPORT_HEADS = ("根因", "改动文件清单", "验证方式")
+# 汇报——进度 ping、范围外回复至少缺一闸。第二项用子串「改动文件」：
+# 「改动文件清单」等清单形式仍命中（issue#65 实证短段头「改动文件」
+# 判负致干净终审报告不被识别）。
+_REPORT_HEADS = ("根因", "改动文件", "验证方式")
+
+# 沉淀行允许的行首 markdown/缩进装饰（issue#65 实证「**沉淀**：」粗体判负）。
+_LINE_DECOR = re.compile(r"^(?:\s|[>#*`-])*")
 
 
 def is_report(text):
     """True when *text* is a protocol §5 report: all three section heads
-    present AND one line starting with 沉淀. Progress fragments and
-    out-of-scope replies miss at least one gate."""
+    present AND one line starting with 沉淀 after stripping leading
+    markdown decoration (bold/bullet/quote/indent). issue#65 实证：粗体
+    沉淀行/短段头判负致干净终审报告不被识别。Progress fragments
+    and out-of-scope replies miss at least one gate."""
     if not isinstance(text, str):
         return False
     if not all(head in text for head in _REPORT_HEADS):
         return False
-    return any(line.startswith("沉淀") for line in text.splitlines())
+    return any(_LINE_DECOR.sub("", line).startswith("沉淀")
+               for line in text.splitlines())
 
 
 def export_last_report(session_id, cwd, timeout_s=60, run=subprocess.run):
