@@ -147,6 +147,14 @@ class GitLabClient:
             "GET", f"/api/v1/repos/{_repo_path(project)}/issues/{int(number)}")
         return (payload or {}).get("state") or "open"
 
+    def close_issue(self, project, number):
+        """Close issue *number* (B6: 回合判定「范围外」后的自动关单).
+        PATCH is idempotent, so the transport's transient retry and auth
+        semantics apply as-is."""
+        self._request_json(
+            "PATCH", f"/api/v1/repos/{_repo_path(project)}/issues/{int(number)}",
+            body={"state": "closed"})
+
     def post_note(self, project, number, body):
         """POST *body* verbatim as a comment (use build_note_body to wrap it)."""
         path = f"/api/v1/repos/{_repo_path(project)}/issues/{int(number)}/comments"

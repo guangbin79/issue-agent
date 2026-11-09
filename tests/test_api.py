@@ -295,6 +295,26 @@ def test_post_note_transient_failure_is_not_retried(monkeypatch):
         "a retried POST could create a duplicate user-visible note")
 
 
+# --- close issue ---------------------------------------------------------
+
+
+def test_close_issue_patches_state_closed():
+    """B6: close_issue PATCHes {"state": "closed"} on the issue endpoint
+    (idempotent, so the transport's transient retry applies as-is)."""
+    issue_path = f"{ISSUES_PATH}/42"
+
+    def route(rec):
+        return 200, [], {"number": 42, "state": "closed"}
+
+    with fake_gitea({("PATCH", issue_path): route}) as server:
+        make_client(server).close_issue(PROJ, 42)
+    rec = server.requests[0]
+    assert rec["method"] == "PATCH"
+    assert rec["path"] == issue_path
+    assert rec["auth"] == "token dummy-pat"
+    assert rec["json"] == {"state": "closed"}
+
+
 # --- current user --------------------------------------------------------
 
 

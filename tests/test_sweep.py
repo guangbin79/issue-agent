@@ -511,25 +511,19 @@ class TestReportProbe:
         h.sweep()
         assert len(h.exports) == 2, "清旗后不再探"
 
-    def test_branch_not_pushed_no_export_no_post(self, tmp_path, monkeypatch):
+    def test_unpushed_no_review_loop_session_still_delivers(self, tmp_path, monkeypatch):
+        """B7（ag-21ea9f）：报告债与推分支/评审环解耦——未推分支＋无评审环
+        ＋有 session → 照常走 export/墙读/补投路径（包裹外回合 server 侧
+        续跑产报告不再被前置卡死）。"""
         h = Harness(tmp_path, monkeypatch)
-        h.export_result = REPORT  # would post if the gate leaked
-        _seed_probe(h)
+        h.export_result = REPORT
+        _seed_probe(h)  # 不调 _probe_ready：分支未推、.review-loop 不存在
         h.sweep()
-        assert h.exports == [] and h.api.posts == []
+        assert len(h.api.posts) == 1 and REPORT in h.api.posts[0][1]
         entry = state.load_state(h.state_path)["issues"]["7"]
-        assert entry["report_probe_pending"], "前置不满足不清旗（前置齐后零成本再探）"
-        assert entry["report_probe_count"] == 0, "前置不满足不烧预算（issue#65 空烧实证）"
-
-    def test_push_probe_gitop_error_keeps_flag(self, tmp_path, monkeypatch):
-        h = Harness(tmp_path, monkeypatch)
-        h.fix_pushed_error = gitop.GitopError("ls-remote failed")
-        _seed_probe(h)
-        h.sweep()
-        assert h.exports == [] and h.api.posts == []
-        entry = state.load_state(h.state_path)["issues"]["7"]
-        assert entry["report_probe_pending"]
-        assert entry["report_probe_count"] == 1
+        assert not entry["report_probe_pending"], "delivered -> flag cleared"
+        assert h.journal("auto-repost")
+        assert h.fix_pushed_calls == [], "推送探测面已随前置解耦移除"
 
     def test_missing_session_id_no_export(self, tmp_path, monkeypatch):
         h = Harness(tmp_path, monkeypatch)

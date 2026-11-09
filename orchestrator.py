@@ -45,7 +45,7 @@ import queue as _queue
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -71,6 +71,11 @@ DEFAULT_SWEEP_INTERVAL_S = 1800  # 0 = off: 欠账巡检 (debt sweep) cadence
 # most this many sweeps before the flag clears (retry window for a missing
 # report / failed push probe: two sweeps, then journal + give up).
 MAX_REPORT_PROBES = 2
+# ag-21ea9f B4: steady-state reconcile pulls comments incrementally. The
+# since store holds the moment of the last successful fetch; each pull
+# rewinds it by the reconcile cadence + margin. Overlap is harmless —
+# replayed notes are deduped by is_note_processed before any fsm feed.
+RECONCILE_SINCE_OVERLAP_S = 660  # 600s reconcile cadence + 60s margin
 
 # Global experience-draft store (the agent-experience capture flow the
 # protocol's 沉淀 step writes to): the post-push capture verification
@@ -239,6 +244,9 @@ class Orchestrator:
         self._sweep_path = os.fspath(state_path) + ".sweep.json"
         self._sweep_guard = threading.Lock()
         self._sweep_thread = None
+        # ag-21ea9f B4: orchestrator-owned since store beside the ledger
+        # (same pattern as _sweep_path; state.py's schema stays frozen).
+        self._since_path = os.fspath(state_path) + ".since.json"
         self.callback_url = callback_url
         self._teardown = teardown
         self.max_parallel = max(1, int(max_parallel))
@@ -671,6 +679,14 @@ class Orchestrator:
                     # transient: the turn result stays in the ledger, reply deferred
                     self._defer(iid, result.session_id or session_id)
                     return
+                # B6: 协议第 0 步「范围外」判定 → 评论已投递后关单。fail-open：
+                # 关单失败只 journal 不上抛——回复送达优先，不因关单炸掉回合。
+                if reply.lstrip().startswith("范围外"):
+                    try:
+                        self.api.close_issue(self.project, iid)
+                    except Exception as exc:
+                        self._journal(
+                            f"warning: issue#{iid} out-of-scope close failed: {exc!r}")
                 # ag-a9af5e 置位面（唯一）：回复上墙了但不是三段式汇报——
                 # 回合可能收队于汇报产出前，交给 sweep 预算内探测补发。
                 # 「范围外」开头是协议第 0 步的合法无汇报回复，不欠汇报。
@@ -1197,23 +1213,14 @@ class Orchestrator:
 
     def _sweep_report_probe_deliver(self, iid, count, session_id):
         """锁外执行面：前置探测 → export → 评论墙去重 → 补发。前置不满足/
-        墙读失败＝非真探测：只 journal 并退还预算；未命中/GitopError/瞬态
-        失败预算内不清旗，预算耗尽则锁内清旗；送达或在墙立即锁内清旗。"""
-        try:
-            pushed = gitop.fix_branch_pushed(self.repo_path, iid, self.remote_url,
-                                             self.ssl_verify)
-        except gitop.GitopError as exc:
-            self._journal(f"probe: issue#{iid} push probe failed "
-                          f"(budget {count}/{MAX_REPORT_PROBES}): {exc}")
-            return self._probe_exhausted(iid, count)
-        review_ran = os.path.isdir(os.path.join(self.repo_path, ".review-loop"))
-        if not pushed or not review_ran or not session_id:
-            # 前置不满足＝本次不是真探测：只 journal，不烧预算不清旗
-            # （worker 迟后会推分支/跑评审，届时零成本再探——issue#65
-            # 实证「precondition unmet...budget 1/2」空烧）
+        墙读失败＝非真探测：只 journal 并退还预算；未命中/瞬态失败预算内
+        不清旗，预算耗尽则锁内清旗；送达或在墙立即锁内清旗。"""
+        if not session_id:
+            # B7: 前置放宽为仅 session——报告补投不依赖分支推送/评审环状态
+            # （包裹外回合 server 侧续跑产报告不再被卡死；ag-92d1a0 的不烧
+            # 预算语义保持：前置不满足＝零成本退还待下轮）
             self._journal(f"probe: issue#{iid} precondition unmet "
-                          f"(pushed={pushed}, review_loop={review_ran}, "
-                          f"session={bool(session_id)}) — budget held")
+                          f"(session={bool(session_id)}) — budget held")
             return self._probe_unburn(iid, count)
         report = runner.export_last_report(session_id, self.repo_path)
         if not report:
@@ -1580,6 +1587,28 @@ class Orchestrator:
                                  f"{gitop.fix_branch(iid)}"
                                  "（评审会话晚到提交已推送）。")
 
+    def _since_iso_load(self):
+        """B4: the steady-state pull window — the stored last-success moment
+        minus RECONCILE_SINCE_OVERLAP_S, as ISO8601 UTC. A missing/corrupt
+        store journals and falls back to None (one full pull; the next
+        success rewrites the store)."""
+        try:
+            with open(self._since_path, encoding="utf-8") as fh:
+                stored = datetime.fromisoformat(json.load(fh))
+        except (OSError, ValueError, TypeError) as exc:
+            self._journal(f"reconcile: since store unusable ({exc!r}) — full pull")
+            return None
+        return (stored - timedelta(seconds=RECONCILE_SINCE_OVERLAP_S)).isoformat()
+
+    def _since_store_save(self, moment):
+        """Atomic tmp+fsync+rename, state.py's write pattern."""
+        tmp = self._since_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(moment.isoformat(), fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self._since_path)
+
     def _fetch_open_issues_and_notes(self):
         """(issue records, {iid: [api comment, ...]}) for every open issue,
         or None when the API is unavailable right now."""
@@ -1592,12 +1621,20 @@ class Orchestrator:
         except api.ApiTransientError as exc:
             self._journal(f"reconcile: aborted, API transient failure: {exc}")
             return None
+        with self._ledger_lock:
+            baselined = state.load_state(
+                self.state_path, warn=self._journal).get("baselined") is True
+        # B4: steady state pulls incrementally since the last success (minus
+        # overlap); the first run stays a full pull — the baseline snapshot
+        # must be complete, or old notes would replay as new events later.
+        since_iso = self._since_iso_load() if baselined else None
         for issue in issues:
             iid = issue.get("number")
             if iid is None:
                 continue
             try:
-                open_notes[int(iid)] = self.api.list_issue_comments(self.project, iid)
+                open_notes[int(iid)] = self.api.list_issue_comments(
+                    self.project, iid, since_iso=since_iso)
             except api.ApiAuthError as exc:
                 self._journal(f"CRITICAL: reconcile cannot read the API: {exc}")
                 return None
@@ -1607,14 +1644,14 @@ class Orchestrator:
                 # 置空列表继续，下轮 reconcile 自然重拉。首跑例外：未
                 # baselined 时快照必须全量，残缺会毒化基线（旧评论日后
                 # 被当新事件重放）——维持整体 abort 不动。
-                with self._ledger_lock:
-                    baselined = state.load_state(
-                        self.state_path, warn=self._journal).get("baselined") is True
                 if not baselined:
                     self._journal(f"reconcile: aborted, API transient failure: {exc}")
                     return None
                 self._journal(f"reconcile: issue#{iid} comments unavailable: {exc}")
                 open_notes[int(iid)] = []
+        # B4: the fetch succeeded — book NOW as the next pull window (auth
+        # early-returns above leave the store untouched).
+        self._since_store_save(datetime.now(timezone.utc))
         return issues, open_notes
 
     @staticmethod

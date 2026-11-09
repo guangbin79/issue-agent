@@ -97,6 +97,9 @@ class FakeApi:
         self.hook_deletes = []             # hook ids passed to delete_hook
         self.hook_delete_error = None      # raise instead of deleting
         self.note_marker = note_marker or api.NOTE_MARKER
+        self.since_seen = []               # since_iso kwargs seen per comments call
+        self.closes = []                   # iids passed to close_issue
+        self.close_error = None            # raise instead of closing
 
     def build_note_body(self, text):
         # same shape as GitLabClient.build_note_body (instance marker)
@@ -110,8 +113,14 @@ class FakeApi:
             out.append(record)
         return out
 
-    def list_issue_comments(self, project, iid):
+    def list_issue_comments(self, project, iid, since_iso=None):
+        self.since_seen.append((int(iid), since_iso))
         return self.issues.get(int(iid), [])
+
+    def close_issue(self, project, iid):
+        if self.close_error is not None:
+            raise self.close_error
+        self.closes.append(int(iid))
 
     def post_note(self, project, iid, body):
         self.posts.append((int(iid), body))
@@ -907,6 +916,43 @@ def test_out_of_scope_reply_does_not_arm_report_probe(harness):
     assert not harness.entry(11)["report_probe_pending"]
 
 
+# --------------------------------------------------------------------------
+# 26b. ag-21ea9f B6: 「范围外」回复上墙后自动关单（fail-open）
+# --------------------------------------------------------------------------
+
+_OUT_OF_SCOPE_REPLY = "范围外：此需求属运维事项，建议转对应仓库。"
+
+
+def test_out_of_scope_reply_closes_issue(harness):
+    """B6 ①：「范围外」开头（含前导空白）回复投递成功 → close_issue 被调。"""
+    seed_active(harness)
+    harness.runner.cont_result = turn_result(
+        sid="ses_1", text="  " + _OUT_OF_SCOPE_REPLY)
+    harness.listener.queue.put(comment_event(iid=11, comment_id=101))
+    assert wait_until(lambda: turn_done(harness, 11, 101)), harness.journal_msgs
+    assert harness.api.closes == [11]
+
+
+def test_normal_reply_does_not_close_issue(harness):
+    """B6 ②：普通回复不关单。"""
+    run_turn_happy(harness, iid=11)
+    assert harness.api.closes == []
+
+
+def test_close_issue_failure_does_not_break_turn(harness):
+    """B6 ③：close 抛错只 journal 不上抛——回合照常收队，评论已投递。"""
+    seed_active(harness)
+    harness.api.close_error = api.ApiTransientError("gitea api unreachable")
+    harness.runner.cont_result = turn_result(
+        sid="ses_1", text=_OUT_OF_SCOPE_REPLY)
+    harness.listener.queue.put(comment_event(iid=11, comment_id=101))
+    assert wait_until(lambda: turn_done(harness, 11, 101)), harness.journal_msgs
+    assert harness.api.closes == [], "失败不算关单"
+    assert any(_OUT_OF_SCOPE_REPLY in b for _, b in harness.api.posts), (
+        "评论已投递优先")
+    assert harness.journal("out-of-scope close failed"), harness.journal_msgs
+
+
 def test_push_failed_path_does_not_arm_report_probe(harness):
     """PushFailed → blocked（回复另有 sweep 欠账面）→ 不置位。"""
     seed_active(harness)
@@ -1091,11 +1137,11 @@ def test_fetch_notes_single_issue_transient_does_not_abort(harness, monkeypatch)
     照常返回、炸的置空列表继续；首跑（未 baselined）保持整体 abort 不动。"""
     real_comments = harness.api.list_issue_comments
 
-    def flaky_comments(project, iid):
+    def flaky_comments(project, iid, since_iso=None):
         if int(iid) == 51:
             raise api.ApiTransientError(
                 "gitea api pagination exceeded 50 pages: GET .../issues/51/comments")
-        return real_comments(project, iid)
+        return real_comments(project, iid, since_iso)
 
     monkeypatch.setattr(harness.api, "list_issue_comments", flaky_comments)
     harness.api.issues = {7: [api_comment(101, "hello")],
@@ -1114,6 +1160,88 @@ def test_fetch_notes_single_issue_transient_does_not_abort(harness, monkeypatch)
     assert harness.orch._fetch_open_issues_and_notes() is None, (
         "首跑（未 baselined）快照必须全量：维持整体 abort 不动")
     assert harness.journal("reconcile: aborted, API transient failure")
+
+
+# --------------------------------------------------------------------------
+# 18c. ag-21ea9f B4: reconcile incremental comment pulls via the since store
+# --------------------------------------------------------------------------
+
+def _spy_since(harness, monkeypatch):
+    """Swap in a comments stub that records the since_iso kwarg per call."""
+    real_comments = harness.api.list_issue_comments
+    seen = []
+
+    def spy_comments(project, iid, since_iso=None):
+        seen.append((int(iid), since_iso))
+        return real_comments(project, iid, since_iso)
+
+    monkeypatch.setattr(harness.api, "list_issue_comments", spy_comments)
+    return seen
+
+
+def test_fetch_steady_state_pulls_since_with_overlap_and_rewrites(harness, monkeypatch):
+    """B4 ①③：稳态（baselined）拉取传「since 存储时刻−OVERLAP」；成功返回前
+    since 文件重写为当前时刻；下次拉取读取新时刻继续带 OVERLAP 回退。"""
+    harness.api.issues = {7: [api_comment(101, "hello")]}
+    st = harness.ledger()
+    st["baselined"] = True
+    state.save_state(harness.state_path, st)
+    stored = datetime(2026, 11, 1, 12, 0, 0, tzinfo=timezone.utc)
+    harness.orch._since_store_save(stored)
+
+    seen = _spy_since(harness, monkeypatch)
+    harness.orch._fetch_open_issues_and_notes()
+    assert seen == [(7, (stored - timedelta(
+        seconds=orchestrator.RECONCILE_SINCE_OVERLAP_S)).isoformat())], (
+        "稳态拉取必须携带 OVERLAP 回退后的 since")
+
+    with open(harness.orch._since_path, encoding="utf-8") as fh:
+        rewritten = datetime.fromisoformat(json.load(fh))
+    assert rewritten > stored, "成功返回前 since 文件已重写为拉取时刻"
+
+    seen.clear()
+    harness.orch._fetch_open_issues_and_notes()
+    assert len(seen) == 1 and seen[0][1] is not None, "下次拉取仍走增量"
+    age = (datetime.now(timezone.utc)
+           - datetime.fromisoformat(seen[0][1])).total_seconds()
+    assert orchestrator.RECONCILE_SINCE_OVERLAP_S <= age <= \
+        orchestrator.RECONCILE_SINCE_OVERLAP_S + 10, (
+        "下次读取＝新存储时刻−OVERLAP")
+
+
+def test_fetch_first_run_pulls_full_without_since(harness, monkeypatch):
+    """B4 ②：未 baselined（首跑）传 None 全量，语义不动；成功后仍落 since
+    文件（下轮起转增量）。"""
+    st = harness.ledger()
+    st["baselined"] = False
+    state.save_state(harness.state_path, st)
+    if os.path.exists(harness.orch._since_path):
+        os.remove(harness.orch._since_path)
+    harness.api.issues = {7: [api_comment(101, "存量评论")]}
+
+    seen = _spy_since(harness, monkeypatch)
+    harness.orch._fetch_open_issues_and_notes()
+    assert seen == [(7, None)], "首跑保持全量（since=None）"
+    assert os.path.exists(harness.orch._since_path), (
+        "成功返回前 since 文件已落盘（下轮起转增量）")
+
+
+def test_fetch_corrupt_since_store_falls_back_to_full(harness, monkeypatch):
+    """B4 ④：since 文件损坏 → journal ＋ 本次全量（None）；本次成功后文件
+    已被重写，下轮自动恢复增量。"""
+    harness.api.issues = {7: [api_comment(101, "hello")]}
+    st = harness.ledger()
+    st["baselined"] = True
+    state.save_state(harness.state_path, st)
+    with open(harness.orch._since_path, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+
+    seen = _spy_since(harness, monkeypatch)
+    harness.orch._fetch_open_issues_and_notes()
+    assert seen == [(7, None)], "损坏 → 全量兜底"
+    assert harness.journal("since store unusable"), harness.journal_msgs
+    with open(harness.orch._since_path, encoding="utf-8") as fh:
+        json.load(fh)  # 不抛即已重写（下轮恢复增量）
 
 
 # --------------------------------------------------------------------------
