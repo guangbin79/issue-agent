@@ -271,6 +271,22 @@ class TestPayoff:
         assert h.api.posts == []
         assert h.store()["swept_shas"] == {}, "failed sweep must not record the sha"
 
+    def test_sweep_flushed_pending_cleared_despite_push_failure(self, tmp_path, monkeypatch):
+        """#119/#264 刷屏根因：留言已成功投递后，pending 清账不得被
+        push 失败拦下——否则欠账原样保留，下轮 sweep 原样重发同一条。"""
+        h = Harness(tmp_path, monkeypatch)
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 2}
+        h.push_error = gitop.PushFailed("push issue/7-fix failed: boom")
+        h.orch._sweep_owe_note(7, "被丢弃的老回复")
+        h.sweep()
+        assert h.pushes == [7]
+        assert len(h.api.posts) == 1, "欠账留言投递成功"
+        assert h.store()["pending_notes"] == {}, "投递成功即清账，与 push 成败无关"
+        assert h.store()["swept_shas"] == {}, "push 失败不得记录 sha"
+        h.sweep()
+        assert len(h.api.posts) == 1, "再次 sweep 不得重发已投递留言"
+
     def test_pending_flush_and_clear(self, tmp_path, monkeypatch):
         h = Harness(tmp_path, monkeypatch)
         h.branches = [(7, SHA_A)]

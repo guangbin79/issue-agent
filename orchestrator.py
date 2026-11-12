@@ -1141,10 +1141,11 @@ class Orchestrator:
                               f"unavailable, debt kept: {exc}")
         elif changed_origin:
             self._post_note(iid, f"欠账巡检：补推 issue#{iid} {count} 提交。")
-        if push_ok:
+        # 已投递欠账的清账与 push 成败无关：push 失败只挡 swept_shas 记账，
+        # 不得挡 pending 清账——否则已落到 issue 的留言每轮原样重发（#119/#264）
+        if flushed or push_ok:
             with self._sweep_guard:
                 store = self._sweep_store_load()
-                store["swept_shas"][key] = sha
                 if flushed:
                     remaining = store["pending_notes"].get(key)
                     if remaining is not None:
@@ -1153,6 +1154,8 @@ class Orchestrator:
                         del remaining[:min(len(pending), len(remaining))]
                         if not remaining:
                             store["pending_notes"].pop(key, None)
+                if push_ok:
+                    store["swept_shas"][key] = sha
                 self._sweep_store_save(store)
 
     def _sweep_owe_note(self, iid, text):
