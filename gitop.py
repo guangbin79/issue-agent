@@ -71,6 +71,12 @@ class PushFailed(GitopError):
     """Pushing the fix branch failed: orchestrator blocks and asks for help."""
 
 
+class PermanentPushFailed(PushFailed):
+    """Deterministic push failure (rebase_safe_to_force refusal): retrying
+    the same branch tip can never succeed — the sweep escalates once per
+    tip instead of spinning every round (issue#264)."""
+
+
 class RefspecViolation(GitopError):
     """Refspec outside the issue/<iid>-fix whitelist (e.g. a default-branch refspec)."""
 
@@ -462,7 +468,8 @@ def push_fix_branch_resilient(repo: PathLike, iid, remote_url: str,
     merge-time-rebase flow) — verify the rewrite via rebase_safe_to_force
     against the observed remote tip and retry ONCE with --force-with-lease.
     Anything uncertain re-raises the original PushFailed (blocked + human
-    note). Returns "pushed" | "force-pushed".
+    note); a proven-lossy rewrite raises PermanentPushFailed (deterministic,
+    same chain same verdict). Returns "pushed" | "force-pushed".
     """
     try:
         push_fix_branch(repo, iid, remote_url, ssl_verify)
@@ -480,7 +487,7 @@ def push_fix_branch_resilient(repo: PathLike, iid, remote_url: str,
         )
     ok, reason = rebase_safe_to_force(repo, branch, remote_tip, local_tip)
     if not ok:
-        raise PushFailed(
+        raise PermanentPushFailed(
             _scrub(f"rewrite unsafe, refusing force push: {reason}", remote_url)
         )
     push(repo, remote_url, f"{branch}:{branch}", ssl_verify,

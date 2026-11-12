@@ -583,6 +583,29 @@ def test_resilient_push_refuses_unsafe_rewrite(repo, remote_url, bare_remote,
     assert git("rev-parse", f"refs/heads/{fix_branch(7)}", cwd=bare_remote) == old
 
 
+def test_resilient_unsafe_rewrite_failure_is_permanent(repo, remote_url,
+                                                       bare_remote,
+                                                       monkeypatch):
+    """issue#264: the rewrite-unsafe refusal is deterministic — same chain,
+    same verdict — so it must classify as PermanentPushFailed (still a
+    PushFailed), letting the sweep escalate once per tip instead of
+    spinning every round."""
+    import gitop
+    git("checkout", "-B", fix_branch(7), cwd=repo)
+    commit_file(repo, "fix.py", "fix\n", "fix")
+    push_fix_branch(repo, 7, remote_url)
+
+    git("reset", "--hard", "HEAD~1", cwd=repo)
+    commit_file(repo, "other.py", "other\n", "other")
+
+    monkeypatch.setattr("gitop._run",
+                        _reject_first_push_run(gitop._run, fix_branch(7)))
+    with pytest.raises(gitop.PermanentPushFailed) as excinfo:
+        push_fix_branch_resilient(repo, 7, remote_url)
+    assert isinstance(excinfo.value, PushFailed)
+    assert "rewrite unsafe" in str(excinfo.value)
+
+
 def test_push_force_with_lease_argv_shape_and_sha_gate(repo, monkeypatch):
     fake = FakeRun()
     monkeypatch.setattr("gitop._run", fake)

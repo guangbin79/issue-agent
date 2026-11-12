@@ -374,6 +374,107 @@ class TestPayoff:
 
 
 # --------------------------------------------------------------------------
+# permanent push failure (rewrite-unsafe): escalate once per tip (issue#264)
+# --------------------------------------------------------------------------
+
+class TestPermanentPushFailure:
+    def test_sweep_permanent_push_failure_escalates_once(self, tmp_path, monkeypatch):
+        """issue#264 空转根因：rewrite-unsafe 拒绝是确定性的（同链同果），
+        同 tip 重试永不可能成功——第一轮恰好一条板面求助留言＋记 unsafe
+        旗，同 sha 第二轮零推送零留言（journal 一行）。"""
+        h = Harness(tmp_path, monkeypatch)
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 2}
+        h.remote_tips = {7: SHA_B}
+        h.push_error = gitop.PermanentPushFailed(
+            "rewrite unsafe, refusing force push: old-chain commit lost")
+        h.sweep()
+        assert h.pushes == [7]
+        assert len(h.api.posts) == 1, "恰好一条板面求助留言"
+        body = h.api.posts[0][1]
+        assert "issue/7-fix" in body and "rebase" in body
+        store = h.store()
+        assert store["unsafe_flags"] == {"7": SHA_A}
+        assert store["swept_shas"] == {}, "push 未成功不得记 swept"
+        h.sweep()
+        assert h.pushes == [7], "同 sha 第二轮零推送"
+        assert len(h.api.posts) == 1, "同 sha 第二轮零留言"
+        assert h.journal("skip(unsafe"), "后续轮次 journal 一行留痕"
+
+    def test_sweep_permanent_failure_new_tip_retries_and_reescalates(
+            self, tmp_path, monkeypatch):
+        h = Harness(tmp_path, monkeypatch)
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 2}
+        h.push_error = gitop.PermanentPushFailed("rewrite unsafe")
+        h.sweep()
+        h.branches = [(7, SHA_B)]  # tip moved -> attempts resume
+        h.sweep()
+        assert h.pushes == [7, 7], "tip 变化后恢复推送尝试"
+        assert len(h.api.posts) == 2, "仍永久失败则按新 sha 再留言一次"
+        assert h.store()["unsafe_flags"] == {"7": SHA_B}
+
+    def test_sweep_transient_failure_still_retries_every_round(
+            self, tmp_path, monkeypatch):
+        h = Harness(tmp_path, monkeypatch)
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 2}
+        h.push_error = gitop.PushFailed("network blip")
+        h.sweep()
+        h.sweep()
+        assert h.pushes == [7, 7], "瞬时失败每轮重试不变"
+        assert h.api.posts == []
+        assert h.store()["unsafe_flags"] == {}
+
+    def test_sweep_escalation_note_failure_does_not_flag(
+            self, tmp_path, monkeypatch):
+        """求助留言未落地不得记旗——记了就成了对外不可见的永久静默
+        （#264 的另一个面）；下轮推送＋留言一起重试。"""
+        h = Harness(tmp_path, monkeypatch)
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 2}
+        h.push_error = gitop.PermanentPushFailed("rewrite unsafe")
+        h.api.fail_note_once = True
+        h.sweep()
+        assert h.store()["unsafe_flags"] == {}, "留言未落地不得记旗"
+        h.sweep()
+        assert h.pushes == [7, 7], "未记旗则下轮重试推送"
+        assert len(h.api.posts) == 1, "第二轮留言落地后才记旗"
+
+    def test_sweep_escalation_auth_dead_no_flag_accurate_journal(
+            self, tmp_path, monkeypatch):
+        """B-2（终闸）：auth 死道时旗未落、下轮连推送带留言整体重试，
+        journal 必须如实描述——写成 kept 会误导 #264 式排障。"""
+        h = Harness(tmp_path, monkeypatch)
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 2}
+        h.push_error = gitop.PermanentPushFailed("rewrite unsafe")
+
+        def auth_dead(project, iid, body):
+            raise api.ApiAuthError("gitea api rejected credentials: HTTP 401")
+
+        monkeypatch.setattr(h.api, "post_note", auth_dead)
+        h.sweep()
+        assert h.store()["unsafe_flags"] == {}, "留言未落地不得记旗"
+        assert h.journal("no flag recorded"), "journal 必须如实说明未记旗"
+
+    def test_sweep_unsafe_flag_does_not_block_pending_flush(
+            self, tmp_path, monkeypatch):
+        """旗标只挡推送与求助留言，不得挡 blocked reply 的欠账补发。"""
+        h = Harness(tmp_path, monkeypatch)
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 2}
+        h.push_error = gitop.PermanentPushFailed("rewrite unsafe")
+        h.sweep()  # 求助留言已投＋旗已记
+        h.push_error = None
+        h.orch._sweep_owe_note(7, "被丢弃的老回复")
+        h.sweep()
+        assert h.pushes == [7], "旗标 sha 不得再推"
+        assert len(h.api.posts) == 2, "求助留言不重发，欠账照常补发"
+        assert "被丢弃的老回复" in h.api.posts[1][1]
+
+
+# --------------------------------------------------------------------------
 # defect A: the blocked path owes the reply
 # --------------------------------------------------------------------------
 

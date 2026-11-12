@@ -1084,7 +1084,8 @@ class Orchestrator:
 
     def _sweep_payoff(self, iid, sha, ledger):
         """The gated body of _sweep_issue: closed-probe -> debounce ->
-        push (count>0) -> pending flush -> sha/ledger bookkeeping."""
+        push (count>0; rewrite-unsafe tips skipped once escalated,
+        issue#264) -> pending flush -> sha/ledger bookkeeping."""
         key = str(int(iid))
         try:
             if self.api.issue_state(self.project, iid) != "open":
@@ -1103,7 +1104,13 @@ class Orchestrator:
         count = self._sweep_commit_count(iid)
         changed_origin = False
         push_ok = True  # no push owed counts as paid
-        if count > 0:
+        unsafe = False  # rewrite-unsafe escalated: tip flagged, help sent
+        if count > 0 and store["unsafe_flags"].get(key) == sha:
+            # issue#264 空转根因：rewrite-unsafe 拒绝是确定性的（同链同果），
+            # 同 tip 重试永不可能成功——求助留言已投，本轮只留痕
+            self._journal(f"sweep: issue#{iid} skip(unsafe tip, help note sent)")
+            push_ok = False
+        elif count > 0:
             try:
                 remote_tip = gitop.remote_branch_tip(
                     self.repo_path, self.remote_url, gitop.fix_branch(iid),
@@ -1114,6 +1121,30 @@ class Orchestrator:
                 self._journal(f"sweep: issue#{iid} push {gitop.fix_branch(iid)} "
                               f"({count} ahead, origin "
                               f"{'updated' if changed_origin else 'unchanged'})")
+            except gitop.PermanentPushFailed as exc:
+                # 确定性失败：投一条求助留言（留言落地才记旗，否则下轮连
+                # 留言一起重试）并把 sha 记入 unsafe_flags，同 sha 不再推
+                self._journal(f"sweep: issue#{iid} push permanently failed, "
+                              f"escalating to issue board: {exc}")
+                try:
+                    self.api.post_note(self.project, iid,
+                                       self.api.build_note_body(
+                                           f"欠账巡检：issue#{iid} 推送卡死"
+                                           f"求助——分支 issue/{iid}-fix 与"
+                                           "远端分叉（变基丢失远端已推提交），"
+                                           "daemon 已停止自动重推，请在回合内 "
+                                           "rebase 到 origin tip 后普通推送。"))
+                    unsafe = True
+                    self._journal(f"sweep: issue#{iid} help note posted; "
+                                  f"auto-repush stopped for tip {sha[:12]}")
+                except api.ApiTransientError as exc2:
+                    self._journal(f"sweep: issue#{iid} help note failed, "
+                                  f"will retry next round: {exc2}")
+                except api.ApiAuthError as exc2:
+                    self._journal(f"CRITICAL: sweep: issue#{iid} comment "
+                                  f"channel unavailable, no flag recorded, "
+                                  f"push and note retry next round: {exc2}")
+                push_ok = False
             except (gitop.PushFailed, gitop.GitopError) as exc:
                 self._journal(f"sweep: issue#{iid} push failed, "
                               f"retry next round: {exc}")
@@ -1143,7 +1174,7 @@ class Orchestrator:
             self._post_note(iid, f"欠账巡检：补推 issue#{iid} {count} 提交。")
         # 已投递欠账的清账与 push 成败无关：push 失败只挡 swept_shas 记账，
         # 不得挡 pending 清账——否则已落到 issue 的留言每轮原样重发（#119/#264）
-        if flushed or push_ok:
+        if flushed or push_ok or unsafe:
             with self._sweep_guard:
                 store = self._sweep_store_load()
                 if flushed:
@@ -1156,6 +1187,8 @@ class Orchestrator:
                             store["pending_notes"].pop(key, None)
                 if push_ok:
                     store["swept_shas"][key] = sha
+                if unsafe:
+                    store["unsafe_flags"][key] = sha
                 self._sweep_store_save(store)
 
     def _sweep_owe_note(self, iid, text):
@@ -1291,14 +1324,18 @@ class Orchestrator:
                 raw = json.load(fh)
             notes, shas = raw.get("pending_notes"), raw.get("swept_shas")
             if isinstance(notes, dict) and isinstance(shas, dict):
+                flags = raw.get("unsafe_flags")
                 return {"pending_notes": {str(k): [str(t) for t in v]
                                           for k, v in notes.items()
                                           if isinstance(v, list)},
                         "swept_shas": {str(k): str(v)
-                                       for k, v in shas.items()}}
+                                       for k, v in shas.items()},
+                        "unsafe_flags": {str(k): str(v)
+                                         for k, v in flags.items()}
+                        if isinstance(flags, dict) else {}}
         except (OSError, ValueError, AttributeError):
             pass
-        return {"pending_notes": {}, "swept_shas": {}}
+        return {"pending_notes": {}, "swept_shas": {}, "unsafe_flags": {}}
 
     def _sweep_store_save(self, store: dict) -> None:
         """Atomic tmp+fsync+rename, state.py's write pattern."""
