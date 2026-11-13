@@ -32,6 +32,7 @@ def write_config(tmp_path, **overrides):
 def no_ssl_env(monkeypatch):
     monkeypatch.delenv("ISSUE_AGENT_SSL_VERIFY", raising=False)
     monkeypatch.delenv("ISSUE_AGENT_CONFIG", raising=False)
+    monkeypatch.delenv("AGORA_HOME", raising=False)
 
 
 def test_happy_path_defaults(tmp_path):
@@ -247,3 +248,82 @@ def test_heartbeat_interval_default_600_and_parses_from_file(tmp_path):
 def test_heartbeat_interval_zero_opt_out_accepted(tmp_path):
     cfg = config.load_config(write_config(tmp_path, heartbeat_interval=0))
     assert cfg.heartbeat_interval == 0
+
+
+# --- agora execution mode (plan Task 1) --------------------------------------
+
+
+def agora_config(tmp_path, **overrides):
+    """A loadable execution_mode=agora config: every agora-required field
+    set, overridable per-branch under test."""
+    payload = {
+        "execution_mode": "agora",
+        "verify_command": "python3 -m pytest tests/ -q",
+        "router_model": "zai-coding-plan/glm-5.3",
+        "agora_home": str(tmp_path / "plaza"),
+    }
+    payload.update(overrides)
+    return write_config(tmp_path, **payload)
+
+
+def test_agora_defaults_are_legacy_and_inert(tmp_path):
+    """缺省全 inert：legacy 模式、空 router/agora 字段、15s 轮询——现有
+    部署不写任何 agora 键也照常加载（零 agora 依赖）。"""
+    cfg = config.load_config(write_config(tmp_path))
+    assert cfg.execution_mode == "legacy"
+    assert cfg.router_model == ""
+    assert cfg.agora_home == ""
+    assert cfg.agora_poll_interval == 15
+
+
+def test_agora_mode_requires_trusted_verify_and_router_model(tmp_path):
+    """计划锚例：agora 模式强校验，ConfigError 点名缺失字段。"""
+    with pytest.raises(config.ConfigError, match="verify_command"):
+        config.load_config(agora_config(tmp_path, verify_command=""))
+    with pytest.raises(config.ConfigError, match="router_model"):
+        config.load_config(agora_config(tmp_path, router_model=""))
+    with pytest.raises(config.ConfigError, match="agora_home"):
+        config.load_config(agora_config(tmp_path, agora_home=""))
+
+
+def test_agora_mode_full_config_loads(tmp_path):
+    cfg = config.load_config(agora_config(tmp_path, agora_poll_interval=5))
+    assert cfg.execution_mode == "agora"
+    assert cfg.router_model == "zai-coding-plan/glm-5.3"
+    assert cfg.agora_home == str(tmp_path / "plaza")
+    assert cfg.agora_poll_interval == 5
+
+
+def test_agora_home_falls_back_to_env_then_file_wins(tmp_path, monkeypatch):
+    """缺省回落 $AGORA_HOME 再 ""；文件值非空时压过环境变量。"""
+    monkeypatch.setenv("AGORA_HOME", "/tmp/opencode/plaza-env")
+    cfg = config.load_config(agora_config(tmp_path, agora_home=""))
+    assert cfg.agora_home == "/tmp/opencode/plaza-env"
+    cfg = config.load_config(
+        agora_config(tmp_path, agora_home="/tmp/opencode/plaza-file"))
+    assert cfg.agora_home == "/tmp/opencode/plaza-file"
+    # 环境也无 → 字段落 ""（legacy 容忍 ""；agora 模式的非空由强校验管）
+    monkeypatch.delenv("AGORA_HOME", raising=False)
+    cfg = config.load_config(write_config(tmp_path))
+    assert cfg.agora_home == ""
+
+
+def test_execution_mode_bad_value_rejected_naming_field(tmp_path):
+    with pytest.raises(config.ConfigError) as excinfo:
+        config.load_config(write_config(tmp_path, execution_mode="turbo"))
+    assert "execution_mode" in str(excinfo.value)
+
+
+def test_legacy_tolerates_empty_agora_fields(tmp_path):
+    """legacy 对四字段全容忍：空 verify/router/agora_home 照常加载。"""
+    cfg = config.load_config(write_config(
+        tmp_path, verify_command="", router_model="", agora_home="",
+        agora_poll_interval=15))
+    assert cfg.execution_mode == "legacy"
+
+
+@pytest.mark.parametrize("bad", [0, -3, "often"])
+def test_agora_poll_interval_must_be_at_least_one(tmp_path, bad):
+    with pytest.raises(config.ConfigError) as excinfo:
+        config.load_config(agora_config(tmp_path, agora_poll_interval=bad))
+    assert "agora_poll_interval" in str(excinfo.value)

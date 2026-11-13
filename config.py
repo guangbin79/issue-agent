@@ -55,6 +55,11 @@ class Config:
     heartbeat_interval: int = 600   # long-turn liveness note cadence; 0 = off
     sweep_interval: int = 1800      # 欠账巡检 (debt sweep) cadence; 0 = off
     max_parallel: int = 1         # bounded concurrent turns (1 = historical serial)
+    # --- agora execution mode (plan Task 1); legacy 对以下四字段全容忍 ---
+    execution_mode: str = "legacy"  # "legacy" | "agora"; 显式启用，禁自动切换
+    router_model: str = ""  # agora 模式必填：持久 Router 的模型
+    agora_home: str = ""     # 缺省回落 $AGORA_HOME 再 ""
+    agora_poll_interval: int = 15  # agora monitor 轮询秒数，≥1
 
     @property
     def note_marker(self) -> str:
@@ -92,6 +97,15 @@ def _bounded_int(raw, field, default, minimum, maximum=None):
         raise ConfigError(
             f"config field {field} out of range [{minimum}, {top}]: {value}")
     return value
+
+
+def _execution_mode(raw):
+    """execution_mode 只认 legacy/agora；坏值 ConfigError 点名字段。"""
+    mode = str(raw.get("execution_mode", "legacy") or "legacy")
+    if mode not in ("legacy", "agora"):
+        raise ConfigError(
+            f"config field execution_mode must be legacy or agora, got {mode!r}")
+    return mode
 
 
 def load_config(path: "str | Path | None" = None) -> Config:
@@ -148,6 +162,12 @@ def load_config(path: "str | Path | None" = None) -> Config:
             raw.get("heartbeat_interval", 600), "heartbeat_interval", 600, 0),
         sweep_interval=_bounded_int(
             raw.get("sweep_interval", 1800), "sweep_interval", 1800, 0),
+        execution_mode=_execution_mode(raw),
+        router_model=str(raw.get("router_model", "") or ""),
+        agora_home=(str(raw.get("agora_home", "") or "")
+                    or os.environ.get("AGORA_HOME", "")),
+        agora_poll_interval=_bounded_int(
+            raw.get("agora_poll_interval", 15), "agora_poll_interval", 15, 1),
     )
     # Canonical-path pin: after all parsing so every pre-existing error
     # contract (missing fields, bad numerics) fires unchanged. Both sides
@@ -161,4 +181,17 @@ def load_config(path: "str | Path | None" = None) -> Config:
             f"config repo_path is not the pinned canonical repository: "
             f"expected {cfg.canonical_path}, got {cfg.repo_path} "
             f"(realpath {real_repo})")
+    # agora 模式强校验（计划 Task 1）：verify_command 只能来自实例可信配置，
+    # router_model/agora_home 必须显式；legacy 对四字段全容忍——现有部署零
+    # agora 依赖（缺键/空值照常加载）。
+    if cfg.execution_mode == "agora":
+        missing_agora = [
+            name for name, value in (("verify_command", cfg.verify_command),
+                                     ("router_model", cfg.router_model),
+                                     ("agora_home", cfg.agora_home))
+            if not value]
+        if missing_agora:
+            raise ConfigError(
+                "execution_mode=agora requires non-empty "
+                + ", ".join(missing_agora))
     return cfg

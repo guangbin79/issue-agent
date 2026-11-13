@@ -193,7 +193,8 @@ class Orchestrator:
                  max_parallel: int = 1,
                  callback_url: str = "",
                  worktree_path: str = "",
-                 teardown: Optional[Callable[[], None]] = None):
+                 teardown: Optional[Callable[[], None]] = None,
+                 agora_client=None):
         self.project = project
         self.api = api
         self.listener = listener
@@ -246,6 +247,9 @@ class Orchestrator:
         self._since_path = os.fspath(state_path) + ".since.json"
         self.callback_url = callback_url
         self._teardown = teardown
+        # agora 服务客户端（计划 Task 1 只注入保存；Task 3 的 _run_turn 才
+        # 消费——pre-flight 裁定本单不动执行路径）。legacy 恒 None。
+        self.agora_client = agora_client
         self.max_parallel = max(1, int(max_parallel))
         # ledger lock: every load-mutate-save sequence (and decide+claim) runs
         # under it, so worker and a concurrent reconcile never interleave writes.
