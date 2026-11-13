@@ -26,6 +26,7 @@ from gitop import (
     PushFailed,
     RefspecViolation,
     agent_tracking_ref,
+    ensure_fix_branch,
     fetch_base,
     fix_branch,
     fix_branch_pushed,
@@ -716,3 +717,55 @@ def test_fix_branch_pushed_ls_remote_error_propagates(repo, remote_url,
     monkeypatch.setattr("gitop._run", broken_ls_run)
     with pytest.raises(GitopError):
         fix_branch_pushed(repo, 9, remote_url)
+
+
+# --- ensure_fix_branch (plan Task 3: 开发分支准备) ---------------------------
+
+
+def _assert_main_checkout_untouched(repo):
+    """ensure_fix_branch 绝不切主检出：分支不变、无新 worktree 注册。"""
+    assert current_branch(repo) == "master"
+    worktrees = git("worktree", "list", cwd=repo).splitlines()
+    assert len(worktrees) == 1
+
+
+def test_ensure_fix_branch_creates_from_agent_remote_default_when_remote_absent(
+        repo, remote_url):
+    """新 issue：远端无开发支 → 从最新 agent-remote/<default> 创建本地分支，
+    返回其 tip。"""
+    fetch_base(repo, remote_url, "master")
+    tip = ensure_fix_branch(repo, 7, "master", remote_url)
+    baseline = git("rev-parse", agent_tracking_ref("master"), cwd=repo)
+    assert tip == baseline
+    assert git("rev-parse", "refs/heads/issue/7-fix", cwd=repo) == baseline
+    _assert_main_checkout_untouched(repo)
+
+
+def test_ensure_fix_branch_uses_remote_position_when_local_absent(
+        repo, remote_url, tmp_path):
+    """远端开发支已存在 → fetch 其有效位置进 agent-remote 命名空间，本地
+    分支从该位置创建。"""
+    remote_tip = advance_remote(tmp_path, remote_url, "fix1",
+                                branch="issue/7-fix")
+    fetch_base(repo, remote_url, "master")
+    tip = ensure_fix_branch(repo, 7, "master", remote_url)
+    assert tip == remote_tip
+    assert git("rev-parse", "refs/heads/issue/7-fix", cwd=repo) == remote_tip
+    assert git("rev-parse", "refs/remotes/agent-remote/issue/7-fix",
+               cwd=repo) == remote_tip
+    _assert_main_checkout_untouched(repo)
+
+
+def test_ensure_fix_branch_never_resets_existing_local_branch(
+        repo, remote_url, tmp_path):
+    """已有本地分支不被重置：远端位置只进 tracking ref，本地 tip 原样返回。"""
+    fetch_base(repo, remote_url, "master")
+    baseline = git("rev-parse", agent_tracking_ref("master"), cwd=repo)
+    git("branch", fix_branch(7), baseline, cwd=repo)
+    remote_tip = advance_remote(tmp_path, remote_url, "fix2",
+                                branch="issue/7-fix")
+    tip = ensure_fix_branch(repo, 7, "master", remote_url)
+    assert tip == baseline, "本地分支 tip 不得被远端位置重置"
+    assert git("rev-parse", "refs/remotes/agent-remote/issue/7-fix",
+               cwd=repo) == remote_tip, "远端有效位置仍须 fetch 进 tracking ref"
+    _assert_main_checkout_untouched(repo)

@@ -233,6 +233,38 @@ def prune_worktrees(main_repo: PathLike) -> None:
     _git(main_repo, ["worktree", "prune"])
 
 
+def ensure_fix_branch(main_repo: PathLike, iid, default_branch: str = "master",
+                      remote_url: str = "", ssl_verify: bool = True) -> str:
+    """Prepare the issue/<iid>-fix TARGET REF only — never touch the main
+    checkout (agora workers branch from this position in their own envs;
+    设计 §5.2).
+
+    - remote issue/<iid>-fix exists: fetch its effective position into the
+      agent-remote namespace (forced refspec, fetch_base style)
+    - remote absent: local branch (when created) starts from the latest
+      refs/remotes/agent-remote/<default_branch> — callers run fetch_base
+      first, that ref IS the fresh baseline
+    - an existing local branch is NEVER reset (a later round may legitimately
+      lead the remote position)
+
+    Returns the local branch tip sha.
+    """
+    branch = fix_branch(iid)
+    tracking = f"{AGENT_REMOTE_NS}/{branch}"
+    remote_tip = remote_branch_tip(main_repo, remote_url, branch, ssl_verify)
+    if remote_tip:
+        env, clean_url = _net_env(remote_url)
+        _git(main_repo,
+             [*_ssl_args(remote_url, ssl_verify), "fetch", clean_url,
+              f"+refs/heads/{branch}:{tracking}"],
+             remote_url=remote_url, env=env)
+    if not _branch_exists(main_repo, branch):
+        source = tracking if remote_tip else agent_tracking_ref(default_branch)
+        _git(main_repo, ["branch", branch, source])
+    return _git(main_repo,
+                ["rev-parse", "--verify", f"refs/heads/{branch}"]).strip()
+
+
 class SweepReport(NamedTuple):
     """Startup sweep outcome: removed = worktrees successfully removed;
     kept = candidates git refused (dirty/untracked — left in place, the

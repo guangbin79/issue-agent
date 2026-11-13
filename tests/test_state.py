@@ -7,6 +7,7 @@ Run: python3 -m pytest tests/test_state.py -q   (from scripts/issue-agent/)
 import json
 from datetime import datetime, timedelta
 
+import state as state_mod
 from state import (
     adopt_existing,
     claim,
@@ -210,3 +211,62 @@ def test_report_probe_fields_survive_roundtrip(tmp_path):
     fresh = adopt_existing({"issues": {}}, {53: [1]})["issues"]["53"]
     assert fresh["report_probe_pending"] is False
     assert fresh["report_probe_count"] == 0
+
+
+# --- agora ledger fields (plan Task 3, 设计 §9.6 六字段) ---------------------
+
+
+def test_agora_fields_survive_save_load_and_legacy_session_is_untouched(tmp_path):
+    """计划锚例：agora 六字段随 save/load 往返；legacy session_id 原样保留
+    （agora worker sid 不落 session_id——设计 §9.4 每回合一新会话）。"""
+    path = tmp_path / "state.json"
+    st = {"issues": {}}
+    adopt_existing(st, {7: [3]})
+    entry = st["issues"]["7"]
+    entry["status"] = "active"
+    entry["session_id"] = "legacy-sid"
+    entry["agora_task_id"] = "ag-123"
+    entry["agora_status"] = "awaiting_external"
+    entry["delivery_commit"] = "a" * 40
+    entry["agora_pending"] = True
+    entry["router_goal"] = "g"
+    entry["router_model"] = "m"
+    save_state(path, st)
+    loaded = load_state(path)["issues"]["7"]
+    assert loaded["session_id"] == "legacy-sid"
+    assert loaded["agora_task_id"] == "ag-123"
+    assert loaded["agora_status"] == "awaiting_external"
+    assert loaded["delivery_commit"] == "a" * 40
+    assert loaded["agora_pending"] is True
+    assert loaded["router_goal"] == "g"
+    assert loaded["router_model"] == "m"
+
+
+def test_agora_fields_default_in_new_issue_and_normalize(tmp_path):
+    """六字段进 _new_issue（新条目默认）与 _normalize（legacy 时代旧账加载
+    补默认）——缺键旧账不得在往返中凭空丢字段或报错。"""
+    fresh = adopt_existing({"issues": {}}, {61: [1]})["issues"]["61"]
+    assert fresh["agora_task_id"] is None
+    assert fresh["agora_status"] is None
+    assert fresh["delivery_commit"] is None
+    assert fresh["agora_pending"] is False
+    assert fresh["router_goal"] is None
+    assert fresh["router_model"] is None
+
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"issues": {"62": {"status": "active"}}}))
+    normed = load_state(path)["issues"]["62"]
+    assert normed["agora_task_id"] is None
+    assert normed["agora_status"] is None
+    assert normed["delivery_commit"] is None
+    assert normed["agora_pending"] is False
+    assert normed["router_goal"] is None
+    assert normed["router_model"] is None
+
+
+def test_state_docstring_documents_the_agora_fields():
+    """四处同步之四：模块 docstring 的 schema 文档必须列出六字段，否则
+    schema 说明与实现漂移。"""
+    for key in ("agora_task_id", "agora_status", "delivery_commit",
+                "agora_pending", "router_goal", "router_model"):
+        assert key in state_mod.__doc__, f"docstring missing {key}"

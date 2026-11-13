@@ -23,6 +23,16 @@ which note ids have already been consumed. Layout:
         #   produced); the sweep probes the session within a 2-probe budget
         #   and re-posts the late report; cleared by delivery/claim/close.
         "report_probe_count": int,         # probe budget consumed (max 2)
+        # --- agora fields (plan Task 3, 设计 §9.6) ---
+        "agora_task_id": str|null,         # 最近一次 create 成功的 agora 任务
+        "agora_status": str|null,          # monitor 同步的 agora 任务态 (T4/T5)
+        "delivery_commit": str|null,       # 外部交付 commit (Task 4)
+        "agora_pending": bool,             # 待派发标记：容量满/agora 不可用/
+        #   建单-派发间中断；claim 留存，重试复用已持久化 goal/model
+        "router_goal": str|null,           # 首次 create 前持久化（同 payload
+        #   重试才能取回原任务，§8.1）
+        "router_model": str|null,
+        #   ^ legacy session_id 永不被 agora 覆盖（§9.4 每回合一新会话）。
     }}}
 
 Write path is atomic (tmp + fsync + rename + dir fsync) and every successful
@@ -42,7 +52,7 @@ PathLike = Union[str, "os.PathLike[str]"]
 
 # 账本根字段（agora 模式，计划 Task 2）：持久语义 Router 的 opencode
 # session id。放在根级而非任何 issue 条目——Router 跨 issue 共享一个会话
-# （设计 §9.6）；issue 级六字段扩展归计划 Task 3，此处只有这一个新键。
+# （设计 §9.6）；issue 级的 agora 六字段扩展见上方条目 schema（Task 3）。
 ROUTER_SESSION_KEY = "router_session_id"
 
 
@@ -82,6 +92,12 @@ def _new_issue(status: str) -> dict:
         "review_push_pending_at": None,
         "report_probe_pending": False,
         "report_probe_count": 0,
+        "agora_task_id": None,
+        "agora_status": None,
+        "delivery_commit": None,
+        "agora_pending": False,
+        "router_goal": None,
+        "router_model": None,
     }
 
 
@@ -106,6 +122,14 @@ def _normalize(state: dict) -> dict:
             "review_push_pending_at": entry.get("review_push_pending_at"),
             "report_probe_pending": bool(entry.get("report_probe_pending")),
             "report_probe_count": int(entry.get("report_probe_count") or 0),
+            # agora 六字段（设计 §9.6）：legacy 时代旧账缺键 → 默认值，
+            # 不得因往返丢字段或报错。
+            "agora_task_id": entry.get("agora_task_id"),
+            "agora_status": entry.get("agora_status"),
+            "delivery_commit": entry.get("delivery_commit"),
+            "agora_pending": bool(entry.get("agora_pending")),
+            "router_goal": entry.get("router_goal"),
+            "router_model": entry.get("router_model"),
         }
     state["issues"] = issues
     return state
