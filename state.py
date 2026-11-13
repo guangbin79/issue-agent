@@ -4,7 +4,9 @@ per-note-id idempotency.
 The ledger is the single source of truth for which issues are tracked and
 which note ids have already been consumed. Layout:
 
-    {"issues": {"<iid>": {
+    {"router_session_id": str|null,        # root: persistent Router opencode
+    #   session id (agora mode, plan Task 2); None/absent in legacy.
+     "issues": {"<iid>": {
         "status": "adopted"|"active"|"done"|"paused"|"blocked"|"defer"|"pending",
         "session_id": str|null,
         "branch": str|null,
@@ -37,6 +39,20 @@ from typing import Callable, Optional, Union
 STATUSES = ("adopted", "active", "done", "paused", "blocked", "defer", "pending")
 DEFAULT_CLAIM_TIMEOUT_S = 5500
 PathLike = Union[str, "os.PathLike[str]"]
+
+# 账本根字段（agora 模式，计划 Task 2）：持久语义 Router 的 opencode
+# session id。放在根级而非任何 issue 条目——Router 跨 issue 共享一个会话
+# （设计 §9.6）；issue 级六字段扩展归计划 Task 3，此处只有这一个新键。
+ROUTER_SESSION_KEY = "router_session_id"
+
+
+def router_session_id(state: dict) -> Optional[str]:
+    """Root-level persistent Router session id, or None.
+
+    Garbage (missing/non-string/empty) degrades to None — a fresh session
+    is cheaper than trusting a corrupt id."""
+    value = state.get(ROUTER_SESSION_KEY) if isinstance(state, dict) else None
+    return value if isinstance(value, str) and value else None
 
 
 def _to_iso(value) -> str:

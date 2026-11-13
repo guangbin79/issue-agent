@@ -290,6 +290,51 @@ def test_daemon_legacy_mode_passes_none_and_never_builds_client(
     captured = _wiring_scaffold(
         tmp_path, monkeypatch, _agora_cfg(tmp_path, execution_mode="legacy"))
     monkeypatch.setattr(daemon, "AgoraClient", FakeClient)
+
+    def no_router(**kwargs):
+        raise AssertionError("legacy must not build a router")
+
+    monkeypatch.setattr(daemon, "SemanticRouter", no_router)
     assert daemon.main() == 0
     assert built == []
     assert captured["agora_client"] is None
+    assert captured["router"] is None
+
+
+# --- agora router wiring (plan Task 2) ----------------------------------------
+
+
+def test_daemon_agora_mode_builds_router_and_threads_it(tmp_path, monkeypatch):
+    """agora 模式：daemon 构造 SemanticRouter（模板/自身模型/账本根路径）
+    并以 router= 注入 orchestrator（消费归 Task 3，此处仅惰性接线）。"""
+    built = []
+
+    class FakeRouter:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            built.append(self)
+
+    captured = _wiring_scaffold(tmp_path, monkeypatch, _agora_cfg(tmp_path))
+    monkeypatch.setattr(daemon, "SemanticRouter", FakeRouter)
+    assert daemon.main() == 0
+    assert len(built) == 1
+    assert built[0].kwargs == {
+        "template_path": daemon._PKG_DIR / "ROUTER.template.md",
+        "cwd": str(tmp_path),
+        "router_model": "zai-coding-plan/glm-5.3",
+        "state_path": tmp_path / "state" / "state.json",
+        "timeout_s": 1800,
+    }
+    assert captured["router"] is built[0]
+
+
+def test_daemon_router_reads_the_same_ledger_as_orchestrator(
+        tmp_path, monkeypatch):
+    """Router 的 session id 持久化与 orchestrator 共用同一份账本文件。"""
+    import types
+
+    captured = _wiring_scaffold(tmp_path, monkeypatch, _agora_cfg(tmp_path))
+    monkeypatch.setattr(daemon, "SemanticRouter",
+                        lambda **kwargs: types.SimpleNamespace(kwargs=kwargs))
+    assert daemon.main() == 0
+    assert captured["router"].kwargs["state_path"] == captured["state_path"]

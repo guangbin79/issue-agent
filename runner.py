@@ -244,15 +244,21 @@ def _turn(argv, cwd, timeout_s, run, session_targeted, prefer_report=False):
 
 
 def new_session(cwd, title, message, timeout_s=DEFAULT_TIMEOUT_S, run=subprocess.run,
-                on_event=None, cred_prefix=None, popen=subprocess.Popen):
+                on_event=None, cred_prefix=None, popen=subprocess.Popen,
+                model=None):
     """Start a fresh opencode session titled *title* and wait for the reply.
 
     on_event (heartbeat): when given, the turn streams through the proven
     select loop and every complete NDJSON line reaches the callback
     mid-flight; without it the historical blocking path runs unchanged.
-    cred_prefix (agora 发牌), non-empty: prepended to *message*."""
+    cred_prefix (agora 发牌), non-empty: prepended to *message*.
+    model (plan Task 2), non-empty: adds --model <model>; absent (None/"")
+    keeps the argv byte-identical to the historical form."""
     message = _with_cred_prefix(message, cred_prefix)
-    argv = ["opencode", "run", "--format", "json", "--title", title, message]
+    argv = ["opencode", "run", "--format", "json"]
+    if model:
+        argv += ["--model", model]
+    argv += ["--title", title, message]
     if on_event is not None:
         return _turn_streaming(argv, cwd, timeout_s, None, popen,
                                session_targeted=False, on_event=on_event,
@@ -420,11 +426,17 @@ def new_session_publishing_sid(cwd, title, message, timeout_s, sid_path,
         on_event=on_event)
 
 def continue_session(cwd, session_id, message, timeout_s=DEFAULT_TIMEOUT_S, run=subprocess.run,
-                     on_event=None, cred_prefix=None, popen=subprocess.Popen):
+                     on_event=None, cred_prefix=None, popen=subprocess.Popen,
+                     model=None):
     """Send *message* to session *session_id* and wait for the reply.
-    cred_prefix (agora 发牌), non-empty: prepended to *message*."""
+    cred_prefix (agora 发牌), non-empty: prepended to *message*.
+    model (plan Task 2), non-empty: adds --model <model>; absent keeps the
+    argv byte-identical to the historical form."""
     message = _with_cred_prefix(message, cred_prefix)
-    argv = ["opencode", "run", "--format", "json", "--session", session_id, message]
+    argv = ["opencode", "run", "--format", "json"]
+    if model:
+        argv += ["--model", model]
+    argv += ["--session", session_id, message]
     if on_event is not None:
         return _turn_streaming(argv, cwd, timeout_s, None, popen,
                                session_targeted=True, on_event=on_event,

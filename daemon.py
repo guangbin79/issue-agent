@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 from api import GitLabClient
 from agora_client import AgoraClient
 from config import ConfigError, load_config
+from router import SemanticRouter
 import gitop
 import orchestrator
 
@@ -173,6 +174,16 @@ def main(argv=None) -> int:
                                 home=config.agora_home,
                                 poll_interval=config.agora_poll_interval)
                     if config.execution_mode == "agora" else None)
+    # 持久语义 Router（计划 Task 2）：agora 模式才构造（构造只读模板与
+    # 账本，零网络；session 建立在首次 decide）；orchestrator 消费归
+    # Task 3，此处仅惰性接线。legacy 恒 None、不读模板。
+    semantic_router = (SemanticRouter(
+        template_path=_PKG_DIR / "ROUTER.template.md",
+        cwd=config.repo_path,
+        router_model=config.router_model,
+        state_path=_STATE_DIR / "state.json",
+        timeout_s=config.opencode_timeout)
+        if config.execution_mode == "agora" else None)
     http_mod = _load_http_module()
     # Port: the unit's ISSUE_AGENT_PORT env wins; config.port otherwise
     # (pre-unit installs and manual config edits keep working unchanged).
@@ -204,6 +215,7 @@ def main(argv=None) -> int:
         callback_url=config.callback_url,
         worktree_path=config.worktree_path,
         agora_client=agora_client,
+        router=semantic_router,
         teardown=_teardown_self_cancel,
     )
     port = orch.start()

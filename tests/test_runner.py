@@ -312,6 +312,56 @@ class TestCommandConstruction:
         assert fake.calls[0][1]["timeout"] == 123
 
 
+class TestModelSelection:
+    """Plan Task 2: new/continue 可选 model——仅显式提供才加 --model；
+    缺席（含显式 None/空串）时 argv 与历史逐字节一致（回归锚）。"""
+
+    def _ok(self):
+        return completed(stdout='{"sessionID":"ses_m","part":{"type":"text","text":"ok"}}')
+
+    def test_new_session_without_model_keeps_historical_argv(self):
+        fake = FakeRun([self._ok()])
+        runner.new_session("/repo", "t", "m", run=fake)
+        assert fake.calls[0][0] == [
+            "opencode", "run", "--format", "json", "--title", "t", "m",
+        ]
+
+    def test_new_session_explicit_none_model_keeps_historical_argv(self):
+        fake = FakeRun([self._ok()])
+        runner.new_session("/repo", "t", "m", run=fake, model=None)
+        assert fake.calls[0][0] == [
+            "opencode", "run", "--format", "json", "--title", "t", "m",
+        ]
+
+    def test_new_session_with_model_inserts_flag_pair(self):
+        fake = FakeRun([self._ok()])
+        runner.new_session("/repo", "t", "m", run=fake, model="prov/m")
+        assert fake.calls[0][0] == [
+            "opencode", "run", "--format", "json",
+            "--model", "prov/m", "--title", "t", "m",
+        ]
+
+    def test_continue_session_without_model_keeps_historical_argv(self):
+        fake = FakeRun([self._ok()])
+        runner.continue_session("/repo", "ses_1", "m", run=fake)
+        assert fake.calls[0][0] == [
+            "opencode", "run", "--format", "json", "--session", "ses_1", "m",
+        ]
+
+    def test_continue_session_with_model_inserts_flag_pair(self):
+        fake = FakeRun([self._ok()])
+        runner.continue_session("/repo", "ses_1", "m", run=fake, model="prov/m")
+        assert fake.calls[0][0] == [
+            "opencode", "run", "--format", "json",
+            "--model", "prov/m", "--session", "ses_1", "m",
+        ]
+
+    def test_empty_model_string_treated_as_absent(self):
+        fake = FakeRun([self._ok()])
+        runner.new_session("/repo", "t", "m", run=fake, model="")
+        assert "--model" not in fake.calls[0][0]
+
+
 # --- happy path --------------------------------------------------------------
 
 
