@@ -237,7 +237,7 @@ run_install() {
     ISSUE_AGENT_ROUTER_MODEL="${ISSUE_AGENT_ROUTER_MODEL:-}" \
     ISSUE_AGENT_AGORA_HOME="${ISSUE_AGENT_AGORA_HOME:-}" \
     ISSUE_AGENT_AGORA_POLL_INTERVAL="${ISSUE_AGENT_AGORA_POLL_INTERVAL:-}" \
-    bash "$PKG_DIR/install.sh" >"$SAN/install.out" 2>&1 || RC=$?
+    bash "${UIA_INSTALL_SRC:-$PKG_DIR}/install.sh" >"$SAN/install.out" 2>&1 || RC=$?
 }
 
 run_uninstall() {
@@ -295,6 +295,36 @@ assert_eq "$SEC2" "$SEC1" "secret_token reused across runs"
 POSTS="$(grep -c '^POST .*/hooks$' "$STUB_STATE/curl.log" || true)"
 assert_eq "$POSTS" "1" "webhook POST called exactly once across two runs"
 assert_grep "$STUB_STATE/curl.log" '^PATCH .*/hooks/[0-9]'  # run 2 patched, not stacked
+
+echo "== 1b. snapshot carries every startup template asset the daemon reads =="
+# 口径＝「daemon 启动期会读的模板资产」（daemon.py: PROTOCOL.template.md
+# 渲染 + ROUTER.template.md 喂 SemanticRouter）——再加启动期模板时须同步
+# install.sh 部署清单与本断言；仓内 e2e 从仓根跑测不到此缺口（文件在）。
+new_sandbox
+run_install
+assert_eq "$RC" "0" "install exit code (template manifest)"
+SNAP="$FAKE_HOME/.local/lib/repo-issue-agent"
+assert_file "$SNAP/PROTOCOL.template.md"
+assert_file "$SNAP/ROUTER.template.md"
+
+echo "== 1c. damaged source tree: manifest template missing -> die offline, live snapshot untouched =="
+# GNU cp 单操作数失败后仍继续拷其余：无前置校验时重跑升级会先把新 *.py 覆盖进
+# 既有快照再失败，留下「新 daemon + 无模板」半更新快照＝下次重启崩溃循环——
+# 须离线先死且分毫不动既有快照。夹具只拷安装面输入（免整仓复制），故意漏
+# ROUTER.template.md。
+new_sandbox
+mkdir -p "$SAN/pkg-damaged"
+cp "$PKG_DIR"/*.py "$PKG_DIR"/install.sh "$PKG_DIR"/PROTOCOL.template.md "$SAN/pkg-damaged/"
+run_install  # intact source: create the live snapshot first
+assert_eq "$RC" "0" "baseline install exit code"
+SNAP_SUM_BEFORE="$(cd "$FAKE_HOME/.local/lib/repo-issue-agent" && sha256sum * | sha256sum)"
+rm -f "$STUB_STATE/curl.log"  # 直接证据预备：拒绝必须发生在任何网络步之前
+UIA_INSTALL_SRC="$SAN/pkg-damaged" run_install
+assert_eq "$RC" "1" "missing source template (reinstall) exit code"
+assert_grep "$SAN/install.out" '缺快照清单资产'
+assert_no "$STUB_STATE/curl.log"  # died before any network probe
+SNAP_SUM_AFTER="$(cd "$FAKE_HOME/.local/lib/repo-issue-agent" && sha256sum * | sha256sum)"
+assert_eq "$SNAP_SUM_AFTER" "$SNAP_SUM_BEFORE" "existing snapshot untouched by damaged reinstall"
 
 echo "== 2. wrong PAT -> abort exit 1, nothing written =="
 new_sandbox

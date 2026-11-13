@@ -89,7 +89,8 @@
 #   存活。本次 env/json 显式提供的字段照常覆盖（覆盖事实经 env_over_json 记录）。
 #
 # ---- 部署产物 ----------------------------------------------------------------
-#   快照 ~/.local/lib/<service>/（*.py + PROTOCOL.template.md）；
+#   快照 ~/.local/lib/<service>/（*.py + PROTOCOL.template.md + ROUTER.template.md
+#   ——daemon 启动期读取的全部模板资产）；
 #   config ~/.config/<service>/config.json（0600，含 PAT、gitea_user、
 #   project=owner/repo、service_name/canonical_path/identity/out_of_scope/
 #   verify_command）；systemd user unit；Gitea 仓库 webhook
@@ -228,6 +229,13 @@ env_over_json() { # env_over_json <env_var> <json_value> <field>
 
 for cmd in curl python3 git systemctl loginctl; do
   command -v "$cmd" >/dev/null 2>&1 || die "缺少命令：$cmd"
+done
+
+# 快照清单资产前置校验：GNU cp 单操作数失败后仍继续拷其余——源树缺模板时
+# cp 会先把新 *.py 覆盖进既有快照再失败，留下「新 daemon + 无模板」半更新
+# 快照（第 3 节无回滚）＝下次重启 FileNotFoundError 崩溃循环。离线先死。
+for f in PROTOCOL.template.md ROUTER.template.md; do
+  [ -f "$SCRIPT_DIR/$f" ] || die "源树缺快照清单资产：${SCRIPT_DIR}/${f}（拒绝半更新部署）"
 done
 
 # --- 0. per-project identity: env > <project>/.issue-agent.json > defaults --
@@ -694,7 +702,8 @@ EOF
 # --- 3. deploy snapshot ------------------------------------------------------
 
 mkdir -p "$SNAPSHOT_DIR"
-cp -f "$SCRIPT_DIR"/*.py "$SCRIPT_DIR"/PROTOCOL.template.md "$SNAPSHOT_DIR"/
+cp -f "$SCRIPT_DIR"/*.py "$SCRIPT_DIR"/PROTOCOL.template.md "$SCRIPT_DIR"/ROUTER.template.md "$SNAPSHOT_DIR"/ \
+  || die "快照部署失败（cp 退出非零；源树资产不可读或目标不可写）"
 note "快照已部署：${SNAPSHOT_DIR}"
 
 # --- 4. config (0600; secret_token reused across re-runs) -------------------
