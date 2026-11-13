@@ -891,11 +891,24 @@ PY
 # 非标量 agora 值（误型）离线拒，不得静默按缺省落 legacy
 # （缺 verify_command 的拒绝用例在 31 的净沙箱——本沙箱已有合法 config，
 # 重装会经既有 config 补齐 verify_command）
+rm -f "$STUB_STATE/curl.log"  # 直接证据预备：拒绝必须发生在任何网络步之前
 printf '{"canonical_path": "%s", "identity": "x", "out_of_scope": ["y"], "verify_command": "true", "agora": {"execution_mode": true, "router_model": "m", "agora_home": "%s"}}\n' \
   "$REPO" "$SAN/agora-home2" > "$REPO/.issue-agent.json"
 run_install
 assert_eq "$RC" "1" "non-scalar agora value exit code"
-assert_grep "$SAN/install.out" 'agora 节字段须为标量'
+assert_grep "$SAN/install.out" '须为标量'
+assert_no "$STUB_STATE/curl.log"  # 零网络（离线先死）
+python3 - "$CFG" <<'PY' && ok "mistyped-node rejection left config untouched" || fail "mistyped-node rejection mutated config"
+import json, sys
+c = json.load(open(sys.argv[1]))
+assert c["execution_mode"] == "agora" and c["router_model"] == "zai-coding-plan/glm-5.3"
+PY
+# 真值非字符串 execution_mode（json 数字）：缺席映射会静默落 legacy——离线拒
+printf '{"canonical_path": "%s", "identity": "x", "out_of_scope": ["y"], "verify_command": "true", "agora": {"execution_mode": 5, "router_model": "m", "agora_home": "%s"}}\n' \
+  "$REPO" "$SAN/agora-home2" > "$REPO/.issue-agent.json"
+run_install
+assert_eq "$RC" "1" "truthy non-string execution_mode (json) exit code"
+assert_grep "$SAN/install.out" '须为字符串'
 
 echo "== 30. legacy install: config face unchanged (zero agora keys) =="
 new_sandbox
@@ -937,7 +950,17 @@ printf '{"canonical_path": "%s", "identity": "x", "out_of_scope": ["y"], "verify
   "$REPO" > "$REPO/.issue-agent.json"
 run_install
 assert_eq "$RC" "1" "non-object agora node exit code"
-assert_grep "$SAN/install.out" 'agora 节字段须为标量'
+assert_grep "$SAN/install.out" '须为对象'
+assert_no "$STUB_STATE/curl.log"
+assert_no "$FAKE_HOME/.config/repo-issue-agent/config.json"
+# env 直通的相对 agora_home 同门（env 值也走绝对路径校验）
+printf '{"canonical_path": "%s", "identity": "x", "out_of_scope": ["y"], "verify_command": "true"}\n' \
+  "$REPO" > "$REPO/.issue-agent.json"
+ISSUE_AGENT_EXECUTION_MODE=agora \
+ISSUE_AGENT_ROUTER_MODEL=m \
+ISSUE_AGENT_AGORA_HOME=relative-env-home run_install
+assert_eq "$RC" "1" "relative agora_home (env) exit code"
+assert_grep "$SAN/install.out" '须为绝对路径'
 assert_no "$STUB_STATE/curl.log"
 assert_no "$FAKE_HOME/.config/repo-issue-agent/config.json"
 # 缺 verify_command（净沙箱无既有 config 可补）：镜像 config.py 离线拒——
@@ -993,6 +1016,12 @@ printf '{"canonical_path": "%s", "identity": "x", "out_of_scope": ["y"], "verify
   "$REPO" > "$REPO/.issue-agent.json"
 run_install
 assert_eq "$RC" "0" "env-less agora reinstall exit code"
+# verify_command 仅出自既有 config 的正路径（OLD_VERIFY 补齐）：json 拿掉
+# verify_command 后重装，agora 模式仍成功（离线门经既有 config 放行）
+printf '{"canonical_path": "%s", "identity": "x", "out_of_scope": ["y"]}\n' \
+  "$REPO" > "$REPO/.issue-agent.json"
+run_install
+assert_eq "$RC" "0" "verify_command via existing config (OLD_VERIFY) exit code"
 python3 - "$CFG" <<'PY' && ok "reinstall kept agora keys" || fail "reinstall dropped agora keys"
 import json, sys
 c = json.load(open(sys.argv[1]))
@@ -1011,6 +1040,15 @@ assert c["router_model"] == "env-model"  # 死键保留：回滚不销毁 agora 
 assert c["agora_home"].endswith("env-home")
 assert c["agora_poll_interval"] == 3
 PY
+# 回滚态必须真能被 daemon 载入（legacy 对死键全容忍的契约面——否则回滚
+# 部署会崩溃循环而测试全绿）
+PKG_DIR="$PKG_DIR" CFG="$CFG" python3 - <<'PY' && ok "rolled-back config daemon-loadable" || fail "daemon rejected rolled-back config"
+import os, sys
+sys.path.insert(0, os.environ["PKG_DIR"])
+import config
+cfg = config.load_config(os.environ["CFG"])
+assert cfg.execution_mode == "legacy"
+PY
 # 坏值离线拒（镜像 config.py 的 execution_mode 白名单）；拒绝不改动既有
 # config、零网络探测（curl 记录先清场——本沙箱此前的成功安装已写过它）
 rm -f "$STUB_STATE/curl.log"
@@ -1025,10 +1063,11 @@ assert c["execution_mode"] == "legacy"
 assert c["router_model"] == "env-model"
 PY
 # agora_poll_interval 非法值（env 0 / env 非数字 / json 0）一律离线拒——
-# json 的 0 不得被静默丢弃成缺省 15
+# json 的 0 不得被静默丢弃成缺省 15；全程零网络（curl 记录保持缺席）
 ISSUE_AGENT_AGORA_POLL_INTERVAL=0 run_install
 assert_eq "$RC" "1" "agora_poll_interval 0 (env) exit code"
 assert_grep "$SAN/install.out" 'agora_poll_interval'
+assert_no "$STUB_STATE/curl.log"  # 离线门契约钉死（与 agora2 案同款直接证据）
 python3 - "$CFG" <<'PY' && ok "poll rejection left config untouched" || fail "poll rejection mutated config"
 import json, sys
 assert json.load(open(sys.argv[1]))["execution_mode"] == "legacy"
@@ -1036,9 +1075,21 @@ PY
 ISSUE_AGENT_AGORA_POLL_INTERVAL=abc run_install
 assert_eq "$RC" "1" "agora_poll_interval abc (env) exit code"
 assert_grep "$SAN/install.out" 'agora_poll_interval'
+assert_no "$STUB_STATE/curl.log"
 # 超长数字封死 bash 算术回绕（同 ISSUE_AGENT_PORT 的 64 位回绕用例）
 ISSUE_AGENT_AGORA_POLL_INTERVAL=18446744073709551617 run_install
 assert_eq "$RC" "1" "agora_poll_interval wraparound exit code"
+assert_grep "$SAN/install.out" 'agora_poll_interval'
+assert_no "$STUB_STATE/curl.log"
+# 边界：5 位上限 99999 受理（写成 int）；6 位 100000 拒
+ISSUE_AGENT_AGORA_POLL_INTERVAL=99999 run_install
+assert_eq "$RC" "0" "agora_poll_interval 99999 (5-digit cap) accepted"
+python3 - "$CFG" <<'PY' && ok "5-digit poll accepted as int" || fail "5-digit poll not written"
+import json, sys
+assert json.load(open(sys.argv[1]))["agora_poll_interval"] == 99999
+PY
+ISSUE_AGENT_AGORA_POLL_INTERVAL=100000 run_install
+assert_eq "$RC" "1" "agora_poll_interval 100000 (6 digits) rejected"
 assert_grep "$SAN/install.out" 'agora_poll_interval'
 printf '{"canonical_path": "%s", "identity": "x", "out_of_scope": ["y"], "verify_command": "true", "agora": {"execution_mode": "agora", "router_model": "m", "agora_home": "%s", "agora_poll_interval": 0}}\n' \
   "$REPO" "$SAN/json-home" > "$REPO/.issue-agent.json"

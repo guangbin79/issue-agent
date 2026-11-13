@@ -296,35 +296,50 @@ for key in keys:
     print(f"{vars_[key]}={grab(key)}")
 # agora 节（计划 Task 6）：可选 {"execution_mode": "agora", "router_model":
 # ..., "agora_home": ..., "agora_poll_interval": N}——env 同名直通优先。
+# 误型（节非对象、字段非标量、execution_mode 真值非字符串）经专用旗标
+# 变量传递——heredoc 内 SystemExit 会被外层 eval 吞掉，且哨值内嵌在值里
+# 有假阳性/拼接误诊面。
+agora_node_bad = ""
 node = raw.get("agora")
 if node is None:
     agora = {}
 elif isinstance(node, dict):
     agora = node
 else:
-    # 节本身误型（字符串/布尔/数组）——不得静默按「无节点」落 legacy（与
-    # 字段级误型同原则），发哨值交 shell 面离线拒。
-    agora = {"execution_mode": f"__AGORA_BAD_TYPE__({type(node).__name__}-node)"}
+    # 节本身误型（字符串/布尔/数组）——不得静默按「无节点」落 legacy。
+    agora = {}
+    agora_node_bad = f"agora 节须为对象（收到 {type(node).__name__}）"
 names = {"execution_mode": "MODE_JSON", "router_model": "ROUTER_MODEL_JSON",
          "agora_home": "AGORA_HOME_JSON",
          "agora_poll_interval": "AGORA_POLL_JSON"}
 for key, var in names.items():
     v = agora.get(key)
     if isinstance(v, (bool, list, tuple, dict)):
-        # 非标量是误型，不得静默按缺省（execution_mode 误型会静默落 legacy，
-        # 且该值永远到不了 config.py 的强校验）——发哨值交 shell 面离线拒。
-        q = shlex.quote(f"__AGORA_BAD_TYPE__({type(v).__name__})")
-    else:
-        q = shlex.quote(str(v)) if v not in (None, "") else "''"
+        # 标量字段收到对象/数组/布尔：布尔对 execution_mode 是合法 legacy
+        # 语义（config.py `or` 归一），对其余字段一律误型。
+        if key == "execution_mode" and v is False:
+            v = None  # false ＝显式 legacy（config.py：False or "legacy"）
+        else:
+            agora_node_bad = (agora_node_bad or
+                              f"agora.{key} 须为标量（收到 {type(v).__name__}）")
+            v = None
+    if var == "MODE_JSON" and isinstance(v, (int, float)) and v:
+        # 真值非字符串 execution_mode（如手编 5）：缺席映射会静默落 legacy、
+        # 坏键经 unknown-key 存活规则透传，daemon 侧 str(5) 过不了白名单＝
+        # 崩溃循环（falsy 0/None/"" 才合法归 legacy）。
+        agora_node_bad = (agora_node_bad or
+                          f"agora.execution_mode 须为字符串（收到 {v!r}）")
+        v = None
+    q = shlex.quote(str(v)) if v not in (None, "") else "''"
     print(f"{var}={q}")
+print(f"AGORA_NODE_BAD={shlex.quote(agora_node_bad)}")
 EOF
 )"
 
-# agora 节误型哨值（heredoc 内 SystemExit 会被外层 eval 吞掉，故经变量传递）
-case "${MODE_JSON:-}${ROUTER_MODEL_JSON:-}${AGORA_HOME_JSON:-}${AGORA_POLL_JSON:-}" in
-  *__AGORA_BAD_TYPE__*)
-    die ".issue-agent.json 的 agora 节字段须为标量（对象/数组/布尔是误型）：${MODE_JSON:-}${ROUTER_MODEL_JSON:-}${AGORA_HOME_JSON:-}${AGORA_POLL_JSON:-}" ;;
-esac
+# agora 节误型旗标（heredoc 内 SystemExit 会被外层 eval 吞掉，故经变量传递）
+if [ -n "${AGORA_NODE_BAD:-}" ]; then
+  die ".issue-agent.json 检查失败：${AGORA_NODE_BAD}（离线先死，不得静默按缺省安装）"
+fi
 
 # guard a1: canonical pin — env (new name > legacy test-only name) > json.
 # Without a pin this installer refuses to run, fully offline: an unpinned
@@ -463,6 +478,14 @@ for key, field, mode in (
     elif mode == "str":
         v = v if isinstance(v, str) else ""
     print(f"{key}={shlex.quote(str(v) if v is not None else '')}")
+# execution_mode 真值非字符串（手编 5/["agora"]）：缺席映射会静默落
+# legacy、坏键经 unknown-key 存活规则透传，daemon 侧 str() 过不了白名单＝
+# 崩溃循环（falsy 0/False/"" 才合法归 legacy，与 config.py `or` 归一同口径）。
+old_mode_bad = ""
+_m = c.get("execution_mode")
+if _m is not None and not isinstance(_m, str) and _m:
+    old_mode_bad = f"execution_mode 须为字符串（收到 {type(_m).__name__}）"
+print(f"UIA_MODE_BAD={shlex.quote(old_mode_bad)}")
 EOF
 )"
   OLD_API_BASE="${UIA_API_BASE:-}"
@@ -474,6 +497,9 @@ EOF
   OLD_AHOME="${UIA_AHOME:-}"
   OLD_APOLL="${UIA_APOLL:-}"
   OLD_VERIFY="${UIA_VERIFY:-}"
+fi
+if [ -n "${UIA_MODE_BAD:-}" ]; then
+  die "既有 config 检查失败：${UIA_MODE_BAD}（daemon 载入会 ConfigError——离线先死）"
 fi
 
 # agora 有效值＝env > json > 既有 config；强校验镜像 config.py（离线先死，
@@ -497,8 +523,9 @@ if [ "$EFFECTIVE_MODE" = "agora" ]; then
 fi
 AGORA_POLL_EFF="${AGORA_POLL:-${OLD_APOLL:-}}"
 if [ -n "$AGORA_POLL_EFF" ]; then
+  # 空串由本守护分支排除；5 位长度上限封死 bash 算术回绕
   case "$AGORA_POLL_EFF" in
-    ''|*[!0-9]*|??????*) die "agora_poll_interval 须为 ≥1 的整数秒，长度 ≤5 位（封死 bash 算术回绕），当前：${AGORA_POLL_EFF}" ;;
+    *[!0-9]*|??????*) die "agora_poll_interval 须为 ≥1 的整数秒，长度 ≤5 位（封死 bash 算术回绕），当前：${AGORA_POLL_EFF}" ;;
   esac
   [ "$AGORA_POLL_EFF" -ge 1 ] || die "agora_poll_interval 须为 ≥1 的整数秒，当前：${AGORA_POLL_EFF}"
 fi
