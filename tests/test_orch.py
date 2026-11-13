@@ -2624,9 +2624,13 @@ def test_crash_between_create_and_dispatch_recovers_original_task(
                       monitor=monitor)
     try:
         h.listener.queue.put(issue_open_event(iid=7))
+        # 回合完全退出（finally release＝keep_pending 落账之后的信号）才能
+        # 安全重排：agora_task_id/agora_pending 在回合中途即可观察，提前
+        # requeue 会与 keep_pending 的账本写并发互噬（verify 红根因之一）
         assert wait_until(
             lambda: h.entry(7)["agora_task_id"] == "ag-123"
-            and h.entry(7)["status"] == "pending"), h.journal_msgs
+            and 7 in monitor.released), h.journal_msgs
+        assert h.entry(7)["status"] == "pending"
         assert h.entry(7)["agora_pending"] is True
         assert monitor.registered == [], "dispatch 未成不得登记"
 

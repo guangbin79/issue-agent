@@ -43,6 +43,7 @@ empty ledger with a warning callback (wired to the daemon journal).
 
 import json
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Callable, Optional, Union
 
@@ -187,7 +188,10 @@ def _read_if_valid(path: str) -> Optional[bytes]:
 
 
 def _atomic_write(path: str, data: bytes) -> None:
-    tmp = path + ".tmp"
+    # 暂存名按写者唯一：共享单名在并发写者下互噬（后者 truncate 前者
+    # 暂存，先 replace 者消费掉暂存名，后者 os.replace 抛
+    # FileNotFoundError——os.replace 的原子性只覆盖单一名下的单写者）
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     with open(tmp, "wb") as fh:
         fh.write(data)
         fh.flush()

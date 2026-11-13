@@ -270,3 +270,43 @@ def test_state_docstring_documents_the_agora_fields():
     for key in ("agora_task_id", "agora_status", "delivery_commit",
                 "agora_pending", "router_goal", "router_model"):
         assert key in state_mod.__doc__, f"docstring missing {key}"
+
+
+def test_atomic_write_survives_concurrent_writers(tmp_path, monkeypatch):
+    """verify 红（ag-8f3133）：共享单一 .tmp 暂存名在并发写者下互噬——
+    后写者 truncate 掉前写者暂存，先 replace 者消费掉暂存名，后者
+    os.replace 抛 FileNotFoundError，原子写契约破灭。暂存名必须按写者
+    唯一，两路并发 save 都得成功、终值是二者之一。"""
+    import itertools
+    import os
+    import threading
+
+    path = str(tmp_path / "state.json")
+    fsync_calls = itertools.count()
+    gate = threading.Barrier(2, timeout=5)
+    real_fsync = os.fsync
+
+    def gated_fsync(fd):
+        if next(fsync_calls) < 2:  # 恰好拦住双写者的首次暂存 fsync
+            gate.wait()            # 两边都暂存完毕才放行 replace
+        real_fsync(fd)
+
+    monkeypatch.setattr(state_mod.os, "fsync", gated_fsync)
+    errors = []
+
+    def writer(tag):
+        try:
+            for _ in range(20):
+                state_mod._atomic_write(
+                    path, json.dumps({"tag": tag}).encode("utf-8"))
+        except OSError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(tag,))
+               for tag in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert json.loads((tmp_path / "state.json").read_text())["tag"] in "ab"
