@@ -1110,6 +1110,25 @@ PY
 run_install
 assert_eq "$RC" "1" "hand-edited agora_poll_interval 0 exit code"
 assert_grep "$SAN/install.out" 'agora_poll_interval'
+# 手编空串 poll：类型面兜底（shell 面的 -n 门管不到键存在但为空串）——
+# 写面按类型门丢弃回退缺省，daemon 可载入（终闸 B 册 warning 修复面）
+python3 - "$CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p))
+c["agora_poll_interval"] = ""
+json.dump(c, open(p, "w"), indent=2)
+PY
+run_install
+assert_eq "$RC" "0" "hand-edited empty-string poll healed by typed drop"
+assert_grep "$SAN/install.out" '类型不符'
+PKG_DIR="$PKG_DIR" CFG="$CFG" python3 - <<'PY' && ok "empty-string poll config daemon-loadable" || fail "daemon rejected healed config"
+import os, sys
+sys.path.insert(0, os.environ["PKG_DIR"])
+import config
+cfg = config.load_config(os.environ["CFG"])
+assert cfg.agora_poll_interval == 15  # 丢弃回退缺省
+PY
 
 echo
 echo "passed=$PASS failed=$FAIL"

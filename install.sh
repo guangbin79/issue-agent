@@ -817,6 +817,12 @@ for key, flag in (("callback_url", "cb_explicit"),
             dropped.append(key)
 for key, value in old.items():
     if key not in cfg:
+        if key == "agora_poll_interval" and not _typed(value, int):
+            # 手编坏型 poll（空串/浮点/字符串）不得经存活规则透传——daemon
+            # 侧 _bounded_int 会拒载成崩溃循环（0/负数等真 int 由 shell 面
+            # 离线拒，这里只兜类型面）。
+            dropped.append(key)
+            continue
         cfg[key] = value
 if merged:
     print("install: 保留既有 config 字段（本次输入未显式提供）："
