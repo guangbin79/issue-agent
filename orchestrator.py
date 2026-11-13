@@ -277,6 +277,14 @@ class Orchestrator:
         # 同线程再取锁，普通 Lock 确定性自锁（评审环 F1）。
         self._ledger_lock = (ledger_lock if ledger_lock is not None
                              else threading.RLock())
+        # monitor 交付上下文接线（Task 4）：daemon 构造面不变（T3 wiring
+        # 锁定），此处把 git 交付原语与共享账本锁一并交给 monitor——
+        # delivery_commit 落账与回合侧账本写互斥。
+        if self.agora_monitor is not None:
+            self.agora_monitor.attach_delivery(
+                repo_path=self.repo_path, remote_url=self.remote_url,
+                ssl_verify=self.ssl_verify, state_path=self.state_path,
+                ledger_lock=self._ledger_lock)
         # bounded turn slots + per-issue locks replace the historical process-
         # wide turn lock: at most max_parallel turns in flight, and a given
         # issue's turns never overlap (same-issue events queue behind the lock).
@@ -760,6 +768,10 @@ class Orchestrator:
 
         绝不同步等待 worker（monitor 异步轮询）；legacy session_id 不被
         本路径改写；agora 不可用保留待派发，绝不降级 legacy opencode run。
+
+        名额（F3 原子 check-and-reserve，T3 移交）：reserve 占位后任何
+        未 register 的出口都经 finally release 归还；register 成功即
+        monitor 交付状态机接管（终态才释放）。
         """
         with self._iid_lock(iid), self._turn_slots:
             self._journal(f"turn: issue#{iid} start ({action}, agora)")
@@ -768,65 +780,73 @@ class Orchestrator:
                 return
             # 活动名额（monitor 侧，与 max_parallel turn 槽双重限制）：满员
             # 保留待派发（claim 留存，claim-timeout 回收后 requeue 重试），
-            # 绝不超额建单。
+            # 绝不超额建单。reserve 是原子 check-and-reserve——并发回合不
+            # 会双双通过（F3）。
             if self.agora_monitor is not None \
-                    and not self.agora_monitor.has_capacity():
+                    and not self.agora_monitor.reserve(iid):
                 self._agora_keep_pending(iid, "monitor at capacity")
                 return
+            registered = False
             try:
-                gitop.fetch_base(self.repo_path, self.remote_url,
-                                 self.default_branch, self.ssl_verify)
-                gitop.ensure_fix_branch(self.repo_path, iid,
-                                        self.default_branch, self.remote_url,
-                                        self.ssl_verify)
-            except gitop.GitopError as exc:
-                self._journal(
-                    f"turn: issue#{iid} deferred (baseline fetch failed): {exc}")
-                self._defer(iid, None)
-                return
-            decision = self._agora_route(iid, event=event, message=message)
-            if decision is None:  # 失败路径已处置（保留待派发/defer）
-                return
-            if decision.action != "dispatch":
-                self._agora_out_of_band(iid, decision)
-                return
-            payload = dict(
-                goal=decision.goal,
-                project_dir=self.repo_path,
-                target_branch=gitop.fix_branch(iid),
-                verify_cmd=self.verify_command,
-                model=decision.model,
-                title=decision.title,
-                client_key=f"{self.service_name}:issue-{iid}:note-{note_id or 0}",
-                after=self._agora_previous_tid(iid),
-            )
-            tid = self._agora_create(iid, payload)
-            if tid is None:  # 保留待派发（超时重试后仍不可达）
-                return
-            # agora_task_id 先落账再 dispatch：dispatch 前崩溃的恢复面。
-            # agora_pending 保持 True 直到 dispatch+register 成功——中断窗口
-            # 内任何重放都靠同 client_key 取回原任务。
-            with self._ledger_lock:
-                ledger = state.load_state(self.state_path, warn=self._journal)
-                entry = ledger["issues"].setdefault(str(int(iid)), _empty_entry())
-                entry["agora_task_id"] = tid
-                state.save_state(self.state_path, ledger)
-            try:
-                self.agora_client.dispatch(tid)
-            except (AgoraUnavailable, AgoraRejected, AgoraProtocolError) as exc:
-                # 恢复路径与建单超时同构：同 client_key 取回原任务再派。
-                self._journal(
-                    f"turn: issue#{iid} dispatch failed, kept pending: {exc}")
-                self._agora_keep_pending(iid, "dispatch failed")
-                return
-            if self.agora_monitor is not None:
-                self.agora_monitor.register(iid, tid)
-            with self._ledger_lock:
-                ledger = state.load_state(self.state_path, warn=self._journal)
-                ledger["issues"].setdefault(
-                    str(int(iid)), _empty_entry())["agora_pending"] = False
-                state.save_state(self.state_path, ledger)
-            self._finalize(iid, None, gitop.fix_branch(iid))
+                try:
+                    gitop.fetch_base(self.repo_path, self.remote_url,
+                                     self.default_branch, self.ssl_verify)
+                    gitop.ensure_fix_branch(self.repo_path, iid,
+                                            self.default_branch,
+                                            self.remote_url,
+                                            self.ssl_verify)
+                except gitop.GitopError as exc:
+                    self._journal(
+                        f"turn: issue#{iid} deferred (baseline fetch failed): {exc}")
+                    self._defer(iid, None)
+                    return
+                decision = self._agora_route(iid, event=event, message=message)
+                if decision is None:  # 失败路径已处置（保留待派发/defer）
+                    return
+                if decision.action != "dispatch":
+                    self._agora_out_of_band(iid, decision)
+                    return
+                payload = dict(
+                    goal=decision.goal,
+                    project_dir=self.repo_path,
+                    target_branch=gitop.fix_branch(iid),
+                    verify_cmd=self.verify_command,
+                    model=decision.model,
+                    title=decision.title,
+                    client_key=f"{self.service_name}:issue-{iid}:note-{note_id or 0}",
+                    after=self._agora_previous_tid(iid),
+                )
+                tid = self._agora_create(iid, payload)
+                if tid is None:  # 保留待派发（超时重试后仍不可达）
+                    return
+                # agora_task_id 先落账再 dispatch：dispatch 前崩溃的恢复面。
+                # agora_pending 保持 True 直到 dispatch+register 成功——中断窗口
+                # 内任何重放都靠同 client_key 取回原任务。
+                with self._ledger_lock:
+                    ledger = state.load_state(self.state_path, warn=self._journal)
+                    entry = ledger["issues"].setdefault(str(int(iid)), _empty_entry())
+                    entry["agora_task_id"] = tid
+                    state.save_state(self.state_path, ledger)
+                try:
+                    self.agora_client.dispatch(tid)
+                except (AgoraUnavailable, AgoraRejected, AgoraProtocolError) as exc:
+                    # 恢复路径与建单超时同构：同 client_key 取回原任务再派。
+                    self._journal(
+                        f"turn: issue#{iid} dispatch failed, kept pending: {exc}")
+                    self._agora_keep_pending(iid, "dispatch failed")
+                    return
+                if self.agora_monitor is not None:
+                    self.agora_monitor.register(iid, tid)
+                registered = True  # 名额自此归 monitor 交付状态机管辖
+                with self._ledger_lock:
+                    ledger = state.load_state(self.state_path, warn=self._journal)
+                    ledger["issues"].setdefault(
+                        str(int(iid)), _empty_entry())["agora_pending"] = False
+                    state.save_state(self.state_path, ledger)
+                self._finalize(iid, None, gitop.fix_branch(iid))
+            finally:
+                if self.agora_monitor is not None and not registered:
+                    self.agora_monitor.release(iid)
 
     def _agora_route(self, iid, *, event, message):
         """账本锁临界区内的 Router 决策与 goal/model 持久化（T2 共享 RLock

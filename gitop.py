@@ -10,6 +10,10 @@ surface is exactly:
   agent branches from and the daemon compares against
 - has_new_commits_vs_ref: detect commits the agent landed on issue/<iid>-fix
 - push_fix_branch: push that branch (and nothing else) to the remote
+- push_verified_commit: agora external delivery — exact <sha> push to
+  issue/<iid>-fix, three-state ok/non_ff/failed (never force)
+- fetch_fix_branch_tip: agora external delivery — explicit-URL fetch of
+  issue/<iid>-fix into the agent-remote namespace, returns the tip sha
 - fix_branch_pushed: read-only tip-equality probe (the repost precondition)
 - tracked_dirty: post-turn observability probe — did the agent illegally
   modify the main working copy?
@@ -536,3 +540,80 @@ def push_fix_branch(repo: PathLike, iid, remote_url: str,
     working copy, and refs are shared across worktrees.
     """
     push(repo, remote_url, f"{fix_branch(iid)}:{fix_branch(iid)}", ssl_verify)
+
+
+# --- agora external delivery (plan Task 4) --------------------------------------
+
+_HEX40_OK = re.compile(r"[0-9a-f]{40}")
+
+# git push output markers for the three-way outcome classification. The
+# transport markers say "the push never got judged" (retry can help); the
+# non-ff markers say "the remote branch moved" (rotate the handoff);
+# anything else (src refspec matches no object, remote rejected the ref by
+# hook/permission) is deterministic — retrying the same commit can never
+# succeed, so the caller reports task_deliver(failed).
+_NON_FF_MARKERS = ("(fetch first)", "non-fast-forward")
+_TRANSPORT_MARKERS = ("unable to access", "could not read from remote "
+                      "repository", "could not resolve", "connection")
+
+
+def push_verified_commit(repo: PathLike, iid, commit: str, remote_url: str,
+                         ssl_verify: bool = True) -> str:
+    """Push the exact verified commit to refs/heads/issue/<iid>-fix on the
+    explicit remote (agora external delivery, 设计 §6.2/§7.2).
+
+    The refspec is ALWAYS `<sha>:refs/heads/issue/<iid>-fix` — never force,
+    never any other ref, so the default branch cannot be touched by shape.
+    *commit* must be a full 40-hex sha (RefspecViolation otherwise — the
+    same whitelist concept as the legacy push gate).
+
+    Returns "ok" | "non_ff" | "failed" (the monitor state machine branches
+    on exactly this):
+    - ok: the remote branch is now at *commit*
+    - non_ff: the remote branch moved — the caller rotates the handoff via
+      task_deliver(non_ff, base=<fetched remote tip>)
+    - failed: deterministic rejection (missing object, hook/permission
+      denial) — the caller reports task_deliver(outcome=failed)
+    Transport failures (unreachable remote / connection refused) raise
+    PushFailed (scrubbed): transient, the caller keeps awaiting_external
+    and retries on its own poll cadence.
+    """
+    if not isinstance(commit, str) or not _HEX40_OK.fullmatch(commit):
+        raise RefspecViolation(
+            _scrub(f"commit {str(commit)[:44]!r} is not a full 40-hex sha; "
+                   f"refspec {commit}:refs/heads/{fix_branch(iid)} refused",
+                   remote_url))
+    env, clean_url = _net_env(remote_url)
+    refspec = f"{commit}:refs/heads/{fix_branch(iid)}"
+    proc = _run(["git", "-C", str(repo), *_ssl_args(remote_url, ssl_verify),
+                 "push", clean_url, refspec], cwd=repo, env=env)
+    if proc.returncode != 0:
+        out = (proc.stderr or proc.stdout).strip()
+        lowered = out.lower()
+        if any(marker in lowered for marker in _NON_FF_MARKERS):
+            return "non_ff"
+        message = "push {} failed: {}".format(refspec, out)
+        if any(marker in lowered for marker in _TRANSPORT_MARKERS):
+            raise PushFailed(_scrub(message, remote_url))
+        return "failed"
+    return "ok"
+
+
+def fetch_fix_branch_tip(repo: PathLike, iid, remote_url: str,
+                         ssl_verify: bool = True) -> str:
+    """Fetch refs/heads/issue/<iid>-fix from the explicit remote URL into
+    the agent-remote namespace and return the 40-hex remote tip (the
+    non_ff rotation's *base*). Forced refspec, fetch_base style — the
+    tracking ref may legitimately rewind across rotations; no checkout, no
+    default-branch ref, no working-copy contact. A missing remote ref
+    raises GitopError (the fetch fails) — by definition non_ff implies the
+    branch exists.
+    """
+    branch = fix_branch(iid)
+    tracking = f"{AGENT_REMOTE_NS}/{branch}"
+    env, clean_url = _net_env(remote_url)
+    _git(repo,
+         [*_ssl_args(remote_url, ssl_verify), "fetch", clean_url,
+          f"+refs/heads/{branch}:{tracking}"],
+         remote_url=remote_url, env=env)
+    return _git(repo, ["rev-parse", "--verify", tracking]).strip()

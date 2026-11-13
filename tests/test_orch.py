@@ -375,15 +375,30 @@ class FakeRouter:
 
 
 class FakeMonitor:
-    """AgoraMonitor 替身：容量/register/release/start/stop 调用记账。"""
+    """AgoraMonitor 替身：reserve/register/release/attach_delivery 调用记账
+    （reserve 语义镜像真件：占位 tid=None、同 iid 重入复用己占名额）。"""
 
     def __init__(self, max_active=1):
         self.max_active = max_active
         self._active = {}
         self.registered = []
         self.released = []
+        self.reserved = []
+        self.attached = None
         self.started = 0
         self.stopped = 0
+
+    def attach_delivery(self, **kwargs):
+        self.attached = kwargs
+
+    def reserve(self, iid):
+        self.reserved.append(int(iid))
+        if int(iid) in self._active:
+            return True
+        if len(self._active) >= self.max_active:
+            return False
+        self._active[int(iid)] = None
+        return True
 
     def has_capacity(self):
         return len(self._active) < self.max_active
@@ -2552,6 +2567,13 @@ def test_run_turn_returns_after_dispatch_and_releases_issue_lock(
         assert router_.calls[0]["available_models"] == ["zai/glm-5.3"], \
             "available_models 必须在调用点从 doctor 取"
         assert any("已接手 issue#7" in b for _, b in h.api.posts)
+        # Task 4 接线断言：orchestrator 把交付上下文交给 monitor——daemon
+        # 构造面不变（T3 wiring 锁定），ledger_lock 与回合侧共用同一把
+        assert monitor.attached["repo_path"] == h.repo_path
+        assert monitor.attached["remote_url"] == h.orch.remote_url
+        assert monitor.attached["state_path"] == h.state_path
+        assert monitor.attached["ledger_lock"] is h.orch._ledger_lock
+        assert h.gitop.push_calls == [], "agora 回合零 legacy origin push"
     finally:
         h.orch.stop()
 
@@ -2638,6 +2660,39 @@ def test_turn_keeps_issue_pending_when_monitor_at_capacity(
         assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
         assert client.created_ids == ["ag-123"]
         assert monitor.registered[-1] == (7, "ag-123")
+    finally:
+        h.orch.stop()
+
+
+def test_agora_turn_failure_paths_release_reserved_slot(
+        tmp_path, monkeypatch):
+    """F3（T3 移交）：reserve 后任何未 register 的出口（fetch 失败 defer、
+    Router ignore 出单）都必须 release；register 成功后名额占用到终态
+    （释放权归 monitor 的交付状态机）。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor(max_active=3)
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.gitop.fetch_error = gitop.GitopError("baseline fetch down (fake)")
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: h.entry(7)["status"] == "defer"
+                          and monitor.released == [7]), \
+            h.journal_msgs  # _defer 先落账、release 在 finally——两态齐备才算落定
+        assert 7 not in monitor._active
+
+        h.gitop.fetch_error = None
+        h.listener.queue.put(issue_open_event(iid=8))  # 正常派发
+        assert wait_until(lambda: turn_finalized(h, 8)), h.journal_msgs
+        assert monitor.registered[-1] == (8, "ag-123")
+        assert 8 not in monitor.released, "登记后名额占用到终态（monitor 释放）"
+
+        router_.decision = agora_decision(action="ignore", reason="属于前端仓")
+        h.listener.queue.put(issue_open_event(iid=9))
+        assert wait_until(lambda: turn_finalized(h, 9)
+                          and 9 in monitor.released), h.journal_msgs
+        assert 9 in monitor.released, "out_of_band 出口必须释放名额"
     finally:
         h.orch.stop()
 

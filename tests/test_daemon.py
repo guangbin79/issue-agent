@@ -370,6 +370,9 @@ def test_daemon_agora_mode_builds_monitor_and_threads_it(tmp_path, monkeypatch):
             self.kwargs = kwargs
             built.append(self)
 
+        def attach_delivery(self, **kwargs):  # Task 4：orchestrator 接线面
+            self.attached = kwargs
+
     captured = _wiring_scaffold(tmp_path, monkeypatch, _agora_cfg(tmp_path))
     monkeypatch.setattr(daemon, "AgoraMonitor", FakeMonitor)
     assert daemon.main() == 0

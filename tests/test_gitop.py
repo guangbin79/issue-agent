@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+import gitop
 from gitop import (
     GitopError,
     PushFailed,
@@ -28,11 +29,13 @@ from gitop import (
     agent_tracking_ref,
     ensure_fix_branch,
     fetch_base,
+    fetch_fix_branch_tip,
     fix_branch,
     fix_branch_pushed,
     has_new_commits_vs_ref,
     knowledge_changes_present,
     prune_worktrees,
+    push_verified_commit,
     sweep_idle_review_worktrees,
     push,
     push_fix_branch,
@@ -769,3 +772,120 @@ def test_ensure_fix_branch_never_resets_existing_local_branch(
     assert git("rev-parse", "refs/remotes/agent-remote/issue/7-fix",
                cwd=repo) == remote_tip, "远端有效位置仍须 fetch 进 tracking ref"
     _assert_main_checkout_untouched(repo)
+
+
+# --- agora external delivery: push_verified_commit / fetch_fix_branch_tip ----
+
+
+def _commit_on_fix_branch(repo, name, content, msg, iid=7):
+    branch = fix_branch(iid)
+    exists = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+         f"refs/heads/{branch}"], capture_output=True)
+    if exists.returncode != 0:
+        git("branch", branch, cwd=repo)
+    git("checkout", branch, cwd=repo)
+    sha = commit_file(repo, name, content, msg)
+    git("checkout", "master", cwd=repo)
+    return sha
+
+
+def test_push_verified_commit_exact_refspec_never_force(
+        repo, remote_url, bare_remote, monkeypatch):
+    """计划 Task 4：非 force 的 <sha>:refs/heads/issue/<iid>-fix 精确推送——
+    argv 恒此形态（无 --force、无任何其他 ref），默认分支 SHA 不动。"""
+    delivery = _commit_on_fix_branch(repo, "fix.txt", "fix\n", "fix work")
+    master_before = git("rev-parse", "refs/heads/master", cwd=bare_remote)
+    argv = []
+    real = gitop._run
+
+    def spying_run(cmd, cwd, env=None):
+        argv.append(cmd)
+        return real(cmd, cwd, env=env)
+
+    monkeypatch.setattr(gitop, "_run", spying_run)
+    assert push_verified_commit(repo, 7, delivery, remote_url) == "ok"
+    assert argv == [["git", "-C", str(repo), "push", remote_url,
+                     f"{delivery}:refs/heads/issue/7-fix"]]
+    assert git("rev-parse", "refs/heads/issue/7-fix",
+               cwd=bare_remote) == delivery
+    assert git("rev-parse", "refs/heads/master", cwd=bare_remote) \
+        == master_before, "默认分支 SHA 不动"
+
+
+def test_push_verified_commit_https_ssl_flag_and_credential_env(
+        repo, monkeypatch):
+    fake = FakeRun()
+    monkeypatch.setattr(gitop, "_run", fake)
+    url = "https://oauth2:SECRETPAT@host/repo.git"
+    assert push_verified_commit(repo, 7, "a" * 40, url, ssl_verify=False) == "ok"
+    assert fake.calls == [
+        ["git", "-C", str(repo), "-c", "http.sslVerify=false", "push",
+         "https://host/repo.git", f"{'a' * 40}:refs/heads/issue/7-fix"]]
+    # F14 同口径：argv 只见无凭据 URL，PAT 只走 env
+    assert "SECRETPAT" not in " ".join(fake.calls[0])
+    assert fake.envs[0].get("UIA_GIT_PAT") == "SECRETPAT"
+    assert fake.envs[0].get("GIT_ASKPASS")
+
+
+def test_push_verified_commit_requires_full_hex_sha(repo, remote_url):
+    for bad in ("", "abc123", "a" * 39, "a" * 41, "Z" * 40, 12345):
+        with pytest.raises(RefspecViolation):
+            push_verified_commit(repo, 7, bad, remote_url)
+
+
+def test_push_verified_commit_non_ff_when_remote_moved(
+        repo, remote_url, tmp_path):
+    """远端 issue/<iid>-fix 已前进：精确推送返回 non_ff，远端位置不动。"""
+    base = _commit_on_fix_branch(repo, "base.txt", "base\n", "base")
+    assert push_verified_commit(repo, 7, base, remote_url) == "ok"
+    adv = tmp_path / "adv-fix"
+    git("clone", remote_url, str(adv), cwd=tmp_path)
+    git("checkout", fix_branch(7), cwd=adv)  # 从远端有效位置出发
+    config_user(adv)
+    remote_tip = commit_file(adv, "remote.txt", "moved\n", "remote advance")
+    git("push", "origin", f"HEAD:{fix_branch(7)}", cwd=adv)
+    local = _commit_on_fix_branch(repo, "local.txt", "local\n", "local work")
+    assert push_verified_commit(repo, 7, local, remote_url) == "non_ff"
+    assert git("ls-remote", remote_url, f"refs/heads/{fix_branch(7)}",
+               cwd=repo).split()[0] == remote_tip, "non_ff 后远端不动（绝不 force）"
+
+
+def test_push_verified_commit_deterministic_rejection_returns_failed(
+        repo, remote_url):
+    """确定性失败（本地不存在该对象——重试同 commit 永不可能成功）返回
+    failed，不抛异常（monitor 按 task_deliver(failed) 终局分流）。"""
+    assert push_verified_commit(repo, 7, "e" * 40, remote_url) == "failed"
+
+
+def test_push_verified_commit_transport_failure_raises_scrubbed(
+        repo, monkeypatch):
+    """传输病（拒连）抛 PushFailed（网络类，monitor 保留 awaiting_external
+    按轮询节奏重试），异常文本零 PAT 泄漏。"""
+    for var in ("http_proxy", "https_proxy", "all_proxy",
+                "HTTP_PROXY", "HTTPS_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+    sha = _commit_on_fix_branch(repo, "t.txt", "t\n", "t")
+    url = "https://oauth2:SECRETPAT123@127.0.0.1:1/gitea/repo.git"
+    with pytest.raises(PushFailed) as excinfo:
+        push_verified_commit(repo, 7, sha, url, ssl_verify=False)
+    assert "SECRETPAT123" not in str(excinfo.value)
+
+
+def test_fetch_fix_branch_tip_reads_remote_into_agent_remote_namespace(
+        repo, remote_url):
+    """显式 URL fetch issue/<iid>-fix 到 agent-remote 命名空间并返回 tip：
+    不改默认支、不碰主检出；本地无该分支也能取（tip 完全来自远端）。"""
+    tip = _commit_on_fix_branch(repo, "fix.txt", "fix\n", "fix work")
+    git("push", remote_url,
+        f"refs/heads/{fix_branch(7)}:refs/heads/{fix_branch(7)}", cwd=repo)
+    git("branch", "-D", fix_branch(7), cwd=repo)
+    assert fetch_fix_branch_tip(repo, 7, remote_url) == tip
+    assert git("rev-parse", f"refs/remotes/agent-remote/{fix_branch(7)}",
+               cwd=repo) == tip
+    assert current_branch(repo) == "master", "主检出不动"
+    probe = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+         "refs/remotes/agent-remote/master"],
+        capture_output=True)
+    assert probe.returncode != 0, "默认支跟踪 ref 不得被创建"
