@@ -3258,4 +3258,3 @@ def test_relay_rejected_non_terminal_keeps_pending(tmp_path, monkeypatch):
         assert h.entry(7)["agora_task_id"] == "ag-123", "登记不覆盖"
     finally:
         h.orch.stop()
-

@@ -1068,4 +1068,3 @@ def test_multiple_questions_capped_one_per_drain(tmp_path, monkeypatch):
     assert json.loads(
         Path(mail_path_of(state_path)).read_text(encoding="utf-8")
     )["pending"] == []
-
