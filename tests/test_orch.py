@@ -407,9 +407,20 @@ class FakeMonitor:
         self._active[int(iid)] = tid
         self.registered.append((int(iid), tid))
 
-    def release(self, iid):
-        self._active.pop(int(iid), None)
-        self.released.append(int(iid))
+    def release(self, iid, tid=None):
+        """compare-and-release 镜像真件：单参只清占位；携 tid 仅当登记
+        仍属该任务才释放。"""
+        key = int(iid)
+        current = self._active.get(key)
+        if current is None and key not in self._active:
+            return
+        if tid is None:
+            if current is not None:
+                return
+        elif current != tid:
+            return
+        del self._active[key]
+        self.released.append(key)
 
     def start(self):
         self.started += 1
@@ -2655,7 +2666,7 @@ def test_turn_keeps_issue_pending_when_monitor_at_capacity(
         assert h.gitop.fetch_calls == [] and h.gitop.ensure_calls == [], \
             "容量闸在 git 工作之前"
 
-        monitor.release(99)  # 名额到终态释放
+        monitor.release(99, "ag-older")  # 名额到终态释放（compare-and-release）
         requeue_retry(h, 7)
         assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
         assert client.created_ids == ["ag-123"]

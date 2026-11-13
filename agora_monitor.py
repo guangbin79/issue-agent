@@ -86,10 +86,23 @@ class AgoraMonitor:
         with self._guard:
             self._active[int(iid)] = str(tid)
 
-    def release(self, iid) -> None:
-        """任务终态或回合失败出口：归还活动名额（幂等）。"""
+    def release(self, iid, tid=None) -> None:
+        """compare-and-release（评审环 ocr #5）：任务终态或回合失败出口
+        归还活动名额（幂等）。tid=None 时只清本 issue 的 reserve 占位
+        （回合失败出口专用——登记已转正则不碰）；携 tid 时仅当登记仍属
+        该任务才释放（快照轮询网络窗内回合链 register 已让位给更新任务
+        时，旧任务的迟到 release 不得逐掉新登记）。"""
         with self._guard:
-            self._active.pop(int(iid), None)
+            key = int(iid)
+            if key not in self._active:
+                return
+            current = self._active[key]
+            if tid is None:
+                if current is not None:
+                    return  # 已转正登记不属占位释放权
+            elif current != tid:
+                return  # 登记已让位给更新任务
+            del self._active[key]
 
     def tasks(self) -> list:
         """[(iid, tid|None)] 快照（升序）；tid=None 是 reserve 占位（回合
@@ -127,7 +140,7 @@ class AgoraMonitor:
         if task_state in _TERMINAL_STATES:
             self._journal(f"agora-monitor: issue#{iid} task {tid} "
                           f"{task_state}; slot released")
-            self.release(iid)
+            self.release(iid, tid)
             return
         if task_state == "blocked" or delivery.get("status") == "failed":
             # 交付失败终局（rebase_conflict/push_failed/retry_exhausted…，
@@ -137,15 +150,28 @@ class AgoraMonitor:
                 f"agora-monitor: issue#{iid} task {tid} push_failed "
                 f"({delivery.get('error')}); blocked, manual follow-up, "
                 "no auto-redispatch")
-            self.release(iid)
+            self.release(iid, tid)
             return
-        if task_state == "done" and delivery.get("status") == "awaiting_external":
-            handoff = delivery.get("commit")
-            if not isinstance(handoff, str) or not _HEX40_OK.fullmatch(handoff):
-                self._journal(f"agora-monitor: issue#{iid} task {tid} "
-                              f"malformed handoff commit {handoff!r}; skipped")
-                return
-            self._deliver_handoff(iid, tid, handoff)
+        if task_state == "done":
+            if delivery.get("status") == "awaiting_external":
+                handoff = delivery.get("commit")
+                if not isinstance(handoff, str) \
+                        or not _HEX40_OK.fullmatch(handoff):
+                    # 确定性协议违约（服务端 hex40 校验使 deliver 无法
+                    # ack）——本地终局释放，不重派、不无限 journal 占名额
+                    self._journal(
+                        f"agora-monitor: issue#{iid} task {tid} malformed "
+                        f"handoff commit {handoff!r}; terminal release")
+                    self.release(iid, tid)
+                    return
+                self._deliver_handoff(iid, tid, handoff)
+            elif delivery.get("status") == "delivered":
+                # delivered ack 后收口读竞态/瞬断的恢复面（评审环 ocr #4）：
+                # 本次 board 读即确认——补记 delivery_commit 并释放
+                commit = delivery.get("commit")
+                if isinstance(commit, str) and _HEX40_OK.fullmatch(commit):
+                    self._record_delivery_commit(iid, commit)
+                self.release(iid, tid)
         # 其余（pending/integrating 与未到 done 的运行态）：本轮无动作
 
     def _deliver_handoff(self, iid, tid, handoff):
@@ -153,13 +179,10 @@ class AgoraMonitor:
             self._journal("agora-monitor: delivery context not attached; "
                           "cannot push")
             return
-        recorded = self._ledger_entry(iid).get("delivery_commit")
-        if recorded is not None and recorded != handoff:
-            # 旧 commit 永不覆盖新交付：账本已有更新的交付，此 handoff 过期
-            self._journal(f"agora-monitor: issue#{iid} handoff "
-                          f"{handoff[:12]} older than recorded delivery "
-                          f"{recorded[:12]}; skipped")
-            return
+        # 旧 commit 防线（评审环 ocr #3 裁定）：board handoff 是权威，推送
+        # 只认它；账本 delivery_commit 跨回合不清理，若在此比对跳过会把
+        # 回合2 起永久卡死（max_active=1 全监视器停摆）。落账侧防线＝
+        # 写前 board 核对＋服务端 stale 403＋monitor 单线程串行落账。
         result = gitop.push_verified_commit(
             self._repo_path, iid, handoff, self._remote_url, self._ssl_verify)
         if result == "ok":
@@ -197,7 +220,7 @@ class AgoraMonitor:
         if outcome == "delivered":
             self._confirm_delivered(iid, tid, commit)
         elif outcome == "failed":
-            self.release(iid)
+            self.release(iid, tid)
         # non_ff：等门体重排重验出新 handoff（同一任务循环），名额保持占用
 
     def _confirm_delivered(self, iid, tid, commit):
@@ -209,7 +232,7 @@ class AgoraMonitor:
                 or delivery.get("status") == "delivered":
             if delivery.get("commit") in (None, commit):
                 self._record_delivery_commit(iid, commit)
-            self.release(iid)
+            self.release(iid, tid)
             return
         self._journal(f"agora-monitor: issue#{iid} board moved after "
                       f"delivered ack ({task.get('state')}/"
@@ -225,18 +248,18 @@ class AgoraMonitor:
         if task_state in _TERMINAL_STATES:
             if attempted and delivery.get("commit") in (None, attempted):
                 self._record_delivery_commit(iid, attempted)
-            self.release(iid)
+            self.release(iid, tid)
             return
         if task_state == "blocked" or delivery.get("status") == "failed":
             self._journal(f"agora-monitor: issue#{iid} push_failed "
                           f"({delivery.get('error')}); blocked, manual "
                           "follow-up, no auto-redispatch")
-            self.release(iid)
+            self.release(iid, tid)
             return
         if delivery.get("status") == "delivered" and attempted \
                 and delivery.get("commit") == attempted:
             self._record_delivery_commit(iid, attempted)
-            self.release(iid)
+            self.release(iid, tid)
             return
         # 仍 awaiting_external（同 commit＝未处理，异 commit＝已轮转）或
         # pending/integrating：下一轮 poll 重试
@@ -253,14 +276,6 @@ class AgoraMonitor:
             raise AgoraProtocolError(
                 f"/board -> task row missing for {tid}")
         return task
-
-    def _ledger_entry(self, iid) -> dict:
-        """issue 账本行快照（锁内读；缺行/未接线返回空 dict）。"""
-        if self._ledger_lock is None or self._state_path is None:
-            return {}
-        with self._ledger_lock:
-            ledger = state.load_state(self._state_path, warn=self._journal)
-            return ledger["issues"].get(str(int(iid))) or {}
 
     def _record_delivery_commit(self, iid, commit):
         """delivery_commit 落账（首个写方＝本模块；agora_status 归 Task 5）。

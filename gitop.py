@@ -551,10 +551,15 @@ _HEX40_OK = re.compile(r"[0-9a-f]{40}")
 # non-ff markers say "the remote branch moved" (rotate the handoff);
 # anything else (src refspec matches no object, remote rejected the ref by
 # hook/permission) is deterministic — retrying the same commit can never
-# succeed, so the caller reports task_deliver(failed).
+# succeed, so the caller reports task_deliver(failed). Marker matching is
+# why the subprocess below pins LC_ALL=C: a localized git prints localized
+# diagnostics and every marker would miss (non_ff misread as "failed" —
+# a terminal verdict).
 _NON_FF_MARKERS = ("(fetch first)", "non-fast-forward")
 _TRANSPORT_MARKERS = ("unable to access", "could not read from remote "
-                      "repository", "could not resolve", "connection")
+                      "repository", "could not resolve", "connection",
+                      "rpc failed", "the remote end hung up",
+                      "unexpected disconnect")
 
 
 def push_verified_commit(repo: PathLike, iid, commit: str, remote_url: str,
@@ -585,6 +590,9 @@ def push_verified_commit(repo: PathLike, iid, commit: str, remote_url: str,
                    remote_url))
     env, clean_url = _net_env(remote_url)
     refspec = f"{commit}:refs/heads/{fix_branch(iid)}"
+    # 分类读 stderr：钉英文输出（LC_ALL 压过继承的 LANG），本地化 git 的
+    # 标记翻译才不会把 non_ff/瞬态病误判成确定性 failed 终局
+    env = {"LC_ALL": "C", **(env or {})}
     proc = _run(["git", "-C", str(repo), *_ssl_args(remote_url, ssl_verify),
                  "push", clean_url, refspec], cwd=repo, env=env)
     if proc.returncode != 0:

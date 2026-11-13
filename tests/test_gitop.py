@@ -889,3 +889,29 @@ def test_fetch_fix_branch_tip_reads_remote_into_agent_remote_namespace(
          "refs/remotes/agent-remote/master"],
         capture_output=True)
     assert probe.returncode != 0, "默认支跟踪 ref 不得被创建"
+
+
+def test_push_verified_commit_pins_english_locale(repo, monkeypatch):
+    """评审环 ocr #1：三态分类靠 stderr 子串——必须钉 LC_ALL=C，本地化
+    git 环境下 non_ff/transport 标记才不 miss（miss 会把 non_ff 误判
+    failed 直接终局化）。"""
+    fake = FakeRun()
+    monkeypatch.setattr(gitop, "_run", fake)
+    push_verified_commit(repo, 7, "a" * 40, "file:///tmp/x.git")
+    assert fake.envs[0].get("LC_ALL") == "C"
+
+
+def test_push_verified_commit_transient_rpc_failures_raise(repo, monkeypatch):
+    """评审环 ocr #2：瞬态传输族（RPC failed/远端挂断/意外断连）必须抛
+    PushFailed（poll 轮次重试面），不得误判确定性 failed 终局。"""
+    for marker in (
+            "error: RPC failed; HTTP 502 Bad Gateway",
+            "fatal: the remote end hung up unexpectedly",
+            "fetch-pack: unexpected disconnect while reading sideband packet"):
+        def failing_run(cmd, cwd, env=None, _marker=marker):
+            return subprocess.CompletedProcess(cmd, 128, stdout="",
+                                               stderr=_marker)
+
+        monkeypatch.setattr(gitop, "_run", failing_run)
+        with pytest.raises(PushFailed):
+            push_verified_commit(repo, 7, "a" * 40, "file:///tmp/r.git")

@@ -75,9 +75,9 @@ def test_reserve_occupies_slot_until_terminal_release():
     assert monitor.tasks() == [(7, None), (8, None)], "占位登记，tid 待 register"
     assert monitor.reserve(7), "同 iid 重入复用己占名额"
     monitor.register(7, "ag-1")  # 占位转正
-    monitor.release(7)  # 任务到终态
+    monitor.release(7, "ag-1")  # 任务到终态（compare-and-release）
     assert monitor.reserve(9)
-    monitor.release(9)  # 幂等
+    monitor.release(9)  # 占位式释放（回合失败出口）＋幂等
     monitor.release(9)
 
 
@@ -504,23 +504,81 @@ def test_stale_deliver_rejection_journals_and_rechecks_board(
     assert entry(state_path)["delivery_commit"] == new
 
 
-def test_handoff_older_than_recorded_delivery_is_skipped(
+def test_release_for_superseded_task_never_evicts_newer_registration():
+    """评审环 ocr #5：快照轮询的网络窗内回合链 register 覆盖后，旧任务
+    迟到的终态 release 不得逐掉新登记（否则新任务失联＋名额账坏）；单参
+    release 只清 reserve 占位，不碰已转正登记。"""
+    monitor = make_monitor(max_active=2)
+    monitor.register(7, "ag-old")
+    monitor.register(7, "ag-new")  # 回合链推进：覆盖为最新 tid
+    monitor.release(7, "ag-old")   # 旧任务终态（迟到的快照 release）
+    assert monitor.tasks() == [(7, "ag-new")]
+    monitor.release(7)             # 占位式 release：已转正登记不受碰
+    assert monitor.tasks() == [(7, "ag-new")]
+    monitor.release(7, "ag-new")
+    assert monitor.tasks() == []
+    monitor.release(7, "ag-new")   # 幂等
+    assert monitor.tasks() == []
+
+
+def test_cross_round_recorded_delivery_does_not_block_new_task(
         tmp_path, monkeypatch):
-    """旧 commit 永不覆盖新交付：账本已记录更新的 delivery_commit 时，
-    board 迟到的旧 handoff 不推送不落账。"""
-    recorded = hex40("5")
-    stale_handoff = hex40("1")
-    client = FakeAgoraClient(commit=stale_handoff)
+    """评审环 ocr #3：回合1 的 delivery_commit 在案时，回合2 任务（哪怕
+    同一 issue 同一账本行）照常交付——「旧 handoff 跳过」闸会把
+    max_active=1 的监视器永久卡死（recorded 跨回合不清理、新 handoff 必
+    不同）；board handoff 是权威，旧 commit 防线＝服务端 stale 403＋写前
+    board 核对。"""
+    handoff = hex40("a")
+    client = FakeAgoraClient(commit=handoff)
     fake_git = FakeGitDelivery(monkeypatch)
-    monitor, state_path, journal = delivery_monitor(tmp_path, monkeypatch,
-                                                    client, fake_git)
+    monitor, state_path, _ = delivery_monitor(tmp_path, monkeypatch, client,
+                                              fake_git)
     with monitor._ledger_lock:
         ledger = state.load_state(state_path)
-        ledger["issues"]["7"]["delivery_commit"] = recorded
+        issue_row = ledger["issues"]["7"]
+        issue_row["delivery_commit"] = hex40("5")  # 回合1 已交付的旧 commit
+        issue_row["agora_task_id"] = TID
         state.save_state(state_path, ledger)
 
     monitor.poll_once()
 
+    assert fake_git.push_calls, "跨回合在案记录不得阻断新交付"
+    assert client.deliver_calls[0]["commit"] == handoff
+    assert entry(state_path)["delivery_commit"] == handoff
+    assert monitor.tasks() == []
+
+
+def test_done_delivered_state_records_and_releases(tmp_path, monkeypatch):
+    """评审环 ocr #4：delivered ack 后收口读竞态/瞬断的恢复面——board 已
+    done+delivered（非 awaiting_external）时补记 delivery_commit 并释放
+    名额，交付事实不因一次收口读失败而丢失（Task 5 消费账本）。"""
+    commit = hex40("a")
+    client = FakeAgoraClient(commit=commit)
+    client.tasks[TID]["delivery"].update(status="delivered",
+                                         local_status="not_required")
+    fake_git = FakeGitDelivery(monkeypatch)
+    monitor, state_path, _ = delivery_monitor(tmp_path, monkeypatch, client,
+                                              fake_git)
+
+    monitor.poll_once()
+
     assert fake_git.push_calls == [] and client.deliver_calls == []
-    assert entry(state_path)["delivery_commit"] == recorded
-    assert any("skipped" in m for m in journal), journal
+    assert entry(state_path)["delivery_commit"] == commit
+    assert monitor.tasks() == []
+
+
+def test_malformed_handoff_is_terminal_local_release(
+        tmp_path, monkeypatch):
+    """评审环 ocr #6：done+awaiting_external+坏 commit 是确定性协议违约
+    ——服务端 hex40 校验使 deliver 无法 ack；本地终局释放（不重派、不无
+    限 journal 占名额）。"""
+    client = FakeAgoraClient(commit="not-a-sha")
+    fake_git = FakeGitDelivery(monkeypatch)
+    monitor, _, journal = delivery_monitor(tmp_path, monkeypatch, client,
+                                           fake_git)
+
+    monitor.poll_once()
+
+    assert fake_git.push_calls == [] and client.deliver_calls == []
+    assert monitor.tasks() == [], "确定性协议违约必须终局释放名额"
+    assert any("malformed" in m for m in journal), journal
