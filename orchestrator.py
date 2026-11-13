@@ -340,8 +340,9 @@ class Orchestrator:
     def _startup_orphan_cleanup(self):
         """No worker thread exists yet, so every pending claim is an orphan
         (kill -9 between claim and finalize): recycle to defer and requeue."""
-        recycled = state.claim_timeout_recycle(
-            self.state_path, datetime.now(timezone.utc), 0)
+        with self._ledger_lock:  # recycle 自带 load→mutate→save：不得绕锁
+            recycled = state.claim_timeout_recycle(
+                self.state_path, datetime.now(timezone.utc), 0)
         for iid in recycled:
             self._journal(f"startup: orphan pending issue#{iid} recycled to defer, requeued")
             self.queue.put({_REQUEUE: int(iid), "reason": "orphan-pending"})
@@ -1459,7 +1460,10 @@ class Orchestrator:
         self._journal("reconcile: start")
         now = datetime.now(timezone.utc)
         # 1. stale claims -> defer (+defer_count) -> requeue
-        for iid in state.claim_timeout_recycle(self.state_path, now, self.claim_timeout_s):
+        with self._ledger_lock:  # 同 startup 孤儿回收：recycle 绕锁＝丢更新旁路
+            recycled = state.claim_timeout_recycle(
+                self.state_path, now, self.claim_timeout_s)
+        for iid in recycled:
             self._journal(f"reconcile: recycled stale claim issue#{iid}, requeued")
             self.queue.put({_REQUEUE: int(iid), "reason": "claim-timeout"})
 

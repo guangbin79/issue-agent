@@ -2302,3 +2302,46 @@ def test_session_invalid_fallback_new_session_keeps_cred_prefix(harness):
     assert len(harness.runner.new_calls) == 1, "fallback to a fresh session"
     assert cred_shape_ok(harness.runner.new_calls[0]["cred_prefix"], 11,
                          harness.repo_path), "prefix survives the degrade path"
+
+
+# --- ledger lock discipline (plan Task 2 / OCR review round 3) ----------------
+
+
+def test_reconcile_and_orphan_cleanup_write_ledger_under_lock(
+        tmp_path, monkeypatch):
+    """claim_timeout_recycle 自带 load→mutate→save，两处调用（startup 孤儿
+    回收＋reconcile 陈旧 claim 回收）都必须在账本锁内——「本类全部账本写
+    在 _ledger_lock 内」的契约不能有无锁旁路，否则 Router 的 sid persist
+    与之交错会丢更新。"""
+    import threading
+
+    class LockProbe:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self.depth = 0
+
+        def __enter__(self):
+            self._lock.acquire()
+            self.depth += 1
+            return self
+
+        def __exit__(self, *exc):
+            self.depth -= 1
+            self._lock.release()
+            return False
+
+    probe = LockProbe()
+    observed = []
+
+    def fake_recycle(path, now, timeout_s):
+        observed.append(probe.depth > 0)
+        return []
+
+    monkeypatch.setattr(orchestrator.state, "claim_timeout_recycle",
+                        fake_recycle)
+    h = Harness(tmp_path, monkeypatch, start=False, ledger_lock=probe)
+    h.orch._startup_orphan_cleanup()
+    h.orch._fetch_open_issues_and_notes = lambda: None  # F20 早退：回收段即本路径全部账本写
+    h.orch._safe_reconcile()
+    assert observed == [True, True], \
+        "claim_timeout_recycle 两处调用都必须持锁"
