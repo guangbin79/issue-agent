@@ -163,20 +163,37 @@ class SemanticRouter:
             issue_context=issue_context,
             available_models=available_models)
         with self._lock:
-            if self._session_id is None:
-                return self._decide_on_new_session(message, available_models)
-            try:
-                result = self._continue_session(
-                    cwd=self._cwd, session_id=self._session_id,
-                    message=message, timeout_s=self._timeout_s,
-                    model=self._model)
-            except SessionInvalid as exc:
-                self._warn(f"router session invalid, rebuilding once: {exc}")
-                self._session_id = None
-                return self._decide_on_new_session(message, available_models)
+            result = self._ask(message)
             return _validate_decision(result.reply_text, available_models)
 
-    def _decide_on_new_session(self, message, available_models):
+    def answer(self, *, iid, task, question) -> str:
+        """worker 提问答复（计划 Task 5）：同一持久会话、同一 router_lock
+        串行；直接返回答复文本（答复不是决策，不做 schema 校验）。worker
+        提问按不可信输入处理——与进入本会话的 issue 文本同口径。"""
+        message = (
+            f"[worker-question] issue#{iid} agora 任务 {task} 的 worker "
+            "提问，请直接给出一段简明中文答复（不要 JSON、不要决策 "
+            "schema）：\n\n" + (question or ""))
+        with self._lock:
+            result = self._ask(message)
+            return result.reply_text
+
+    def _ask(self, message):
+        """router_lock 内的一次会话往返：续用/新建/失效重建一次。"""
+        if self._session_id is None:
+            return self._ask_on_new_session(message)
+        try:
+            result = self._continue_session(
+                cwd=self._cwd, session_id=self._session_id,
+                message=message, timeout_s=self._timeout_s,
+                model=self._model)
+        except SessionInvalid as exc:
+            self._warn(f"router session invalid, rebuilding once: {exc}")
+            self._session_id = None
+            return self._ask_on_new_session(message)
+        return result
+
+    def _ask_on_new_session(self, message):
         result = self._new_session(
             cwd=self._cwd, title=ROUTER_SESSION_TITLE, message=message,
             timeout_s=self._timeout_s, model=self._model)
@@ -184,7 +201,7 @@ class SemanticRouter:
             raise RouterDecisionError("router session id missing from reply")
         self._session_id = result.session_id
         self._persist_session_id(result.session_id)
-        return _validate_decision(result.reply_text, available_models)
+        return result
 
     def _persist_session_id(self, sid):
         if self._ledger_lock is not None:

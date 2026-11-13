@@ -204,6 +204,14 @@ def _atomic_write(path: str, data: bytes) -> None:
         os.close(dir_fd)
 
 
+def write_json_atomic(path: PathLike, payload) -> None:
+    """Atomic JSON dump for orchestrator-owned sidecars (mail/reports stores
+    beside the ledger — not ledger schema, so save_state's normalize does not
+    apply). Same crash guarantees as save_state: tmp + fsync + rename."""
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    _atomic_write(os.fspath(path), encoded)
+
+
 def adopt_existing(state: dict, open_issues_with_notes: dict) -> dict:
     """First-install baseline: mark untracked open issues as "adopted" and
     snapshot ALL their current note ids into processed_note_ids, so the next

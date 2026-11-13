@@ -313,6 +313,18 @@ class FakeAgoraClient:
         self.dispatch_failures = []
         self.doctor_calls = 0
         self.doctor_result = {"models": ["zai/glm-5.3"]}
+        # Task 5 持续对话面：post(kind=question) 直通与失败注入
+        self.posts = []          # {"task", "kind", "body"}
+        self.post_failures = []  # 提交时抛出的异常队列
+        self.cancel_calls = []   # task_cancel 调用记账（关单语义必须为零）
+
+    def post(self, tid, kind, body):
+        self.posts.append({"task": tid, "kind": kind, "body": body})
+        if self.post_failures:
+            raise self.post_failures.pop(0)
+
+    def task_cancel(self, tid):
+        self.cancel_calls.append(tid)
 
     def doctor(self):
         self.doctor_calls += 1
@@ -376,7 +388,9 @@ class FakeRouter:
 
 class FakeMonitor:
     """AgoraMonitor 替身：reserve/register/release/attach_delivery 调用记账
-    （reserve 语义镜像真件：占位 tid=None、同 iid 重入复用己占名额）。"""
+    （reserve 语义镜像真件：占位 tid=None、同 iid 重入复用己占名额）。
+    Task 5 面：active_task 镜像登记簿反查（活动任务门控）、report_for
+    返回脚本化持久报告、attach_conversation 捕获接线。"""
 
     def __init__(self, max_active=1):
         self.max_active = max_active
@@ -385,11 +399,22 @@ class FakeMonitor:
         self.released = []
         self.reserved = []
         self.attached = None
+        self.conversation = None
+        self.report = None  # report_for 脚本化返回（None＝无持久报告）
         self.started = 0
         self.stopped = 0
 
     def attach_delivery(self, **kwargs):
         self.attached = kwargs
+
+    def attach_conversation(self, **kwargs):
+        self.conversation = kwargs
+
+    def active_task(self, iid):
+        return self._active.get(int(iid))
+
+    def report_for(self, iid):
+        return self.report
 
     def reserve(self, iid):
         self.reserved.append(int(iid))
@@ -2781,7 +2806,9 @@ def test_router_question_does_not_create_only_asks(tmp_path, monkeypatch):
 def test_new_note_round_redecides_and_chains_after_previous_tid(
         tmp_path, monkeypatch):
     """新 note＝新回合：重新路由、client_key 换 note 段、after 链上轮 tid；
-    legacy session_id 全程不被改写。"""
+    legacy session_id 全程不被改写。Task 5 起：上轮任务非终态时评论直通
+    worker（见 test_active_comment_reaches_worker_...），新回合只在终态
+    后发生——释放登记模拟终态再评论。"""
     client = FakeAgoraClient()
     router_ = FakeRouter()
     monitor = FakeMonitor(max_active=2)  # 上轮任务未终态：名额须并行
@@ -2795,6 +2822,7 @@ def test_new_note_round_redecides_and_chains_after_previous_tid(
             and turn_finalized(h, 7)), h.journal_msgs
         assert h.entry(7)["session_id"] == "ses_legacy"
 
+        monitor.release(7, "ag-123")  # 上轮任务终态：新评论才会重新路由
         h.listener.queue.put(comment_event(iid=7, comment_id=102))
         assert wait_until(
             lambda: h.entry(7)["agora_task_id"] == "ag-124"
@@ -2885,3 +2913,255 @@ def test_create_protocol_error_recovers_same_task(tmp_path, monkeypatch):
         assert monitor.registered == [(7, "ag-123")]
     finally:
         h.orch.stop()
+
+
+# --- agora continuous conversation & terminal semantics (plan Task 5) -----------
+
+
+def seed_active_agora_task(h, *, iid=7, tid="ag-123"):
+    """账本登记 agora 任务＋monitor 在案：模拟派发完成后的稳态（issue 活跃、
+    任务非终态）。"""
+    st = state.load_state(h.state_path)
+    entry = st["issues"].setdefault(str(iid), state._new_issue("active"))
+    entry["agora_task_id"] = tid
+    state.save_state(h.state_path, st)
+    h.orch.agora_monitor.register(iid, tid)
+    return tid
+
+
+def test_active_comment_reaches_worker_without_waiting_for_turn(
+        tmp_path, monkeypatch):
+    """计划锚例（T4-B1 根修）：awaiting_external 交付窗口（任务非终态）内
+    同 issue 新评论 → daemon 直接 post(kind=question) 给在案 worker（body
+    带 issue/note id），零 task_create、零 after 链、登记 tid 不变。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        assert monitor.registered == [(7, "ag-123")]
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="请改用方案 B", comment_id=102))
+        assert wait_until(lambda: any(p["kind"] == "question"
+                                      for p in client.posts)), h.journal_msgs
+
+        question = next(p for p in client.posts if p["kind"] == "question")
+        assert question["task"] == "ag-123"
+        assert "请改用方案 B" in question["body"]
+        assert "102" in question["body"], "body 必须带 note id"
+        assert "7" in question["body"], "body 必须带 issue 标识"
+        assert client.created_ids == ["ag-123"], "活动窗口零新任务"
+        assert len(router_.calls) == 1, "零重路由"
+        assert h.entry(7)["agora_task_id"] == "ag-123", "登记 tid 不被覆盖"
+        assert turn_finalized(h, 7), "直通回合照常收尾（claim 闭环）"
+    finally:
+        h.orch.stop()
+
+
+def test_terminal_comment_uses_router_for_new_round(tmp_path, monkeypatch):
+    """计划锚例：任务已终态（名额释放、账本 tid 让位候选）→ 新评论重新走
+    Router 建新回合，且 after 链上轮 tid。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor(max_active=2)
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        monitor.release(7, "ag-123")  # 任务终态：monitor 收口释放
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="继续修复边界情况", comment_id=102))
+        assert wait_until(lambda: len(client.created_ids) == 2), h.journal_msgs
+
+        assert len(router_.calls) == 2, "终态后必须重新路由"
+        assert client.create_calls[1]["after"] == "ag-123"
+        assert client.posts == [], "终态后不直通旧 worker"
+    finally:
+        h.orch.stop()
+
+
+def test_active_comment_relay_unavailable_keeps_pending(tmp_path, monkeypatch):
+    """直通投递遇 agora 不可用 → 保留待派发重试（与建单/派发同口径），
+    绝不丢失评论也绝不降级 legacy。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        client.post_failures.append(AgoraUnavailable("post down (fake)"))
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="请补充测试", comment_id=102))
+        assert wait_until(lambda: h.entry(7)["agora_pending"] is True), \
+            h.journal_msgs
+        assert h.entry(7)["status"] == "pending", "claim 留存待重试"
+        assert client.created_ids == ["ag-123"]
+    finally:
+        h.orch.stop()
+
+
+def test_stale_registry_rejected_relay_falls_back_to_router(
+        tmp_path, monkeypatch):
+    """注册表陈旧竞态（board 已终态、poll 未及释放）→ 直通被服务端拒
+    （AgoraRejected）→ 回落 Router 新回合，不得卡死在直通路径。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor(max_active=2)
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        monitor.release(7, "ag-123")  # board 侧已终态
+        monitor.register(7, "ag-123")  # 注册表陈旧（poll 未及收敛）
+        client.post_failures.append(AgoraRejected("任务已收口 (fake)"))
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="还有问题", comment_id=102))
+        assert wait_until(lambda: len(client.created_ids) == 2), h.journal_msgs
+        assert len(router_.calls) == 2
+    finally:
+        h.orch.stop()
+
+
+def test_repost_uses_persisted_report_zero_dispatch(tmp_path, monkeypatch):
+    """重发汇报（设计 §9.5）：agora 模式复用持久化 worker 报告——零派工、
+    零提交、零推送；无报告时只发事实型未找到评论（同样零派工）。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor()
+    report = "根因：竞态窗口\n改动：orchestrator.py\n坑位：tests/fake.py 是替身"
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        created_before = list(client.create_calls)
+
+        monitor.report = report
+        h.listener.queue.put(comment_event(iid=7, body="重发汇报",
+                                           comment_id=102))
+        assert wait_until(lambda: any(report in b for _, b in h.api.posts)), \
+            h.journal_msgs
+        assert client.create_calls == created_before, "零派工"
+        assert h.gitop.push_calls == [], "零推送"
+        assert h.entry(7)["status"] == "active"
+        assert h.entry(7)["claimed_at"] is None
+    finally:
+        h.orch.stop()
+
+
+def test_repost_without_report_posts_factual_note_zero_dispatch(
+        tmp_path, monkeypatch):
+    """无持久化报告的重发汇报：只发事实型「未找到」评论，不打扰 worker、
+    不降级成新回合。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        created_before = list(client.create_calls)
+        router_calls_before = len(router_.calls)
+
+        h.listener.queue.put(comment_event(iid=7, body="重发汇报",
+                                           comment_id=102))
+        assert wait_until(
+            lambda: any("重发" in b or "汇报" in b for _, b in h.api.posts)
+            and h.entry(7)["claimed_at"] is None), h.journal_msgs
+        assert client.create_calls == created_before, "零派工"
+        assert len(router_.calls) == router_calls_before, "零路由"
+    finally:
+        h.orch.stop()
+
+
+def test_pause_blocks_new_dispatch_but_monitor_continues(
+        tmp_path, monkeypatch):
+    """暂停语义（设计 §9.5）：禁新派工不取消在飞——monitor 登记不动、
+    暂停期间新评论不建任务不路由；恢复后按任务状态路由（活动任务直通）。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        created_before = list(client.create_calls)
+
+        h.listener.queue.put(comment_event(iid=7, body="暂停", comment_id=102))
+        assert wait_until(lambda: h.entry(7)["status"] == "paused"), \
+            h.journal_msgs
+        assert h.orch.agora_monitor._active.get(7) == "ag-123", \
+            "暂停不取消在飞 monitor 登记"
+
+        h.listener.queue.put(comment_event(iid=7, body="随便聊聊",
+                                           comment_id=103))
+        time.sleep(0.3)
+        assert client.create_calls == created_before, "暂停期零派工"
+        assert client.posts == [], "暂停期零直通零路由"
+
+        h.listener.queue.put(comment_event(iid=7, body="恢复", comment_id=104))
+        assert wait_until(lambda: h.entry(7)["status"] == "active"), \
+            h.journal_msgs
+        h.listener.queue.put(
+            comment_event(iid=7, body="请改用方案 B", comment_id=105))
+        assert wait_until(lambda: any(p["kind"] == "question"
+                                      for p in client.posts)), h.journal_msgs
+        assert client.create_calls == created_before, \
+            "恢复后活动任务仍在：直通而非新回合"
+    finally:
+        h.orch.stop()
+
+
+def test_close_keeps_inflight_and_reopen_restores_routing(
+        tmp_path, monkeypatch):
+    """关单＝终态暂停（2026-11-13 裁定）：不调 task_cancel、在飞任务由
+    monitor 走完、close-push 照旧；close 后新评论不建任务；重开恢复正常
+    路由（新回合 after 链上轮 tid）。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor(max_active=2)
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        created_before = list(client.create_calls)
+
+        close = issue_open_event(iid=7)
+        close["action"] = "closed"
+        h.listener.queue.put(close)
+        assert wait_until(lambda: h.entry(7)["status"] == "done"), \
+            h.journal_msgs
+        assert client.cancel_calls == [], "关单绝不调 task_cancel"
+        assert h.orch.agora_monitor._active.get(7) == "ag-123", \
+            "在飞任务由 monitor 继续走完（登记不动）"
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="关单后的留言", comment_id=102,
+                          issue_state="closed"))
+        time.sleep(0.3)
+        assert client.create_calls == created_before, "关单后不建新任务"
+        assert client.posts == []
+
+        reopen = issue_open_event(iid=7)
+        reopen["action"] = "reopened"
+        h.listener.queue.put(reopen)
+        assert wait_until(lambda: h.entry(7)["status"] == "active"), \
+            h.journal_msgs
+        monitor.release(7, "ag-123")  # 在飞任务此后由 monitor 交付收口
+        h.listener.queue.put(
+            comment_event(iid=7, body="重开后继续修", comment_id=103))
+        assert wait_until(lambda: len(client.created_ids) == 2), h.journal_msgs
+        assert client.create_calls[-1]["after"] == "ag-123", "重开恢复路由"
+    finally:
+        h.orch.stop()
+

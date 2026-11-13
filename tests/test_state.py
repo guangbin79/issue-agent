@@ -310,3 +310,14 @@ def test_atomic_write_survives_concurrent_writers(tmp_path, monkeypatch):
         t.join()
     assert errors == []
     assert json.loads((tmp_path / "state.json").read_text())["tag"] in "ab"
+
+
+def test_write_json_atomic_roundtrip_and_no_tmp_leftovers(tmp_path):
+    """write_json_atomic（Task 5 monitor sidecar 用）：任意 JSON 原子落盘、
+    覆盖写、不留暂存残件。"""
+    path = tmp_path / "side.json"
+    state_mod.write_json_atomic(path, {"pending": [1, 2]})
+    assert json.loads(path.read_text(encoding="utf-8")) == {"pending": [1, 2]}
+    state_mod.write_json_atomic(path, {"pending": []})
+    assert json.loads(path.read_text(encoding="utf-8")) == {"pending": []}
+    assert list(tmp_path.glob("*.tmp*")) == []

@@ -285,6 +285,13 @@ class Orchestrator:
                 repo_path=self.repo_path, remote_url=self.remote_url,
                 ssl_verify=self.ssl_verify, state_path=self.state_path,
                 ledger_lock=self._ledger_lock)
+            # 会话面接线（Task 5）：issue 评论通道（终态汇报/worker 答复
+            # 回评）、worker 提问答复回调（锁序见 _answer_worker_question）
+            # 与心跳间隔。daemon 构造面依旧不变。
+            self.agora_monitor.attach_conversation(
+                post_note=self._post_note,
+                answer_question=self._answer_worker_question,
+                heartbeat_interval=self.heartbeat_interval)
         # bounded turn slots + per-issue locks replace the historical process-
         # wide turn lock: at most max_parallel turns in flight, and a given
         # issue's turns never overlap (same-issue events queue behind the lock).
@@ -484,8 +491,12 @@ class Orchestrator:
     def _repost_report(self, iid, session_id, pre_status=None):
         """「重发汇报」轻量补发回合：零派工/零提交/零推送。
 
-        Preconditions: the fix branch is verifiably on the remote (nothing
-        to push) AND the issue's review loop ran (<repo>/.review-loop/
+        agora 模式（Task 5，设计 §9.5）：直接复用 monitor 持久化的 worker
+        报告；无报告只发事实型未找到评论（同样零派工零推送，不打扰
+        worker）。
+
+        Preconditions (legacy): the fix branch is verifiably on the remote
+        (nothing to push) AND the issue's review loop ran (<repo>/.review-loop/
         present). Anything else — including a failed probe — journals and
         returns False so the caller degrades to a normal continue turn
         (never for a paused issue — the caller gates that).
@@ -494,6 +505,8 @@ class Orchestrator:
         closed (claimed_at None; status active — EXCEPT a paused issue
         keeps its pause: 重发汇报 must never silently resume automation).
         """
+        if self.agora_client is not None and self.agora_monitor is not None:
+            return self._repost_agora(iid, pre_status)
         try:
             pushed = gitop.fix_branch_pushed(self.repo_path, iid, self.remote_url,
                                              self.ssl_verify)
@@ -527,6 +540,32 @@ class Orchestrator:
         note_kind = "report re-posted" if report else "not-found note posted"
         suffix = "" if entry["status"] == "active" else f" (status={entry['status']})"
         self._journal(f"repost: issue#{iid} {note_kind}{suffix}")
+        return True
+
+    def _repost_agora(self, iid, pre_status=None):
+        """agora 重发汇报（Task 5）：复用 monitor 持久化报告，零派工/零
+        提交/零推送；无报告发事实型未找到评论。claim 闭环与 legacy 同
+        口径（paused 保持暂停，绝不静默恢复自动化）。"""
+        report = self.agora_monitor.report_for(iid)
+        text = report if report else \
+            f"issue#{iid} 尚无持久化的 agora worker 汇报，无法重发。"
+        if not self._post_note(iid, text):
+            return False  # 瞬断：沿用 legacy 降级口径（continue 回合）
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            issues = ledger.setdefault("issues", {})
+            key = str(int(iid))
+            if key not in issues:
+                issues[key] = _empty_entry()
+            entry = issues[key]
+            # CAS：只在 claim 自己的 pending 上收口（与 legacy 同门）
+            if entry["status"] == "pending":
+                entry["status"] = "paused" if pre_status == "paused" \
+                    else "active"
+            entry["claimed_at"] = None
+            state.save_state(self.state_path, ledger)
+        self._journal(f"repost: issue#{iid} agora persisted report "
+                      f"{'re-posted' if report else 'missing (noted)'}")
         return True
 
     # ------------------------------------------------------------------ turns
@@ -778,6 +817,16 @@ class Orchestrator:
             if not self._post_note(iid, f"已接手 issue#{iid}"):
                 self._defer(iid, None)
                 return
+            # 持续对话门控（Task 5，T4-B1 根修）：账本登记任务非终态
+            # （monitor 在案，含 done+awaiting_external 交付窗口）→ 新评论
+            # post(kind=question) 直达在案 worker——不建新任务、不 after
+            # 链、不覆盖登记 tid；仅无登记或已终态才经 Router 建新回合。
+            active_tid = (self.agora_monitor.active_task(iid)
+                          if self.agora_monitor is not None else None)
+            if active_tid is not None \
+                    and self._agora_relay_comment(iid, active_tid, message,
+                                                  note_id):
+                return
             # 活动名额（monitor 侧，与 max_parallel turn 槽双重限制）：满员
             # 保留待派发（claim 留存，claim-timeout 回收后 requeue 重试），
             # 绝不超额建单。reserve 是原子 check-and-reserve——并发回合不
@@ -847,6 +896,43 @@ class Orchestrator:
             finally:
                 if self.agora_monitor is not None and not registered:
                     self.agora_monitor.release(iid)
+
+    def _agora_relay_comment(self, iid, tid, message, note_id):
+        """活动任务评论直通（Task 5）：post(kind=question) 给在案 worker
+        （body 带 issue/note id）。AgoraRejected（注册表陈旧竞态——board
+        已终态而 poll 未及释放）返回 False 交调用方回落 Router 新回合；
+        不可达保留待派发重试（绝不丢评论、绝不降级 legacy）。"""
+        body = (f"issue#{iid} 新评论（note {note_id or 0}）需要你处理："
+                f"\n\n{message}")
+        try:
+            self.agora_client.post(tid, "question", body)
+        except AgoraRejected as exc:
+            self._journal(f"turn: issue#{iid} relay to {tid} rejected "
+                          f"({exc}); falling back to router")
+            return False
+        except (AgoraUnavailable, AgoraProtocolError) as exc:
+            self._journal(f"turn: issue#{iid} relay to {tid} unreachable, "
+                          f"kept pending: {exc}")
+            self._agora_keep_pending(iid, "comment relay unavailable")
+            return True
+        self._journal(f"turn: issue#{iid} comment relayed to worker "
+                      f"({tid}, note {note_id or 0})")
+        self._finalize(iid, None, None)
+        return True
+
+    def _answer_worker_question(self, iid, tid, body):
+        """worker 提问答复回调（Task 5，monitor 汇报管线调用）：T3 锁序
+        铁律——Router 的唯一合法入口是先持 orchestrator ledger_lock 再进
+        （与 _agora_route 同序；反序获取会与之死锁）。Router 故障返回
+        None（monitor 侧给事实型兜底答复，不虚构）。"""
+        with self._ledger_lock:
+            try:
+                return self.router.answer(iid=iid, task=tid, question=body)
+            except (router.RouterDecisionError, runner.SessionInvalid,
+                    runner.TurnTimeout, runner.TurnCrash) as exc:
+                self._journal(f"agora-monitor: router answer for {tid} "
+                              f"failed: {exc}")
+                return None
 
     def _agora_route(self, iid, *, event, message):
         """账本锁临界区内的 Router 决策与 goal/model 持久化（T2 共享 RLock

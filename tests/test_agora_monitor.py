@@ -16,6 +16,7 @@ Run: python3 -m pytest tests/test_agora_monitor.py -q
 import json
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -183,7 +184,11 @@ class FakeAgoraClient:
     pending 轮转（gate_requeue 模拟门体按 base 重排重验出新 handoff）。
 
     ack_mode：""＝正常；"lost"＝服务端已处理但回包丢失（先落账再抛
-    AgoraUnavailable）；"down"＝未处理即抛（纯超时）。"""
+    AgoraUnavailable）；"down"＝未处理即抛（纯超时）。
+
+    Task 5 面：check_mail 一次性吐出 mail 队列（镜像「拉取即送达」——
+    返回即清空）；post 记账（answer 直投）；create_task/cancel 记账
+    （重启恢复必须零 create，关单语义必须零 cancel）。"""
 
     def __init__(self, tid=TID, commit=None):
         commit = commit or hex40("a")
@@ -197,6 +202,29 @@ class FakeAgoraClient:
         self.board_calls = []
         self.deliver_calls = []
         self.ack_mode = ""
+        self.mail = []        # 待投递消息（wire 形状：id/ts/task/kind/from/to/body）
+        self.posts = []       # post() 记账
+        self.create_calls = []   # create_task 记账（恢复面断言零建单）
+        self.cancel_calls = []   # task_cancel 记账
+        self.check_mail_calls = 0
+
+    def check_mail(self):
+        self.check_mail_calls += 1
+        got, self.mail = self.mail, []
+        return got
+
+    def poll_interval(self):
+        return 15.0
+
+    def post(self, tid, kind, body):
+        self.posts.append({"task": tid, "kind": kind, "body": body})
+
+    def create_task(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return "ag-new"
+
+    def task_cancel(self, tid):
+        self.cancel_calls.append(tid)
 
     def board(self, tid):
         self.board_calls.append(tid)
@@ -582,3 +610,308 @@ def test_malformed_handoff_is_terminal_local_release(
     assert fake_git.push_calls == [] and client.deliver_calls == []
     assert monitor.tasks() == [], "确定性协议违约必须终局释放名额"
     assert any("malformed" in m for m in journal), journal
+
+
+# --- Task 5: 终态汇报 / 持续评论 / mailbox 管线 / 重启恢复 / 心跳 -----------------
+
+
+def mail_msg(mid, tid=TID, kind="note", body="进度正常"):
+    """check_mail wire 形状（agorad store：frontmatter 字符串值＋id:int＋body）。"""
+    return {"id": mid, "ts": f"{1700000000.0 + mid:.6f}", "task": tid,
+            "kind": kind, "from": "ses_worker_1",
+            "to": "issue-agent:agora-test", "body": body}
+
+
+class ConversationFace:
+    """会话面间谍：post_note 记账（可校验调用时报告已先持久化）、
+    answer_question 记录问题并返回脚本化答复。"""
+
+    def __init__(self, answer_text="答复正文", answer_error=None):
+        self.posts = []       # (iid, text)
+        self.answers = []     # (iid, tid, body)
+        self.answer_text = answer_text
+        self.answer_error = answer_error
+        self.note_hook = None  # callable(iid) 在每次 post_note 前调用
+
+    def post_note(self, iid, text):
+        if self.note_hook is not None:
+            self.note_hook(iid)
+        self.posts.append((int(iid), text))
+        return True
+
+    def answer_question(self, iid, tid, body):
+        self.answers.append((int(iid), tid, body))
+        if self.answer_error is not None:
+            raise self.answer_error
+        return self.answer_text
+
+
+def conversation_monitor(tmp_path, monkeypatch, client, face=None,
+                         heartbeat_interval=0):
+    """接线完毕的 monitor＋issue 账本＋会话面（Task 5）。"""
+    if face is None:
+        face = ConversationFace()
+    monitor, state_path, journal = delivery_monitor(tmp_path, monkeypatch,
+                                                    client)
+    monitor.attach_conversation(post_note=face.post_note,
+                                answer_question=face.answer_question,
+                                heartbeat_interval=heartbeat_interval)
+    return monitor, state_path, journal, face
+
+
+def reports_path_of(state_path):
+    return str(state_path) + ".agora-reports.json"
+
+
+def mail_path_of(state_path):
+    return str(state_path) + ".agora-mail.json"
+
+
+def test_delivered_report_comment_preserves_pitfalls_line(
+        tmp_path, monkeypatch):
+    """计划 L345：交付成功后从 mailbox 取最新 worker note 回评 Gitea，
+    原样保留报告末行「坑位：」提示（下轮 Router 上下文依赖）；先持久化
+    报告再回评；agora_status 落账以 board 为准。"""
+    client = FakeAgoraClient()
+    report = "根因：竞态窗口未关\n改动：agora_monitor.py\n坑位：tests/test_old.py 是替身勿信"
+    client.mail = [mail_msg(1, kind="note", body="中期进度"),
+                   mail_msg(2, kind="note", body=report)]
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    # 回评发生时报告必须已先持久化（先持久化再回评）
+    face.note_hook = lambda iid: None  # placeholder，下方重设断言
+
+    report_file_seen = []
+
+    def hook(iid):
+        report_file_seen.append(
+            report in json.loads(
+                Path(reports_path_of(state_path)).read_text(encoding="utf-8")
+            )["reports"][TID]["note"])
+
+    face.note_hook = hook
+    monitor.poll_once()
+
+    assert client.deliver_calls[0]["outcome"] == "delivered"
+    assert report_file_seen == [True], "回评前报告必须已持久化"
+    assert any(report in text for _, text in face.posts), face.posts
+    assert entry(state_path)["agora_status"] == "closed/delivered"
+    assert entry(state_path)["delivery_commit"] == hex40("a")
+    assert monitor.tasks() == []
+
+    # 终态评论只发一次：重启后再轮询不得重复回评
+    monitor.register(7, TID)
+    monitor.poll_once()
+    assert len(face.posts) == 1
+
+
+def test_missing_report_posts_factual_comment_only(tmp_path, monkeypatch):
+    """计划 L345：worker 未留结构化报告 → 只发事实型降级评论（任务 tid/
+    commit 已交付、未提供结构化汇报）＋journal warning；不虚构验证结论、
+    不阻塞已确认交付。"""
+    client = FakeAgoraClient()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    assert client.deliver_calls[0]["outcome"] == "delivered"
+    assert len(face.posts) == 1
+    text = face.posts[0][1]
+    assert TID in text and hex40("a")[:12] in text
+    assert "未提供结构化汇报" in text
+    assert "坑位" not in text, "缺报告不得虚构内容"
+    assert any("report" in m and ("missing" in m or "缺失" in m)
+               for m in journal), journal
+    assert entry(state_path)["delivery_commit"] == hex40("a"), "交付不被阻塞"
+    assert monitor.tasks() == []
+
+
+def test_worker_question_answered_via_callback_and_posted_as_answer(
+        tmp_path, monkeypatch):
+    """计划 L345：worker question 交答复回调（orchestrator 在 ledger_lock
+    内交 Router）后 post(kind=answer) 回 worker。"""
+    client = FakeAgoraClient()
+    client.mail = [mail_msg(3, kind="question", body="测试 X 可以删吗？")]
+    monitor, state_path, _, face = conversation_monitor(
+        tmp_path, monkeypatch, client,
+        face=ConversationFace(answer_text="可以删，它是替身"))
+
+    monitor.poll_once()
+
+    assert face.answers == [(7, TID, "测试 X 可以删吗？")]
+    assert client.posts == [{"task": TID, "kind": "answer",
+                             "body": "可以删，它是替身"}]
+
+
+def test_worker_answer_relayed_to_issue_thread(tmp_path, monkeypatch):
+    """直通闭环：worker 对转发问题的答复（kind=answer）回评到 Gitea issue。"""
+    client = FakeAgoraClient()
+    client.mail = [mail_msg(4, kind="answer", body="已改用方案 B，验证全绿")]
+    monitor, state_path, _, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    assert any("已改用方案 B" in text for _, text in face.posts), face.posts
+
+
+def test_check_mail_crash_after_read_replays_without_loss(
+        tmp_path, monkeypatch):
+    """计划 L345：check_mail 读取后、处理前崩溃 → 重启先重放未处理批次
+    （读后崩溃不丢消息），处理完成才标记（pending 清空）。"""
+    client = FakeAgoraClient()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    crashed = [mail_msg(1, kind="note", body="崩溃前的进度 note"),
+               mail_msg(2, kind="question", body="崩溃前的问题？")]
+    # 模拟崩溃现场：整批已原子落盘、未处理
+    state.write_json_atomic(mail_path_of(state_path), {"pending": crashed})
+
+    monitor.poll_once()  # 新收件为空：先重放未处理批次
+
+    assert any("崩溃前的问题？" in body for _, _, body in face.answers)
+    reports = json.loads(
+        Path(reports_path_of(state_path)).read_text(encoding="utf-8"))
+    assert reports["reports"][TID]["note"] == "崩溃前的进度 note"
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] == []
+
+
+def test_mail_processing_failure_does_not_swallow_other_messages(
+        tmp_path, monkeypatch):
+    """计划 L345：单条消息处理失败只 journal 不吞批次——同批其他任务的
+    消息照常处理，pending 照常推进。"""
+    client = FakeAgoraClient()
+    face = ConversationFace(answer_error=RuntimeError("router down (fake)"))
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client, face=face)
+    client.mail = [mail_msg(1, kind="question", body="会失败的问题"),
+                   mail_msg(2, kind="note", body="不受影响的汇报 note")]
+
+    monitor.poll_once()
+
+    assert any("router down" in m for m in journal), journal
+    reports = json.loads(
+        Path(reports_path_of(state_path)).read_text(encoding="utf-8"))
+    assert reports["reports"][TID]["note"] == "不受影响的汇报 note"
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] == []
+
+
+def test_restart_resumes_awaiting_external_without_duplicate_task(
+        tmp_path, monkeypatch):
+    """计划锚例：daemon 启动从账本恢复未终态 agora_task_id（幂等
+    register），不建新任务；恢复后交付状态机照常收口。"""
+    client = FakeAgoraClient()
+    fake_git = FakeGitDelivery(monkeypatch)
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"issues": {"7": {
+        "status": "active", "agora_task_id": TID,
+        "agora_status": "awaiting_external"}}}))
+    monitor = AgoraMonitor(client=client, journal=[].append, max_active=1)
+    monitor.attach_delivery(repo_path=str(tmp_path / "repo"),
+                            remote_url=PAT_URL, ssl_verify=True,
+                            state_path=state_path,
+                            ledger_lock=threading.RLock())
+
+    monitor.start()  # daemon 启动（orchestrator.start → monitor.start）
+    try:
+        assert monitor.tasks() == [(7, TID)]
+        assert client.create_calls == [], "恢复只登记，绝不建新任务"
+        assert client.check_mail_calls == 0, "恢复本身零网络副作用"
+    finally:
+        monitor.stop()
+
+    monitor.poll_once()
+    assert entry(state_path)["delivery_commit"] == hex40("a")
+    assert monitor.tasks() == []
+
+
+def test_restart_skips_terminal_and_unknown_status_ledger_tasks(
+        tmp_path, monkeypatch):
+    """终态（merged/closed/cancelled）账本任务不恢复；从未同步过
+    agora_status 的在账 tid 按未终态恢复（安全方向）。"""
+    client = FakeAgoraClient()
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"issues": {
+        "7": {"status": "active", "agora_task_id": "ag-closed",
+              "agora_status": "closed/delivered"},
+        "8": {"status": "active", "agora_task_id": "ag-unsynced",
+              "agora_status": None}}}))
+    monitor = AgoraMonitor(client=client, journal=[].append, max_active=4)
+    monitor.attach_delivery(repo_path=str(tmp_path / "repo"),
+                            remote_url=PAT_URL, ssl_verify=True,
+                            state_path=state_path,
+                            ledger_lock=threading.RLock())
+    monitor.start()
+    try:
+        assert monitor.tasks() == [(8, "ag-unsynced")]
+    finally:
+        monitor.stop()
+
+
+def test_cancelled_posts_factual_comment_without_quality_blame(
+        tmp_path, monkeypatch):
+    """计划 L345：board cancelled 与 Gitea 状态一致——只报取消事实，不归因
+    质量失败；agora_status 落账；不调 task_cancel（只陈述，不动作）。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "cancelled"
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    assert monitor.tasks() == []
+    assert len(face.posts) == 1
+    assert "取消" in face.posts[0][1]
+    assert "失败" not in face.posts[0][1], "cancelled 不归因质量失败"
+    assert entry(state_path)["agora_status"] == "cancelled"
+    assert client.cancel_calls == []
+    assert client.deliver_calls == []
+
+
+def test_blocked_delivery_failure_comment_carries_push_failed_detail(
+        tmp_path, monkeypatch):
+    """计划 L345：blocked＋delivery.status=failed 回评具体 push_failed 错误
+    （设计 §7.4），人工跟进；名额释放。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "blocked"
+    client.tasks[TID]["delivery"].update(status="failed",
+                                         error="push_failed: connection reset")
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    assert monitor.tasks() == []
+    assert len(face.posts) == 1
+    assert "push_failed" in face.posts[0][1]
+    assert "connection reset" in face.posts[0][1]
+    assert entry(state_path)["agora_status"].startswith("blocked")
+
+
+def test_heartbeat_reports_agora_board_state(tmp_path, monkeypatch):
+    """计划 L345：心跳评论显示 board state/delivery.status（legacy 心跳
+    不变——由 test_orch 既有用例锁定）；间隔未到零评论。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "running"
+    client.tasks[TID]["delivery"] = None
+    monitor, state_path, _, face = conversation_monitor(
+        tmp_path, monkeypatch, client, heartbeat_interval=30)
+
+    monitor.poll_once()  # board 读到 running：状态同步，间隔未到零评论
+    assert face.posts == []
+    assert entry(state_path)["agora_status"] == "running"
+
+    with monitor._guard:  # 回拨时钟模拟间隔已到
+        monitor._hb[7]["last"] -= 60
+    monitor.poll_once()
+    assert len(face.posts) == 1
+    assert TID in face.posts[0][1] and "running" in face.posts[0][1]
+
+    monitor.poll_once()  # 间隔未到：不重复刷屏
+    assert len(face.posts) == 1
+
