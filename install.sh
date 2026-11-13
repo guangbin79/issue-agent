@@ -304,12 +304,21 @@ names = {"execution_mode": "MODE_JSON", "router_model": "ROUTER_MODEL_JSON",
          "agora_poll_interval": "AGORA_POLL_JSON"}
 for key, var in names.items():
     v = agora.get(key)
-    if isinstance(v, bool) or isinstance(v, (list, tuple, dict)):
-        v = None  # 非标量按缺省（config.py 侧自有强校验兜底）
-    q = shlex.quote(str(v)) if v else "''"
+    if isinstance(v, (bool, list, tuple, dict)):
+        # 非标量是误型，不得静默按缺省（execution_mode 误型会静默落 legacy，
+        # 且该值永远到不了 config.py 的强校验）——发哨值交 shell 面离线拒。
+        q = shlex.quote(f"__AGORA_BAD_TYPE__({type(v).__name__})")
+    else:
+        q = shlex.quote(str(v)) if v not in (None, "") else "''"
     print(f"{var}={q}")
 EOF
 )"
+
+# agora 节误型哨值（heredoc 内 SystemExit 会被外层 eval 吞掉，故经变量传递）
+case "${MODE_JSON:-}${ROUTER_MODEL_JSON:-}${AGORA_HOME_JSON:-}${AGORA_POLL_JSON:-}" in
+  *__AGORA_BAD_TYPE__*)
+    die ".issue-agent.json 的 agora 节字段须为标量（对象/数组/布尔是误型）：${MODE_JSON:-}${ROUTER_MODEL_JSON:-}${AGORA_HOME_JSON:-}${AGORA_POLL_JSON:-}" ;;
+esac
 
 # guard a1: canonical pin — env (new name > legacy test-only name) > json.
 # Without a pin this installer refuses to run, fully offline: an unpinned
@@ -422,7 +431,7 @@ fi
 # 复用既有 config 的 pat/api_base（仅 env 未提供时；guard b 已确认同钉定）：
 # 重装/迁移免重输密钥，stderr 记录复用事实。
 OLD_API_BASE=""; OLD_PAT=""; OLD_CB=""; OLD_PORT=""
-OLD_MODE=""; OLD_ROUTER=""; OLD_AHOME=""; OLD_APOLL=""
+OLD_MODE=""; OLD_ROUTER=""; OLD_AHOME=""; OLD_APOLL=""; OLD_VERIFY=""
 if [ -f "$CONFIG_FILE" ]; then
   eval "$(config_file="$CONFIG_FILE" python3 - 2>/dev/null <<'EOF' || true
 import json, os, shlex
@@ -435,7 +444,8 @@ for key, field in (("UIA_API_BASE", "api_base"), ("UIA_PAT", "pat"),
                    ("UIA_MODE", "execution_mode"),
                    ("UIA_ROUTER", "router_model"),
                    ("UIA_AHOME", "agora_home"),
-                   ("UIA_APOLL", "agora_poll_interval")):
+                   ("UIA_APOLL", "agora_poll_interval"),
+                   ("UIA_VERIFY", "verify_command")):
     print(f"{key}={shlex.quote(str(c.get(field, '') or ''))}")
 EOF
 )"
@@ -447,11 +457,14 @@ EOF
   OLD_ROUTER="${UIA_ROUTER:-}"
   OLD_AHOME="${UIA_AHOME:-}"
   OLD_APOLL="${UIA_APOLL:-}"
+  OLD_VERIFY="${UIA_VERIFY:-}"
 fi
 
 # agora 有效值＝env > json > 既有 config；强校验镜像 config.py（离线先死，
-# 先于任何网络探测/PAT 步骤）：execution_mode 只认 legacy/agora、agora 模式
-# 必须 router_model＋agora_home 齐、poll interval ≥1。legacy 对四字段全容忍。
+# 先于任何网络探测/PAT 步骤——否则安装成功而 daemon 启动即 ConfigError
+# 崩溃循环）：execution_mode 只认 legacy/agora、agora 模式必须 router_model＋
+# agora_home＋verify_command 齐且 agora_home 为绝对路径、poll interval 为
+# ≥1 的整数（含既有 config 里的手编值——config.py 无条件校验该字段）。
 EFFECTIVE_MODE="${EXECUTION_MODE:-${OLD_MODE:-legacy}}"
 case "$EFFECTIVE_MODE" in
   legacy|agora) ;;
@@ -460,12 +473,18 @@ esac
 if [ "$EFFECTIVE_MODE" = "agora" ]; then
   [ -n "${ROUTER_MODEL:-$OLD_ROUTER}" ] || die "execution_mode=agora 缺 router_model（ISSUE_AGENT_ROUTER_MODEL 或 .issue-agent.json 的 agora 节）"
   [ -n "${AGORA_HOME_CFG:-$OLD_AHOME}" ] || die "execution_mode=agora 缺 agora_home（ISSUE_AGENT_AGORA_HOME 或 .issue-agent.json 的 agora 节）"
-fi
-if [ -n "$AGORA_POLL" ]; then
-  case "$AGORA_POLL" in
-    ''|*[!0-9]*) die "agora_poll_interval 须为 ≥1 的整数秒（ISSUE_AGENT_AGORA_POLL_INTERVAL / .issue-agent.json agora 节），当前：${AGORA_POLL}" ;;
+  case "${AGORA_HOME_CFG:-$OLD_AHOME}" in
+    /*) ;;
+    *) die "agora_home 须为绝对路径（相对路径随 daemon cwd 解析、~ 不展开），当前：${AGORA_HOME_CFG:-$OLD_AHOME}" ;;
   esac
-  [ "$AGORA_POLL" -ge 1 ] || die "agora_poll_interval 须为 ≥1 的整数秒，当前：${AGORA_POLL}"
+  [ -n "${VERIFY_COMMAND:-$OLD_VERIFY}" ] || die "execution_mode=agora 缺 verify_command（config.py 强校验非空：.issue-agent.json 的 verify_command 或既有 config）"
+fi
+AGORA_POLL_EFF="${AGORA_POLL:-${OLD_APOLL:-}}"
+if [ -n "$AGORA_POLL_EFF" ]; then
+  case "$AGORA_POLL_EFF" in
+    ''|*[!0-9]*|??????*) die "agora_poll_interval 须为 ≥1 的整数秒，长度 ≤5 位（封死 bash 算术回绕），当前：${AGORA_POLL_EFF}" ;;
+  esac
+  [ "$AGORA_POLL_EFF" -ge 1 ] || die "agora_poll_interval 须为 ≥1 的整数秒，当前：${AGORA_POLL_EFF}"
 fi
 
 # validate_port：垃圾值即 die；stdout 输出规范化端口（去前导零，保证注册
