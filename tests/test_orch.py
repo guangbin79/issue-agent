@@ -42,7 +42,8 @@ import orchestrator  # noqa: E402
 import router as router_mod  # noqa: E402
 import runner  # noqa: E402
 import state  # noqa: E402
-from agora_client import AgoraRejected, AgoraUnavailable  # noqa: E402
+from agora_client import (AgoraProtocolError, AgoraRejected,  # noqa: E402
+                          AgoraUnavailable)
 
 
 # --------------------------------------------------------------------------
@@ -2756,3 +2757,61 @@ def test_agora_ledger_fields_synced_across_construction_paths(tmp_path):
     normed = state_mod.load_state(path)["issues"]["5"]
     assert normed["agora_pending"] is False
     assert normed["agora_task_id"] is None
+
+
+# --- agora review-round fixes (评审环 20261113-1435 F1/F2) ---------------------
+
+
+def test_default_ledger_lock_is_reentrant_across_agora_defer(tmp_path,
+                                                             monkeypatch):
+    """评审环 F1：未注入 ledger_lock 的构造（缺省回退锁）下，_agora_route
+    持锁内调 _defer 同线程再取锁——普通 Lock 确定性自锁（回合挂死、issue
+    永远 pending）；缺省必须是 RLock。"""
+    router_ = FakeRouter()
+    router_.error = router_mod.RouterDecisionError("bad json (fake)")
+    h = agora_harness(tmp_path, monkeypatch, router_=router_,
+                      ledger_lock=None)  # 缺省回退路径
+    try:
+        assert isinstance(h.orch._ledger_lock, type(threading.RLock()))
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: h.entry(7)["status"] == "defer"), \
+            h.journal_msgs  # 修复前：worker 线程自锁，状态永远停在 pending
+    finally:
+        h.orch.stop()
+
+
+def test_doctor_rejected_blocks_with_help_note(tmp_path, monkeypatch):
+    """评审环 F2：doctor 的确定性 4xx（如牌轮换）→ blocked＋求助评论，
+    不静默无限重试。"""
+    client = FakeAgoraClient()
+    client.doctor_result = AgoraRejected("credential rotated (fake)")
+    h = agora_harness(tmp_path, monkeypatch, client=client)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(
+            lambda: h.entry(7)["status"] == "blocked"
+            and any("doctor 被拒" in b for _, b in h.api.posts)), \
+            h.journal_msgs  # _blocked 先写账本后发评论：两态齐备才算落定
+        assert h.entry(7)["claimed_at"] is None
+        assert client.create_calls == []
+    finally:
+        h.orch.stop()
+
+
+def test_create_protocol_error_recovers_same_task(tmp_path, monkeypatch):
+    """评审环 F2：create 返回 200 非 JSON（协议错乱，服务端可能已提交）→
+    与超时同处置：同 client_key 重试取回原任务，不重复建单。"""
+    client = FakeAgoraClient()
+    client.create_failures.append(AgoraProtocolError("not json (fake)"))
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        assert client.created_ids == ["ag-123"]
+        assert len(client.create_calls) == 2
+        first, second = client.create_calls
+        assert second["client_key"] == first["client_key"]
+        assert monitor.registered == [(7, "ag-123")]
+    finally:
+        h.orch.stop()

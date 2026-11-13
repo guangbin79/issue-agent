@@ -54,7 +54,7 @@ from api import NOTE_MARKER as _DEFAULT_NOTE_MARKER
 import fsm
 import gitop
 import router
-from agora_client import AgoraRejected, AgoraUnavailable
+from agora_client import AgoraProtocolError, AgoraRejected, AgoraUnavailable
 import runner
 import state
 
@@ -273,8 +273,10 @@ class Orchestrator:
         # under it, so worker and a concurrent reconcile never interleave
         # writes. daemon（agora 模式）注入与 SemanticRouter persist 共用的
         # 同一把可重入锁——Router 落 sid 与本类写账本互斥（计划 Task 2）。
+        # 缺省回退也必须可重入：_agora_route 持锁内调 _defer/_blocked 会
+        # 同线程再取锁，普通 Lock 确定性自锁（评审环 F1）。
         self._ledger_lock = (ledger_lock if ledger_lock is not None
-                             else threading.Lock())
+                             else threading.RLock())
         # bounded turn slots + per-issue locks replace the historical process-
         # wide turn lock: at most max_parallel turns in flight, and a given
         # issue's turns never overlap (same-issue events queue behind the lock).
@@ -811,7 +813,7 @@ class Orchestrator:
                 state.save_state(self.state_path, ledger)
             try:
                 self.agora_client.dispatch(tid)
-            except (AgoraUnavailable, AgoraRejected) as exc:
+            except (AgoraUnavailable, AgoraRejected, AgoraProtocolError) as exc:
                 # 恢复路径与建单超时同构：同 client_key 取回原任务再派。
                 self._journal(
                     f"turn: issue#{iid} dispatch failed, kept pending: {exc}")
@@ -863,11 +865,19 @@ class Orchestrator:
                     issue_context={"title": issue_ctx_title, "body": message},
                     available_models=router.available_models_from_doctor(
                         self.agora_client.doctor()))
-            except AgoraUnavailable as exc:
+            except (AgoraUnavailable, AgoraProtocolError) as exc:
+                # 协议错乱（200 非 JSON）与不可达同处置：保留待派发重试，
+                # 不降级 legacy（评审环 F2——顶层兜底会让 issue 静默挂 claim
+                # 5500s）。
                 self._journal(
                     f"turn: issue#{iid} agora unavailable, kept pending: {exc}")
                 entry["agora_pending"] = True
                 state.save_state(self.state_path, ledger)
+                return None
+            except AgoraRejected as exc:
+                # doctor 的确定性 4xx（如牌轮换）：人工介入，不无限重试。
+                self._blocked(iid, None,
+                              f"agora doctor 被拒，需要人工处理 issue#{iid}：{exc}")
                 return None
             except (router.RouterDecisionError, runner.SessionInvalid,
                     runner.TurnTimeout, runner.TurnCrash) as exc:
@@ -885,8 +895,9 @@ class Orchestrator:
 
     def _agora_create(self, iid, payload):
         """client_key 幂等建单＋超时恢复：create 成功但客户端超时
-        （AgoraUnavailable）→ 同 client_key＋同 payload 原地重试一次，服务
-        端已提交的任务按键取回，不重复建单；两次不可达→保留待派发。"""
+        （AgoraUnavailable，含 200 非 JSON 的协议错乱——同按不可达处置，
+        服务端可能已提交）→ 同 client_key＋同 payload 原地重试一次，服务
+        端已提交的任务按键取回，不重复建单；两次失败→保留待派发。"""
         for attempt in (1, 2):
             try:
                 return self.agora_client.create_task(**payload)
@@ -895,7 +906,7 @@ class Orchestrator:
                 self._blocked(iid, None,
                               f"agora 建单被拒，需要人工处理 issue#{iid}：{exc}")
                 return None
-            except AgoraUnavailable as exc:
+            except (AgoraUnavailable, AgoraProtocolError) as exc:
                 if attempt == 2:
                     self._journal(
                         f"turn: issue#{iid} create unreachable twice, "
