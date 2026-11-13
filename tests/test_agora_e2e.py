@@ -319,6 +319,9 @@ class E2EEnv:
 
     def __init__(self, root: Path):
         self.root = root
+        # 回合等待预算给足（T5 坑位 ⑤ 满载抖动教训：建单链含真实 git env
+        # 创建＋HTTP 往返，机器满载时 30s 偶发不够）
+        self.turn_wait_s = 60
         (root / "layout").mkdir(parents=True, exist_ok=True)
         # bare origin＋种子基线（main）
         self.origin = root / "layout" / "origin.git"
@@ -355,7 +358,7 @@ class E2EEnv:
 
     def build_orchestrator(self):
         client = AgoraClient(service_name=SERVICE, home=str(self.agorad.home),
-                             poll_interval=1, timeout_s=15)
+                             poll_interval=1, timeout_s=30)
         monitor = AgoraMonitor(client=client, journal=self.journal.append,
                                max_active=2)
         note_marker = f"<!-- {SERVICE} -->"
@@ -471,7 +474,7 @@ def test_full_chain_delivers_and_comments(env):
     env.start_orchestrator()
     env.open_issue(7)
     wait_until(lambda: env.turn_done(7), what="agora 回合建单派发收尾",
-               timeout=30)
+               timeout=env.turn_wait_s)
     assert any("已接手 issue#7" in body for _, body in env.gitea.posts), \
         "接手评论必须落到 Gitea"
     assert env.agorad.task_count() == 1
@@ -508,7 +511,11 @@ def test_full_chain_delivers_and_comments(env):
     # 家族只含主检出与 env 自身，env 目录内部不得再有 worker 建的 worktree）
     assert env.worker_env_worktrees[tid] == [str(env.repo), str(env_dir)], \
         f"worker 不得建嵌套 worktree：{env.worker_env_worktrees[tid]}"
-    # Gitea 回评：报告原样上墙，坑位行逐字保留
+    # Gitea 回评：报告原样上墙，坑位行逐字保留（回评在 delivery_commit
+    # 落账之后异步发生——等待而非即时断言）
+    wait_until(lambda: any(WORKER_REPORT in body
+                           for _, body in env.gitea.posts),
+               what="最终报告回评 Gitea")
     report_notes = [body for _, body in env.gitea.posts
                     if "根因" in body and WORKER_REPORT in body]
     assert report_notes, f"最终报告必须回评 Gitea：{env.gitea.posts}"
@@ -522,7 +529,7 @@ def test_full_chain_delivers_and_comments(env):
 def test_non_ff_rotates_base_and_redelivers(env):
     env.start_orchestrator()
     env.open_issue(7)
-    wait_until(lambda: env.turn_done(7), what="建单派发", timeout=30)
+    wait_until(lambda: env.turn_done(7), what="建单派发", timeout=env.turn_wait_s)
     tid = env.entry(7)["agora_task_id"]
 
     # 远端前推（确定性：在首个 handoff 产生前就把 issue/7-fix 推到 origin，
@@ -560,7 +567,10 @@ def test_non_ff_rotates_base_and_redelivers(env):
     assert remote_refs(env.origin, env.repo)[
         f"refs/heads/issue/7-fix"] == new_commit
     assert branch_sha(env.origin, DEFAULT_BRANCH) == env.base_sha
-    assert any("根因" in body for _, body in env.gitea.posts), "报告照常回评"
+    wait_until(lambda: any("根因" in body for _, body in env.gitea.posts),
+               what="non_ff 交付后报告回评")  # 回评在落账后异步发生
+    assert any("坑位：" in body for _, body in env.gitea.posts), \
+        "报告照常回评（含坑位行）"
 
 
 # --- 场景 3：daemon 重启恢复（awaiting_external 中重启）--------------------------
@@ -569,7 +579,7 @@ def test_non_ff_rotates_base_and_redelivers(env):
 def test_restart_recovers_awaiting_external_without_duplicate(env):
     env.start_orchestrator()
     env.open_issue(7)
-    wait_until(lambda: env.turn_done(7), what="建单派发", timeout=30)
+    wait_until(lambda: env.turn_done(7), what="建单派发", timeout=env.turn_wait_s)
     tid = env.entry(7)["agora_task_id"]
     handoff, _ = env.worker_complete(tid, {"fix.txt": "fix\n"},
                                      "fix issue#7", WORKER_REPORT)
@@ -591,7 +601,8 @@ def test_restart_recovers_awaiting_external_without_duplicate(env):
     assert branch_sha(env.origin, DEFAULT_BRANCH) == env.base_sha
     assert remote_refs(env.origin, env.repo)[
         f"refs/heads/issue/7-fix"] == handoff
-    assert any("根因" in body for _, body in env.gitea.posts)
+    wait_until(lambda: any("根因" in body for _, body in env.gitea.posts),
+               what="恢复交付后报告回评")  # 回评在落账后异步发生
     assert env.worker_anchor_writes == [], "重启不重跑 worker 侧任何动作"
 
 
@@ -613,7 +624,7 @@ def test_crash_after_create_recovers_same_task(env):
     env.open_issue(7)
     wait_until(lambda: env.entry(7).get("agora_task_id")
                and env.entry(7)["agora_pending"] is True,
-               what="create 落账、dispatch 中断、保留待派发", timeout=30)
+               what="create 落账、dispatch 中断、保留待派发", timeout=env.turn_wait_s)
     assert env.agorad.task_count() == 1
     tid = env.entry(7)["agora_task_id"]
     assert env.agorad.row(tid)["state"] == "todo", "dispatch 未达"
