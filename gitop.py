@@ -233,8 +233,8 @@ def prune_worktrees(main_repo: PathLike) -> None:
     _git(main_repo, ["worktree", "prune"])
 
 
-def ensure_fix_branch(main_repo: PathLike, iid, default_branch: str = "master",
-                      remote_url: str = "", ssl_verify: bool = True) -> str:
+def ensure_fix_branch(main_repo: PathLike, iid, default_branch: str,
+                      remote_url: str, ssl_verify: bool = True) -> str:
     """Prepare the issue/<iid>-fix TARGET REF only — never touch the main
     checkout (agora workers branch from this position in their own envs;
     设计 §5.2).
