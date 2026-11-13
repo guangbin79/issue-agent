@@ -911,8 +911,16 @@ class Orchestrator:
         try:
             self.agora_client.post(tid, "question", body)
         except AgoraRejected as exc:
+            # 终闸 B-1：4xx ≠ 终态专有（限流/校验同样 4xx）——回落 Router
+            # 前必须 board 确认任务确已终态；仍存活则保留待派发重试
+            # （为在飞任务建新回合会孤儿化旧任务＋断其 mailbox）。
+            if not self._agora_task_terminal(tid):
+                self._journal(f"turn: issue#{iid} relay to {tid} rejected "
+                              f"but task alive ({exc}); kept pending")
+                self._agora_keep_pending(iid, "comment relay rejected")
+                return True
             self._journal(f"turn: issue#{iid} relay to {tid} rejected "
-                          f"({exc}); falling back to router")
+                          f"({exc}); task terminal, falling back to router")
             return False
         except (AgoraUnavailable, AgoraProtocolError) as exc:
             self._journal(f"turn: issue#{iid} relay to {tid} unreachable, "
@@ -923,6 +931,18 @@ class Orchestrator:
                       f"({tid}, note {note_id or 0})")
         self._finalize(iid, None, None)
         return True
+
+    def _agora_task_terminal(self, tid) -> bool:
+        """board 重读判定任务终态（merged/closed/cancelled——与
+        agora_monitor._TERMINAL_STATES 同源的 board 契约）。读失败按存活
+        处置（保守方向：不建新任务）。"""
+        try:
+            board = self.agora_client.board(tid)
+        except Exception:
+            return False
+        task = board.get("task") if isinstance(board, dict) else None
+        return isinstance(task, dict) \
+            and task.get("state") in ("merged", "closed", "cancelled")
 
     def _answer_worker_question(self, iid, tid, body):
         """worker 提问答复回调（Task 5，monitor 汇报管线调用）：T3 锁序

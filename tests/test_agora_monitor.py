@@ -204,6 +204,8 @@ class FakeAgoraClient:
         self.ack_mode = ""
         self.mail = []        # 待投递消息（wire 形状：id/ts/task/kind/from/to/body）
         self.posts = []       # post() 记账
+        self.post_failures = []  # post 瞬断注入（未送达不记账）
+        self.board_task = {"state": "running"}  # relay 回落前的 board 重读面
         self.create_calls = []   # create_task 记账（恢复面断言零建单）
         self.cancel_calls = []   # task_cancel 记账
         self.check_mail_calls = 0
@@ -216,7 +218,13 @@ class FakeAgoraClient:
     def poll_interval(self):
         return 15.0
 
+    def board(self, tid):
+        return {"task": json.loads(json.dumps(self.board_task)),
+                "events": []}
+
     def post(self, tid, kind, body):
+        if self.post_failures:
+            raise self.post_failures.pop(0)
         self.posts.append({"task": tid, "kind": kind, "body": body})
 
     def create_task(self, **kwargs):
@@ -311,11 +319,14 @@ class FakeGitDelivery:
 
 def delivery_monitor(tmp_path, monkeypatch, client, fake_git=None,
                      max_active=2):
-    """接线完毕的 monitor＋issue 账本：iid=7 已登记 tid。"""
+    """接线完毕的 monitor＋issue 账本：iid=7 已登记 tid（账本同步在案
+    agora_task_id——生产面派发时必先落账，释放后 mail 反查依赖它）。"""
     if fake_git is None:
         fake_git = FakeGitDelivery(monkeypatch)
     state_path = tmp_path / "state.json"
-    state_path.write_text(json.dumps({"issues": {"7": {"status": "active"}}}))
+    tid = next(iter(client.tasks))
+    state_path.write_text(json.dumps({"issues": {"7": {
+        "status": "active", "agora_task_id": tid}}}))
     journal = []
     monitor = AgoraMonitor(client=client, journal=journal.append,
                            max_active=max_active)
@@ -323,7 +334,6 @@ def delivery_monitor(tmp_path, monkeypatch, client, fake_git=None,
                             remote_url=PAT_URL, ssl_verify=True,
                             state_path=state_path,
                             ledger_lock=threading.RLock())
-    tid = next(iter(client.tasks))
     monitor.register(7, tid)
     return monitor, state_path, journal
 
@@ -975,4 +985,87 @@ def test_poison_non_object_mail_message_does_not_break_batch(
     )["pending"] == []
     assert any("non-object" in m or "not-an-object" in m for m in journal), \
         journal
+
+
+# --- 终闸三分册修复（B-1/B-2/B-3/B-4） -------------------------------------------
+
+
+def test_answer_post_transient_defers_for_replay(tmp_path, monkeypatch):
+    """终闸 B-2：answer post 瞬断——消息留 pending 下一轮重放重试，绝不
+    吞问题（worker 无限等待）也不重复投递已成功答复。"""
+    client = FakeAgoraClient()
+    client.mail = [mail_msg(5, kind="question", body="瞬断窗口的提问")]
+    client.post_failures.append(AgoraUnavailable("post down (fake)"))
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    assert client.posts == [], "未送达不得记账"
+    pending = json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8"))["pending"]
+    assert len(pending) == 1, "瞬断的消息必须留待重放"
+
+    client.post_failures.clear()
+    monitor.poll_once()
+    answers = [p for p in client.posts if p["kind"] == "answer"]
+    assert len(answers) == 1, "重放恰好补投一次"
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] == []
+
+
+def test_reports_store_write_failure_defers_note(tmp_path, monkeypatch):
+    """终闸 B-3/A-1：reports 落盘瞬态 OSError≠毒消息——消息留 pending
+    重放，恢复后报告照常入库（不降级成事实型评论）。"""
+    client = FakeAgoraClient()
+    client.mail = [mail_msg(6, kind="note", body="瞬断窗口的汇报正文")]
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    real_write = state.write_json_atomic
+    failures = [OSError("ENOSPC (fake)")]
+
+    def flaky_write(path, payload):
+        if str(path).endswith(".agora-reports.json") and failures:
+            raise failures.pop(0)
+        return real_write(path, payload)
+
+    monkeypatch.setattr(state, "write_json_atomic", flaky_write)
+
+    monitor.poll_once()
+    pending = json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8"))["pending"]
+    assert len(pending) == 1, "写失败的消息必须留待重放"
+
+    monitor.poll_once()  # 写恢复正常
+    reports = json.loads(
+        Path(reports_path_of(state_path)).read_text(encoding="utf-8"))
+    assert reports["reports"][TID]["note"] == "瞬断窗口的汇报正文"
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] == []
+
+
+def test_multiple_questions_capped_one_per_drain(tmp_path, monkeypatch):
+    """终闸 B-4：每轮 drain 至多答复一个 question——封顶 monitor 线程
+    持 ledger_lock 跨 LLM 的停摆窗；其余顺延下一轮（15s 级延迟）。"""
+    client = FakeAgoraClient()
+    client.mail = [mail_msg(7, kind="question", body="第一问"),
+                   mail_msg(8, kind="question", body="第二问")]
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+    answers = [p for p in client.posts if p["kind"] == "answer"]
+    assert len(answers) == 1, "每轮至多一个 LLM 答复"
+    pending = json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8"))["pending"]
+    assert len(pending) == 1, "第二问顺延"
+
+    monitor.poll_once()
+    answers = [p for p in client.posts if p["kind"] == "answer"]
+    assert len(answers) == 2, "下一轮补答"
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] == []
 

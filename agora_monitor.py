@@ -48,6 +48,12 @@ _HEX40_OK = re.compile(r"[0-9a-f]{40}")
 _TERMINAL_STATES = ("merged", "closed", "cancelled")
 
 
+class _MailDeferred(RuntimeError):
+    """瞬态投递失败（answer post 瞬断／sidecar 写 OSError）：本轮停止
+    批次推进，消息留 pending 下一轮 poll 重放重试——确定性失败才按毒
+    消息消费＋journal（终闸 B-2/B-3：瞬态≠毒，不吞 worker 汇报）。"""
+
+
 class AgoraMonitor:
     """本实例活动 agora 任务的登记簿＋轮询线程＋外部交付状态机。"""
 
@@ -75,6 +81,7 @@ class AgoraMonitor:
         self._answer_question = None
         self._hb_interval = 0
         self._hb = {}  # iid -> {"start","last","status"}（_guard 保护）
+        self._questions_this_drain = 0  # 每轮 drain 的 LLM 答复预算（B-4）
 
     # ---- 登记簿 ----
 
@@ -492,6 +499,7 @@ class AgoraMonitor:
         重启先重放未处理批次（读后崩溃不丢消息、不吞其他任务消息）。"""
         if self._state_path is None:
             return
+        self._questions_this_drain = 0  # 每轮至多一个 LLM 答复（终闸 B-4）
         replay = self._mail_pending()
         if replay:
             self._journal(f"agora-monitor: replaying {len(replay)} "
@@ -524,10 +532,17 @@ class AgoraMonitor:
         return [m for m in pending if isinstance(m, dict)]
 
     def _process_batch(self, messages):
-        """逐条处理并逐条推进 pending 标记：单条异常只 journal 不吞批次
-        （毒消息不得无限重放，也不得拖垮同批其他任务的消息）。"""
+        """逐条处理并逐条推进 pending 标记：瞬态失败（_MailDeferred）停
+        止推进留待重放；确定性异常只 journal 不吞批次（毒消息不得无限
+        重放，也不得拖垮同批其他任务的消息）。每轮 drain 至多答复一个
+        question（终闸 B-4：封顶 monitor 线程持 ledger_lock 跨 LLM 的
+        停摆窗，其余顺延下一轮）。"""
         remaining = list(messages)
         for message in messages:
+            if isinstance(message, dict) \
+                    and message.get("kind") == "question" \
+                    and self._questions_this_drain >= 1:
+                return  # 本轮答复预算已用：其余 question 留 pending 重放
             if not isinstance(message, dict):
                 # ocr R1 #5：非对象毒元素在此丢弃——except 处理器自身的
                 # message.get 再抛会中断整批一轮
@@ -536,10 +551,17 @@ class AgoraMonitor:
             else:
                 try:
                     self._process_message(message)
+                except _MailDeferred as exc:
+                    self._journal(f"agora-monitor: mail deferred, batch "
+                                  f"replays next poll: {exc}")
+                    return  # 不推进 remaining：本条＋后续都留 pending
                 except Exception as exc:
                     self._journal(f"agora-monitor: mail message "
                                   f"{message.get('id')!r} processing failed: "
                                   f"{exc!r}")
+                else:
+                    if message.get("kind") == "question":
+                        self._questions_this_drain += 1
             remaining = remaining[1:]
             state.write_json_atomic(self._mail_path(),
                                     {"pending": remaining})
@@ -599,7 +621,12 @@ class AgoraMonitor:
         reports[tid] = {"iid": int(iid), "note": body,
                         "note_id": int(mid) if mid is not None else -1,
                         "finalized": bool(current.get("finalized"))}
-        state.write_json_atomic(self._reports_path(), store)
+        try:
+            state.write_json_atomic(self._reports_path(), store)
+        except OSError as exc:
+            # 终闸 B-3：落盘瞬态失败≠毒消息——留 pending 下一轮重放，
+            # 不让报告永久丢失成降级评论
+            raise _MailDeferred(f"reports store write failed: {exc}") from exc
 
     def _handle_worker_question(self, iid, tid, body):
         """worker 提问 → 答复回调（orchestrator 在 ledger_lock 内交
@@ -620,9 +647,14 @@ class AgoraMonitor:
                       f"跟进。worker 原问题（任务 {tid}）：{body}")
         try:
             self._client.post(tid, "answer", answer)
-        except (AgoraUnavailable, AgoraRejected, AgoraProtocolError) as exc:
-            self._journal(f"agora-monitor: answer post failed for {tid}, "
-                          f"dropped: {exc}")
+        except (AgoraUnavailable, AgoraProtocolError) as exc:
+            # 终闸 B-2：瞬断不吞——消息留 pending 下一轮重放重试（worker
+            # 提问无服务端重投通道，丢了就是永久等待）
+            raise _MailDeferred(f"answer post transient for {tid}: {exc}") \
+                from exc
+        except AgoraRejected as exc:
+            self._journal(f"agora-monitor: answer post rejected for {tid}, "
+                          f"dropped (deterministic): {exc}")
 
     # ---- 心跳（Task 5：agora 回合报 board 态；legacy 心跳不变）----
 

@@ -316,12 +316,17 @@ class FakeAgoraClient:
         # Task 5 持续对话面：post(kind=question) 直通与失败注入
         self.posts = []          # {"task", "kind", "body"}
         self.post_failures = []  # 提交时抛出的异常队列
+        self.board_task = {"state": "running"}  # relay 回落前的 board 重读面
         self.cancel_calls = []   # task_cancel 调用记账（关单语义必须为零）
 
     def post(self, tid, kind, body):
         if self.post_failures:
             raise self.post_failures.pop(0)  # 未送达：不记账（先记后抛会让断言虚绿）
         self.posts.append({"task": tid, "kind": kind, "body": body})
+
+    def board(self, tid):
+        """relay 回落前的 board 重读面（终闸 B-1：4xx ≠ 终态专有）。"""
+        return {"task": dict(self.board_task), "events": []}
 
     def task_cancel(self, tid):
         self.cancel_calls.append(tid)
@@ -3021,6 +3026,7 @@ def test_stale_registry_rejected_relay_falls_back_to_router(
         assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
         monitor.release(7, "ag-123")  # board 侧已终态
         monitor.register(7, "ag-123")  # 注册表陈旧（poll 未及收敛）
+        client.board_task = {"state": "closed"}  # board 确认终态（B-1 门）
         client.post_failures.append(AgoraRejected("任务已收口 (fake)"))
 
         h.listener.queue.put(
@@ -3221,6 +3227,35 @@ def test_relay_unavailable_retry_preserves_comment_body(tmp_path,
         assert "请改用方案 B" in question["body"], \
             "重试必须转达原评论正文，而非 RETRY_MESSAGE"
         assert "系统重试" not in question["body"]
+    finally:
+        h.orch.stop()
+
+
+def test_relay_rejected_non_terminal_keeps_pending(tmp_path, monkeypatch):
+    """终闸 B-1：4xx ≠ 终态专有——relay 被拒但 board 显示任务仍存活
+    （如限流）时保留待派发重试，绝不为在飞任务建新回合（防孤儿化＋
+    防 mailbox 断供）。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        client.board_task = {"state": "running"}  # board：任务仍存活
+        client.post_failures.append(
+            AgoraRejected("429 too many requests (fake)"))
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="请补充说明", comment_id=102))
+        assert wait_until(lambda: h.entry(7)["agora_pending"] is True), \
+            h.journal_msgs
+        assert h.entry(7)["status"] == "pending", "保留待派发重试"
+        assert client.created_ids == ["ag-123"], \
+            "任务仍存活时绝不建新回合"
+        assert len(router_.calls) == 1, "零重路由"
+        assert h.entry(7)["agora_task_id"] == "ag-123", "登记不覆盖"
     finally:
         h.orch.stop()
 
