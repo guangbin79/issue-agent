@@ -295,10 +295,16 @@ def test_daemon_legacy_mode_passes_none_and_never_builds_client(
         raise AssertionError("legacy must not build a router")
 
     monkeypatch.setattr(daemon, "SemanticRouter", no_router)
+
+    def no_monitor(**kwargs):
+        raise AssertionError("legacy must not build a monitor")
+
+    monkeypatch.setattr(daemon, "AgoraMonitor", no_monitor)
     assert daemon.main() == 0
     assert built == []
     assert captured["agora_client"] is None
     assert captured["router"] is None
+    assert captured["agora_monitor"] is None
 
 
 # --- agora router wiring (plan Task 2) ----------------------------------------
@@ -349,3 +355,27 @@ def test_daemon_router_reads_the_same_ledger_as_orchestrator(
                         lambda **kwargs: types.SimpleNamespace(kwargs=kwargs))
     assert daemon.main() == 0
     assert captured["router"].kwargs["state_path"] == captured["state_path"]
+
+
+# --- agora monitor wiring (plan Task 3) ----------------------------------------
+
+
+def test_daemon_agora_mode_builds_monitor_and_threads_it(tmp_path, monkeypatch):
+    """agora 模式：daemon 构造 AgoraMonitor（client/journal/max_active＝
+    config.max_parallel 双重限制口径）并以 agora_monitor= 注入。"""
+    built = []
+
+    class FakeMonitor:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            built.append(self)
+
+    captured = _wiring_scaffold(tmp_path, monkeypatch, _agora_cfg(tmp_path))
+    monkeypatch.setattr(daemon, "AgoraMonitor", FakeMonitor)
+    assert daemon.main() == 0
+    assert len(built) == 1
+    kwargs = dict(built[0].kwargs)
+    journal = kwargs.pop("journal")
+    assert callable(journal)
+    assert kwargs == {"client": captured["agora_client"], "max_active": 1}
+    assert captured["agora_monitor"] is built[0]

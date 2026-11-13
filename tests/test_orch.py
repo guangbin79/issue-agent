@@ -39,8 +39,10 @@ sys.path.insert(0, str(PKG_DIR))
 import api  # noqa: E402
 import gitop  # noqa: E402
 import orchestrator  # noqa: E402
+import router as router_mod  # noqa: E402
 import runner  # noqa: E402
 import state  # noqa: E402
+from agora_client import AgoraRejected, AgoraUnavailable  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -238,6 +240,9 @@ class FakeGitop:
         self.fix_pushed = False
         self.fix_pushed_error = None
         self.fix_pushed_calls = []  # (repo, iid, remote_url)
+        # agora 开发分支准备 seam（Task 3）
+        self.ensure_calls = []      # (repo, iid, default_branch)
+        self.ensure_error = None
 
     def fake_fetch(self, repo, remote_url, default_branch="master", ssl_verify=True):
         self.fetch_calls.append((repo, remote_url, default_branch))
@@ -275,6 +280,130 @@ class FakeGitop:
             raise self.fix_pushed_error
         return self.fix_pushed
 
+    def fake_ensure_fix_branch(self, repo, iid, default_branch="master",
+                               remote_url=None, ssl_verify=True):
+        self.ensure_calls.append((repo, iid, default_branch))
+        if self.ensure_error is not None:
+            raise self.ensure_error
+        return "0" * 40
+
+
+def agora_decision(action="dispatch", **overrides):
+    """agora 测试缺省决策：dispatch 到可用模型。"""
+    payload = dict(action=action, title="修复 #7",
+                   goal="goal-v1\nIssue: #7", model="zai/glm-5.3",
+                   reason="跨模块 bug 需强模型", raw={})
+    payload.update(overrides)
+    return router_mod.RouterDecision(**payload)
+
+
+class FakeAgoraClient:
+    """AgoraClient 替身：建单幂等语义照设计 §8.1——client_key 命中且执行
+    payload（goal/project_dir/target_branch/verify_cmd/model/deliverable）
+    相同则返回原任务，payload 不同则 AgoraRejected；create_failures 队列
+    模拟「服务端已提交但客户端超时」。零网络。"""
+
+    def __init__(self):
+        self.tasks = {}          # client_key -> {"task", "payload"}
+        self.create_calls = []   # 每次 create 请求的完整 kwargs
+        self.created_ids = []    # 服务端真正新建的任务 id（去重后）
+        self.create_failures = []   # 提交后抛出的异常队列（超时模拟）
+        self.dispatch_calls = []
+        self.dispatch_failures = []
+        self.doctor_calls = 0
+        self.doctor_result = {"models": ["zai/glm-5.3"]}
+
+    def doctor(self):
+        self.doctor_calls += 1
+        if isinstance(self.doctor_result, Exception):
+            raise self.doctor_result
+        return self.doctor_result
+
+    @staticmethod
+    def _execution_payload(kwargs):
+        return {key: kwargs[key] for key in
+                ("goal", "project_dir", "target_branch", "verify_cmd",
+                 "model", "deliverable")}
+
+    def create_task(self, *, goal, project_dir, target_branch, verify_cmd,
+                    model, title, client_key, deliverable="external_branch",
+                    after=None):
+        call = dict(goal=goal, project_dir=project_dir,
+                    target_branch=target_branch, verify_cmd=verify_cmd,
+                    model=model, title=title, client_key=client_key,
+                    deliverable=deliverable)
+        if after is not None:  # 同真实客户端：None 不含键（wire 形状）
+            call["after"] = after
+        self.create_calls.append(call)
+        key = client_key
+        execution = self._execution_payload(call)
+        hit = self.tasks.get(key)
+        if hit is not None:
+            if hit["payload"] != execution:
+                raise AgoraRejected(
+                    f"client_key {key} reused with a different payload")
+            return hit["task"]
+        tid = f"ag-{123 + len(self.tasks)}"
+        self.tasks[key] = {"task": tid, "payload": execution}
+        self.created_ids.append(tid)
+        if self.create_failures:  # 服务端已提交，回复没能送达客户端
+            raise self.create_failures.pop(0)
+        return tid
+
+    def dispatch(self, tid):
+        self.dispatch_calls.append(tid)
+        if self.dispatch_failures:
+            raise self.dispatch_failures.pop(0)
+
+
+class FakeRouter:
+    """SemanticRouter 替身：decide 记录入参并返回脚本化决策（或抛错）。"""
+
+    def __init__(self, decision=None):
+        self.decision = decision or agora_decision()
+        self.calls = []
+        self.error = None
+
+    def decide(self, *, iid, event, issue_context, available_models):
+        self.calls.append({"iid": iid, "event": event,
+                           "issue_context": issue_context,
+                           "available_models": available_models})
+        if self.error is not None:
+            raise self.error
+        return self.decision
+
+
+class FakeMonitor:
+    """AgoraMonitor 替身：容量/register/release/start/stop 调用记账。"""
+
+    def __init__(self, max_active=1):
+        self.max_active = max_active
+        self._active = {}
+        self.registered = []
+        self.released = []
+        self.started = 0
+        self.stopped = 0
+
+    def has_capacity(self):
+        return len(self._active) < self.max_active
+
+    def register(self, iid, tid):
+        self._active[int(iid)] = tid
+        self.registered.append((int(iid), tid))
+
+    def release(self, iid):
+        self._active.pop(int(iid), None)
+        self.released.append(int(iid))
+
+    def start(self):
+        self.started += 1
+
+    def stop(self):
+        self.stopped += 1
+
+    def poll_once(self):
+        return None
+
 
 
 def turn_result(sid="ses_1", text="已定位并修复，详见分支。"):
@@ -305,6 +434,7 @@ class Harness:
         monkeypatch.setattr(gitop, "push_fix_branch", self.gitop.fake_push)
         monkeypatch.setattr(gitop, "knowledge_changes_present", self.gitop.fake_knowledge_changes)
         monkeypatch.setattr(gitop, "fix_branch_pushed", self.gitop.fake_fix_branch_pushed)
+        monkeypatch.setattr(gitop, "ensure_fix_branch", self.gitop.fake_ensure_fix_branch)
         monkeypatch.setattr(runner, "export_last_report", self.runner.fake_export)
         # spy on the REAL git runner: with all five turn seams faked above,
         # anything still reaching _run is a git op the turn must not do
@@ -2345,3 +2475,284 @@ def test_reconcile_and_orphan_cleanup_write_ledger_under_lock(
     h.orch._safe_reconcile()
     assert observed == [True, True], \
         "claim_timeout_recycle 两处调用都必须持锁"
+
+
+# --- agora mode turns (plan Task 3: 幂等派发) ----------------------------------
+
+
+def agora_harness(tmp_path, monkeypatch, client=None, router_=None,
+                  monitor=None, **kwargs):
+    """agora 模式 harness：AgoraClient/Router/Monitor 三替身注入（零外网）。"""
+    return Harness(
+        tmp_path, monkeypatch,
+        agora_client=client if client is not None else FakeAgoraClient(),
+        router=router_ if router_ is not None else FakeRouter(),
+        agora_monitor=monitor if monitor is not None else FakeMonitor(),
+        **kwargs)
+
+
+def turn_finalized(harness, iid):
+    entry = harness.entry(iid)
+    return entry["status"] == "active" and entry["claimed_at"] is None
+
+
+def requeue_retry(harness, iid):
+    """以 requeue 路径重试（claim-timeout 回收后的真实通道）：置 defer 再
+    _handle_requeue——它保持 last_note_id，故 client_key 与原回合一致。"""
+    st = state.load_state(harness.state_path)
+    st["issues"][str(int(iid))]["status"] = "defer"
+    state.save_state(harness.state_path, st)
+    harness.orch._handle_requeue(int(iid))
+
+
+def test_run_turn_returns_after_dispatch_and_releases_issue_lock(
+        tmp_path, monkeypatch):
+    """计划锚例：agora 回合 ack→fetch+ensure→Router→create→落账→dispatch→
+    register 后立即返回并释放 issue 锁——绝不同步等待 worker，零 legacy
+    opencode run。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        assert monitor.registered == [(7, "ag-123")]
+        lock = h.orch._iid_lock(7)
+        assert wait_until(lambda: lock.acquire(blocking=False)), \
+            "回合返回后 issue 锁必须随即释放（finalize 在锁内，释放紧随其后）"
+        lock.release()
+
+        assert h.runner.new_calls == [] and h.runner.cont_calls == [], \
+            "agora 模式不得走 legacy opencode run"
+        assert client.dispatch_calls == ["ag-123"]
+        assert h.gitop.fetch_calls and h.gitop.ensure_calls, \
+            "基线 fetch 与开发分支准备都必须发生"
+
+        entry = h.entry(7)
+        assert entry["agora_task_id"] == "ag-123"
+        assert entry["agora_pending"] is False
+        assert entry["router_goal"] == router_.decision.goal
+        assert entry["router_model"] == "zai/glm-5.3"
+        assert entry["branch"] == "issue/7-fix"
+        assert entry["session_id"] is None, "legacy session_id 不被 agora 改写"
+
+        call = client.create_calls[0]
+        assert call["client_key"] == "issue-agent:issue-7:note-0"
+        assert call["target_branch"] == "issue/7-fix"
+        assert call["deliverable"] == "external_branch"
+        assert call["verify_cmd"] == h.orch.verify_command
+        assert call["model"] == "zai/glm-5.3"
+        assert call["goal"] == router_.decision.goal
+        assert call["project_dir"] == h.repo_path
+        assert "after" not in call, "首轮无上轮任务可链"
+        assert router_.calls[0]["available_models"] == ["zai/glm-5.3"], \
+            "available_models 必须在调用点从 doctor 取"
+        assert any("已接手 issue#7" in b for _, b in h.api.posts)
+    finally:
+        h.orch.stop()
+
+
+def test_create_timeout_recovers_same_task(tmp_path, monkeypatch):
+    """计划锚例：create 服务端已提交但客户端超时 → 同 client_key＋同
+    payload 重试取回原任务，不重复建单。"""
+    client = FakeAgoraClient()
+    client.create_failures.append(AgoraUnavailable("create timeout (fake)"))
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        assert client.created_ids == ["ag-123"], "不得重复建单"
+        assert len(client.create_calls) == 2, "超时后必须原地重试一次"
+        first, second = client.create_calls
+        assert FakeAgoraClient._execution_payload(second) \
+            == FakeAgoraClient._execution_payload(first)
+        assert second["client_key"] == first["client_key"]
+        assert client.dispatch_calls == ["ag-123"]
+        assert monitor.registered == [(7, "ag-123")]
+    finally:
+        h.orch.stop()
+
+
+def test_crash_between_create_and_dispatch_recovers_original_task(
+        tmp_path, monkeypatch):
+    """计划 L224：create 落账后 dispatch 前中断 → 账本留 agora_task_id＋
+    pending；重试走持久化 goal/model＋同 client_key，只恢复原任务。"""
+    client = FakeAgoraClient()
+    client.dispatch_failures.append(AgoraUnavailable("dispatch down (fake)"))
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(
+            lambda: h.entry(7)["agora_task_id"] == "ag-123"
+            and h.entry(7)["status"] == "pending"), h.journal_msgs
+        assert h.entry(7)["agora_pending"] is True
+        assert monitor.registered == [], "dispatch 未成不得登记"
+
+        requeue_retry(h, 7)
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        assert client.created_ids == ["ag-123"], "恢复不得建新任务"
+        assert len(router_.calls) == 1, "恢复复用持久化决策，不重新路由"
+        first, second = client.create_calls
+        assert FakeAgoraClient._execution_payload(second) \
+            == FakeAgoraClient._execution_payload(first)
+        assert second["client_key"] == first["client_key"]
+        assert client.dispatch_calls == ["ag-123", "ag-123"]
+        assert monitor.registered == [(7, "ag-123")]
+        assert h.entry(7)["agora_pending"] is False
+    finally:
+        h.orch.stop()
+
+
+def test_turn_keeps_issue_pending_when_monitor_at_capacity(
+        tmp_path, monkeypatch):
+    """计划 L224：活动名额（与 max_parallel 双重限制）满员时保留待派发，
+    不超额建单；名额释放后重试照常派发。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor(max_active=1)
+    monitor.register(99, "ag-older")  # 占满名额
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: h.entry(7)["agora_pending"] is True), \
+            h.journal_msgs
+        assert h.entry(7)["status"] == "pending", "保留待派发＝claim 留存"
+        assert client.create_calls == []
+        assert router_.calls == []
+        assert h.gitop.fetch_calls == [] and h.gitop.ensure_calls == [], \
+            "容量闸在 git 工作之前"
+
+        monitor.release(99)  # 名额到终态释放
+        requeue_retry(h, 7)
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        assert client.created_ids == ["ag-123"]
+        assert monitor.registered[-1] == (7, "ag-123")
+    finally:
+        h.orch.stop()
+
+
+def test_doctor_unavailable_keeps_pending_without_legacy_fallback(
+        tmp_path, monkeypatch):
+    """设计 §9.2：agora 不可用→保留待派发并重试，绝不降级 legacy
+    opencode run（防超时后实际已建单造成双 worker）。"""
+    client = FakeAgoraClient()
+    client.doctor_result = AgoraUnavailable("agora down (fake)")
+    h = agora_harness(tmp_path, monkeypatch, client=client)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: h.entry(7)["agora_pending"] is True), \
+            h.journal_msgs
+        assert h.runner.new_calls == [] and h.runner.cont_calls == []
+        assert h.entry(7)["status"] == "pending"
+
+        client.doctor_result = {"models": ["zai/glm-5.3"]}  # 服务恢复
+        requeue_retry(h, 7)
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        assert client.created_ids == ["ag-123"]
+    finally:
+        h.orch.stop()
+
+
+def test_router_ignore_does_not_create_and_closes(tmp_path, monkeypatch):
+    """计划 L224：Router ignore 不建单——走现有范围外评论＋关单策略（关单＝
+    终态暂停语义，收口交互归 Task 5）。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter(agora_decision(action="ignore", reason="属于前端仓"))
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        assert client.create_calls == []
+        assert client.dispatch_calls == []
+        assert monitor.registered == []
+        assert h.entry(7)["agora_task_id"] is None
+        assert any("范围外：属于前端仓" in b for _, b in h.api.posts)
+        assert h.api.closes == [7]
+        assert h.gitop.ensure_calls, "分支准备先于路由，照常发生"
+    finally:
+        h.orch.stop()
+
+
+def test_router_question_does_not_create_only_asks(tmp_path, monkeypatch):
+    """计划 L224：Router question 不建单——只发澄清评论，不关单不派发。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter(agora_decision(action="question", reason="缺复现步骤"))
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        assert client.create_calls == []
+        assert client.dispatch_calls == []
+        assert monitor.registered == []
+        assert h.entry(7)["agora_task_id"] is None
+        assert any("需要人工澄清：缺复现步骤" in b for _, b in h.api.posts)
+        assert h.api.closes == [], "question 不关单"
+    finally:
+        h.orch.stop()
+
+
+def test_new_note_round_redecides_and_chains_after_previous_tid(
+        tmp_path, monkeypatch):
+    """新 note＝新回合：重新路由、client_key 换 note 段、after 链上轮 tid；
+    legacy session_id 全程不被改写。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor(max_active=2)  # 上轮任务未终态：名额须并行
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        seed_active(h, iid=7, session_id="ses_legacy")
+        h.listener.queue.put(comment_event(iid=7, comment_id=101))
+        assert wait_until(
+            lambda: h.entry(7)["agora_task_id"] == "ag-123"
+            and turn_finalized(h, 7)), h.journal_msgs
+        assert h.entry(7)["session_id"] == "ses_legacy"
+
+        h.listener.queue.put(comment_event(iid=7, comment_id=102))
+        assert wait_until(
+            lambda: h.entry(7)["agora_task_id"] == "ag-124"
+            and turn_finalized(h, 7)), h.journal_msgs
+
+        assert len(router_.calls) == 2
+        first, second = client.create_calls
+        assert first["client_key"] == "issue-agent:issue-7:note-101"
+        assert second["client_key"] == "issue-agent:issue-7:note-102"
+        assert second["after"] == "ag-123", "同 issue 上轮 tid 若在账须为 after"
+        assert client.created_ids == ["ag-123", "ag-124"]
+        assert h.entry(7)["session_id"] == "ses_legacy", "全程不被 agora 覆盖"
+    finally:
+        h.orch.stop()
+
+
+def test_agora_ledger_fields_synced_across_construction_paths(tmp_path):
+    """设计 §9.6 四处同步：state._new_issue、_normalize 与 orchestrator
+    ._empty_entry 的新字段默认值一致（docstring 由 test_state 锁定）。"""
+    import state as state_mod
+    fresh = state_mod._new_issue("active")
+    empty = orchestrator._empty_entry()
+    for key, default in (("agora_task_id", None), ("agora_status", None),
+                         ("delivery_commit", None), ("agora_pending", False),
+                         ("router_goal", None), ("router_model", None)):
+        assert fresh[key] == default, key
+        assert empty[key] == default, key
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"issues": {"5": {"status": "active"}}}))
+    normed = state_mod.load_state(path)["issues"]["5"]
+    assert normed["agora_pending"] is False
+    assert normed["agora_task_id"] is None

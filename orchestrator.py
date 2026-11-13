@@ -53,6 +53,8 @@ import api
 from api import NOTE_MARKER as _DEFAULT_NOTE_MARKER
 import fsm
 import gitop
+import router
+from agora_client import AgoraRejected, AgoraUnavailable
 import runner
 import state
 
@@ -167,6 +169,13 @@ def _empty_entry() -> dict:
         "review_push_pending_at": None,
         "report_probe_pending": False,
         "report_probe_count": 0,
+        # agora 六字段（设计 §9.6，与 state._new_issue 同步）
+        "agora_task_id": None,
+        "agora_status": None,
+        "delivery_commit": None,
+        "agora_pending": False,
+        "router_goal": None,
+        "router_model": None,
     }
 
 
@@ -196,6 +205,7 @@ class Orchestrator:
                  teardown: Optional[Callable[[], None]] = None,
                  agora_client=None,
                  router=None,
+                 agora_monitor=None,
                  ledger_lock=None):
         self.project = project
         self.api = api
@@ -255,6 +265,9 @@ class Orchestrator:
         # 持久语义 Router（计划 Task 2 只注入保存；Task 3 在 router_lock 内
         # decide 才消费）。legacy 恒 None。
         self.router = router
+        # agora 任务监视器（计划 Task 3）：登记派发后的活动任务并轮询；
+        # start/stop 随本类生命周期。legacy 恒 None。
+        self.agora_monitor = agora_monitor
         self.max_parallel = max(1, int(max_parallel))
         # ledger lock: every load-mutate-save sequence (and decide+claim) runs
         # under it, so worker and a concurrent reconcile never interleave
@@ -317,6 +330,8 @@ class Orchestrator:
             self._sweep_thread = threading.Thread(
                 target=self._sweep_loop, name="issue-agent-sweep", daemon=True)
             self._sweep_thread.start()
+        if self.agora_monitor is not None:
+            self.agora_monitor.start()
         self._journal(f"startup: listener up (port={port}), baseline reconciled, "
                       f"workers running (max_parallel={self.max_parallel})")
         return port
@@ -336,6 +351,8 @@ class Orchestrator:
         if self._sweep_thread is not None:
             self._sweep_thread.join(timeout=5)
             self._sweep_thread = None
+        if self.agora_monitor is not None:
+            self.agora_monitor.stop()
 
     def _startup_orphan_cleanup(self):
         """No worker thread exists yet, so every pending claim is an orphan
@@ -419,7 +436,8 @@ class Orchestrator:
             action = "continue"
         if action in ("new", "continue"):
             self._run_turn(iid, message=message, title=title,
-                           session_id=session_id, action=action)
+                           session_id=session_id, action=action, event=event,
+                           note_id=note_ids[-1] if note_ids else 0)
             return
         # pause / unpause / close / reopen: ledger mutation inside the lock
         with self._ledger_lock:
@@ -547,6 +565,12 @@ class Orchestrator:
         entry = issues[key]
         entry["status"] = "pending"
         entry["claimed_at"] = _now_iso()
+        # agora 回合边界（Task 3）：消费新 note ids 的 claim＝新回合——上一
+        # 回合未完成的建单意图与 goal/model 不再属于本回合（恢复复用只认
+        # 不经过 _claim 的 requeue 重试，那条路径才代表同回合重放）。
+        entry.pop("agora_pending", None)
+        entry.pop("router_goal", None)
+        entry.pop("router_model", None)
         # the turn's own post-turn/post-review pushes own the branch now
         entry.pop("review_push_pending_at", None)
         # ag-a9af5e: the new turn's own reply absorbs any report debt —
@@ -594,7 +618,8 @@ class Orchestrator:
         with self._iid_locks_guard:
             return self._iid_locks.setdefault(str(int(iid)), threading.Lock())
 
-    def _run_turn(self, iid, *, message, title, session_id, action):
+    def _run_turn(self, iid, *, message, title, session_id, action,
+                  event=None, note_id=None):
         # bounded concurrency: at most max_parallel turns process-wide, and
         # this issue's own turns strictly serialize (iid lock held across the
         # whole turn so a queued same-issue comment can never interleave).
@@ -602,6 +627,10 @@ class Orchestrator:
         # full turn budget while its claim ages — claim_timeout_s must stay
         # above that budget (checked at __init__, warning) or the recycle
         # can requeue a duplicate retry mid-wait.
+        if self.agora_client is not None:
+            return self._run_turn_agora(
+                iid, message=message, title=title, session_id=session_id,
+                action=action, event=event, note_id=note_id)
         with self._iid_lock(iid), self._turn_slots:
             self._journal(f"turn: issue#{iid} start ({action}, session={session_id or 'new'})")
             # ack BEFORE the gates: humans get instant feedback even when the
@@ -717,6 +746,204 @@ class Orchestrator:
                                gitop.fix_branch(iid))
             finally:
                 self._heartbeat_unregister(iid)
+
+    # ------------------------------------------------------------ agora turns
+
+    def _run_turn_agora(self, iid, *, message, title, session_id, action,
+                        event, note_id):
+        """agora 模式回合（计划 Task 3，设计 §9.2）：同一 issue 锁＋接手
+        评论 → fetch 基线＋ensure_fix_branch → 账本锁临界区内 Router 决策
+        （goal/model 首次 create 前持久化）→ client_key 幂等建单 →
+        agora_task_id 先落账再 dispatch → 登记监视器后立即返回释放锁。
+
+        绝不同步等待 worker（monitor 异步轮询）；legacy session_id 不被
+        本路径改写；agora 不可用保留待派发，绝不降级 legacy opencode run。
+        """
+        with self._iid_lock(iid), self._turn_slots:
+            self._journal(f"turn: issue#{iid} start ({action}, agora)")
+            if not self._post_note(iid, f"已接手 issue#{iid}"):
+                self._defer(iid, None)
+                return
+            # 活动名额（monitor 侧，与 max_parallel turn 槽双重限制）：满员
+            # 保留待派发（claim 留存，claim-timeout 回收后 requeue 重试），
+            # 绝不超额建单。
+            if self.agora_monitor is not None \
+                    and not self.agora_monitor.has_capacity():
+                self._agora_keep_pending(iid, "monitor at capacity")
+                return
+            try:
+                gitop.fetch_base(self.repo_path, self.remote_url,
+                                 self.default_branch, self.ssl_verify)
+                gitop.ensure_fix_branch(self.repo_path, iid,
+                                        self.default_branch, self.remote_url,
+                                        self.ssl_verify)
+            except gitop.GitopError as exc:
+                self._journal(
+                    f"turn: issue#{iid} deferred (baseline fetch failed): {exc}")
+                self._defer(iid, None)
+                return
+            decision = self._agora_route(iid, event=event, message=message)
+            if decision is None:  # 失败路径已处置（保留待派发/defer）
+                return
+            if decision.action != "dispatch":
+                self._agora_out_of_band(iid, decision)
+                return
+            payload = dict(
+                goal=decision.goal,
+                project_dir=self.repo_path,
+                target_branch=gitop.fix_branch(iid),
+                verify_cmd=self.verify_command,
+                model=decision.model,
+                title=decision.title,
+                client_key=f"{self.service_name}:issue-{iid}:note-{note_id or 0}",
+                after=self._agora_previous_tid(iid),
+            )
+            tid = self._agora_create(iid, payload)
+            if tid is None:  # 保留待派发（超时重试后仍不可达）
+                return
+            # agora_task_id 先落账再 dispatch：dispatch 前崩溃的恢复面。
+            # agora_pending 保持 True 直到 dispatch+register 成功——中断窗口
+            # 内任何重放都靠同 client_key 取回原任务。
+            with self._ledger_lock:
+                ledger = state.load_state(self.state_path, warn=self._journal)
+                entry = ledger["issues"].setdefault(str(int(iid)), _empty_entry())
+                entry["agora_task_id"] = tid
+                state.save_state(self.state_path, ledger)
+            try:
+                self.agora_client.dispatch(tid)
+            except (AgoraUnavailable, AgoraRejected) as exc:
+                # 恢复路径与建单超时同构：同 client_key 取回原任务再派。
+                self._journal(
+                    f"turn: issue#{iid} dispatch failed, kept pending: {exc}")
+                self._agora_keep_pending(iid, "dispatch failed")
+                return
+            if self.agora_monitor is not None:
+                self.agora_monitor.register(iid, tid)
+            with self._ledger_lock:
+                ledger = state.load_state(self.state_path, warn=self._journal)
+                ledger["issues"].setdefault(
+                    str(int(iid)), _empty_entry())["agora_pending"] = False
+                state.save_state(self.state_path, ledger)
+            self._finalize(iid, None, gitop.fix_branch(iid))
+
+    def _agora_route(self, iid, *, event, message):
+        """账本锁临界区内的 Router 决策与 goal/model 持久化（T2 共享 RLock
+        可重入，persist 嵌套获取不自锁）。
+
+        返回可执行的 RouterDecision：新决策（dispatch/ignore/question）、或
+        中断恢复复用（由持久化 goal/model 重建的 dispatch）；失败已处置并
+        返回 None——agora 不可用→保留待派发（doctor 在调用点取可用模型，
+        models 缺席即空表，dispatch 决策被拒是安全方向）；Router 坏决策/
+        会话故障→defer（不执行）。
+        """
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            issues = ledger.setdefault("issues", {})
+            key = str(int(iid))
+            if key not in issues:
+                issues[key] = _empty_entry()
+            entry = issues[key]
+            if entry.get("agora_pending") and entry.get("router_goal") \
+                    and entry.get("router_model"):
+                # 本回合已持久化建单意图但未完成 dispatch（容量/建单/派发
+                # 中断）：原样复用同一 payload——§8.1 同键异 payload 会被
+                # 拒，重新路由生成的 goal 必然不同。
+                self._journal(
+                    f"turn: issue#{iid} recovering persisted router payload")
+                return router.RouterDecision(
+                    action="dispatch", title=f"issue#{iid}"[:40],
+                    goal=entry["router_goal"], model=entry["router_model"],
+                    reason="recovered", raw={})
+            issue_ctx_title = ""
+            if isinstance(event, dict) and isinstance(event.get("issue"), dict):
+                issue_ctx_title = event["issue"].get("title") or ""
+            try:
+                decision = self.router.decide(
+                    iid=iid, event=event or {"kind": "requeue-retry"},
+                    issue_context={"title": issue_ctx_title, "body": message},
+                    available_models=router.available_models_from_doctor(
+                        self.agora_client.doctor()))
+            except AgoraUnavailable as exc:
+                self._journal(
+                    f"turn: issue#{iid} agora unavailable, kept pending: {exc}")
+                entry["agora_pending"] = True
+                state.save_state(self.state_path, ledger)
+                return None
+            except (router.RouterDecisionError, runner.SessionInvalid,
+                    runner.TurnTimeout, runner.TurnCrash) as exc:
+                self._journal(
+                    f"turn: issue#{iid} deferred (router decision failed): {exc}")
+                self._defer(iid, None)  # RLock 可重入：锁内调用安全
+                return None
+            if decision.action == "dispatch":
+                # 首次 create 前持久化 goal/model＋建单意图（§8.1/§9.6）。
+                entry["router_goal"] = decision.goal
+                entry["router_model"] = decision.model
+                entry["agora_pending"] = True
+                state.save_state(self.state_path, ledger)
+            return decision
+
+    def _agora_create(self, iid, payload):
+        """client_key 幂等建单＋超时恢复：create 成功但客户端超时
+        （AgoraUnavailable）→ 同 client_key＋同 payload 原地重试一次，服务
+        端已提交的任务按键取回，不重复建单；两次不可达→保留待派发。"""
+        for attempt in (1, 2):
+            try:
+                return self.agora_client.create_task(**payload)
+            except AgoraRejected as exc:
+                # 确定性拒绝（含同键异 payload）：人工介入
+                self._blocked(iid, None,
+                              f"agora 建单被拒，需要人工处理 issue#{iid}：{exc}")
+                return None
+            except AgoraUnavailable as exc:
+                if attempt == 2:
+                    self._journal(
+                        f"turn: issue#{iid} create unreachable twice, "
+                        f"kept pending: {exc}")
+                    self._agora_keep_pending(iid, "create unreachable")
+                    return None
+                self._journal(
+                    f"turn: issue#{iid} create timeout (server may have "
+                    f"committed), retrying same client_key: {exc}")
+
+    def _agora_previous_tid(self, iid):
+        """同 issue 上轮 tid（在账即链，作 after）；无则 None（body 不含键）。"""
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            entry = ledger["issues"].get(str(int(iid)))
+            return (entry or {}).get("agora_task_id") or None
+
+    def _agora_keep_pending(self, iid, why):
+        """保留待派发：agora_pending=True 落账，claim（pending）留存——
+        claim-timeout 回收→requeue 即重试通道；不降级 legacy。"""
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            issues = ledger.setdefault("issues", {})
+            key = str(int(iid))
+            if key not in issues:
+                issues[key] = _empty_entry()
+            issues[key]["agora_pending"] = True
+            state.save_state(self.state_path, ledger)
+        self._journal(f"turn: issue#{iid} kept pending for dispatch ({why})")
+
+    def _agora_out_of_band(self, iid, decision):
+        """Router ignore/question：不建单（范围外/待澄清）。ignore 走现有
+        范围外评论＋关单策略（关单＝终态暂停语义，收口交互归 Task 5）；
+        question 只发澄清评论。两者按回合完成收尾。"""
+        if decision.action == "ignore":
+            text = f"范围外：{decision.reason or '不属于本仓库处理范围'}"
+        else:
+            text = f"需要人工澄清：{decision.reason or '信息不足'}"
+        if not self._post_note(iid, text):
+            self._defer(iid, None)
+            return
+        if decision.action == "ignore":
+            try:
+                self.api.close_issue(self.project, iid)
+            except Exception as exc:  # fail-open：评论已送达优先
+                self._journal(
+                    f"warning: issue#{iid} out-of-scope close failed: {exc!r}")
+        self._finalize(iid, None, None)
 
     def _run_opencode(self, iid, prompt, title, session_id):
         """Run one opencode turn with the runner's failure mapping.
@@ -1735,6 +1962,10 @@ class Orchestrator:
             entry["status"] = "pending"
             entry["claimed_at"] = _now_iso()
             session_id = entry.get("session_id")
+            # agora 重试保持原回合 client_key：note 段取自 claim 已消费的
+            # last_note_id（同 note 重放＝同 key，服务端幂等取回原任务）。
+            note_id = entry.get("last_note_id")
             state.save_state(self.state_path, ledger)
         self._run_turn(iid, message=RETRY_MESSAGE, title=f"issue#{iid}: retry"[:40],
-                       session_id=session_id, action="continue")
+                       session_id=session_id, action="continue",
+                       note_id=note_id)

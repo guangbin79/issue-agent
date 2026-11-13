@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 from api import GitLabClient
 from agora_client import AgoraClient
+from agora_monitor import AgoraMonitor
 from config import ConfigError, load_config
 from router import SemanticRouter
 import gitop
@@ -189,6 +190,12 @@ def main(argv=None) -> int:
         warn=journal,
         ledger_lock=shared_ledger_lock)
         if config.execution_mode == "agora" else None)
+    # agora 任务监视器（计划 Task 3）：登记派发后的活动任务并轮询，活动
+    # 名额与 config.max_parallel 双重限制口径；start/stop 随 orchestrator
+    # 生命周期。legacy 恒 None。
+    agora_monitor = (AgoraMonitor(client=agora_client, journal=journal,
+                                  max_active=config.max_parallel)
+                     if config.execution_mode == "agora" else None)
     http_mod = _load_http_module()
     # Port: the unit's ISSUE_AGENT_PORT env wins; config.port otherwise
     # (pre-unit installs and manual config edits keep working unchanged).
@@ -221,6 +228,7 @@ def main(argv=None) -> int:
         worktree_path=config.worktree_path,
         agora_client=agora_client,
         router=semantic_router,
+        agora_monitor=agora_monitor,
         ledger_lock=shared_ledger_lock,
         teardown=_teardown_self_cancel,
     )
