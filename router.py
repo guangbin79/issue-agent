@@ -16,6 +16,7 @@ router_lock 内串行（同一持久会话不并发收 prompt）；session id �
 """
 
 import json
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,8 @@ DECISION_KEYS = ("schema_version", "action", "title", "goal", "model", "reason")
 ALLOWED_ACTIONS = ("dispatch", "ignore", "question")
 TITLE_MAX_CHARS = 40
 ROUTER_SESSION_TITLE = "issue-agent router"
+_PLACEHOLDER_RE = re.compile(
+    r"\{\{(IID|EVENT|ISSUE_CONTEXT|AVAILABLE_MODELS)\}\}")
 
 
 class RouterDecisionError(RuntimeError):
@@ -61,15 +64,17 @@ def build_router_prompt(template_text, *, iid, event, issue_context,
     """ROUTER.template.md + 本次输入 -> 单条 prompt 消息。
 
     输入以 JSON 嵌入（含不可信 issue 文本——模板已声明它只是分析素材）；
-    占位符单趟替换，无遗留。"""
-    return (template_text
-            .replace("{{IID}}", str(iid))
-            .replace("{{EVENT}}",
-                     json.dumps(event, ensure_ascii=False, indent=2))
-            .replace("{{ISSUE_CONTEXT}}",
-                     json.dumps(issue_context, ensure_ascii=False, indent=2))
-            .replace("{{AVAILABLE_MODELS}}",
-                     "\n".join(available_models)))
+    占位符单趟正则替换：先替换出的文本不会再被扫描——issue 文本里注入
+    的 "{{AVAILABLE_MODELS}}" 等字面量只能原样留在文本区，不被二次展开。"""
+    values = {
+        "IID": str(iid),
+        "EVENT": json.dumps(event, ensure_ascii=False, indent=2),
+        "ISSUE_CONTEXT": json.dumps(issue_context, ensure_ascii=False,
+                                    indent=2),
+        "AVAILABLE_MODELS": "\n".join(available_models),
+    }
+    return _PLACEHOLDER_RE.sub(lambda match: values[match.group(1)],
+                               template_text)
 
 
 def _extract_json_object(reply_text):
@@ -177,6 +182,6 @@ class SemanticRouter:
         return _validate_decision(result.reply_text, available_models)
 
     def _persist_session_id(self, sid):
-        ledger = state_mod.load_state(self._state_path)
+        ledger = state_mod.load_state(self._state_path, warn=self._warn)
         ledger[state_mod.ROUTER_SESSION_KEY] = sid
         state_mod.save_state(self._state_path, ledger)

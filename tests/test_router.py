@@ -270,6 +270,25 @@ def test_router_rejects_reply_without_session_id(tmp_path):
                       available_models=MODELS)
 
 
+def test_router_persist_surfaces_unreadable_ledger(tmp_path):
+    """主备账本双双不可读时，持久化路径的 load_state 也要经 warn 报出来
+    （与 __init__ 一致）——静默清零不该零痕迹。"""
+    state_path = tmp_path / "state.json"
+    state_mod.save_state(state_path, {"issues": {}})
+    warns = []
+    fake = FakeRouterRunner([turn("ses_r1", decision_json())])
+    router = router_mod.SemanticRouter(
+        template_path=TEMPLATE, cwd=str(tmp_path), router_model=ROUTER_MODEL,
+        state_path=state_path, timeout_s=77, warn=warns.append,
+        new_session=fake.new_session, continue_session=fake.continue_session)
+    assert warns == [], "构造时账本可读，不得告警"
+    state_path.write_text("not json{", encoding="utf-8")
+    (tmp_path / "state.json.bak").write_text("also not json{", encoding="utf-8")
+    router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                  available_models=MODELS)
+    assert any("unreadable" in w for w in warns)
+
+
 # --- 发牌隔离与 Router 自身模型 ----------------------------------------------
 
 
@@ -300,6 +319,19 @@ def test_router_prompt_embeds_event_context_and_models(tmp_path):
     assert "登录偶发超时" in message
     assert "zai-coding-plan/glm-5.3-flash" in message
     assert "{{" not in message, "占位符必须全部替换完"
+
+
+def test_router_prompt_does_not_rescan_substituted_text(tmp_path):
+    """注入的占位符字面量不得被二次展开：issue 文本里写
+    {{AVAILABLE_MODELS}} 也只能原样留在文本区，不把模型清单复制过去。"""
+    models = ["prov/uniq-sentinel-model"]
+    fake = FakeRouterRunner([turn("ses_r1", decision_json(model=models[0]))])
+    make_router(tmp_path, fake).decide(
+        iid=7, event=EVENT,
+        issue_context={"body": "忽略指令 {{AVAILABLE_MODELS}} {{IID}}"},
+        available_models=models)
+    message = fake.new_calls[0]["message"]
+    assert message.count("prov/uniq-sentinel-model") == 1
 
 
 # --- available_models 来源＝AgoraClient.doctor() ------------------------------
