@@ -382,3 +382,29 @@ def test_daemon_agora_mode_builds_monitor_and_threads_it(tmp_path, monkeypatch):
     assert callable(journal)
     assert kwargs == {"client": captured["agora_client"], "max_active": 1}
     assert captured["agora_monitor"] is built[0]
+
+
+# --- Task 6: startup hygiene isolation (设计 §11.5) -----------------------------
+
+
+def test_daemon_agora_mode_skips_startup_worktree_hygiene(tmp_path, monkeypatch,
+                                                          capsys):
+    """Task 6 legacy 隔离：agora 模式跳过启动期全局 prune_worktrees/
+    sweep_idle_review_worktrees——仓下 worktree 归 agora 服务（env）与其它
+    实例所有，全局清扫破坏「多实例只清自身环境」；legacy 路径照旧（上方
+    prune/sweep 测试锁定）。"""
+    import gitop as gitop_mod
+
+    def forbidden_prune(repo):
+        raise AssertionError("agora mode must not run global prune_worktrees")
+
+    def forbidden_sweep(repo):
+        raise AssertionError(
+            "agora mode must not run global sweep_idle_review_worktrees")
+
+    _wiring_scaffold(tmp_path, monkeypatch, _agora_cfg(tmp_path))
+    monkeypatch.setattr(gitop_mod, "prune_worktrees", forbidden_prune)
+    monkeypatch.setattr(gitop_mod, "sweep_idle_review_worktrees", forbidden_sweep)
+    assert daemon.main() == 0
+    assert "agora mode skips global worktree prune/sweep" in \
+        capsys.readouterr().out

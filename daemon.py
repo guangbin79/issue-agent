@@ -147,25 +147,34 @@ def main(argv=None) -> int:
     _STATE_DIR.mkdir(parents=True, exist_ok=True)
     protocol_path = _render_protocol(_PKG_DIR, config)
 
-    # startup hygiene: the agent removes its own worktrees, but a dir deleted
-    # out-of-band leaves a stale registration — prune cheaply, best-effort
-    # (the daemon itself creates no worktree)
-    try:
-        gitop.prune_worktrees(config.repo_path)
-        journal("startup: stale worktree registrations pruned")
-    except gitop.GitopError as exc:
-        journal(f"warning: worktree prune failed (continuing): {exc}")
+    # startup hygiene (Task 6 legacy isolation, 设计 §11.5): these are GLOBAL
+    # passes over the shared repo — in agora mode the worktrees under that repo
+    # belong to agora envs (service-owned) and other instances, so a global
+    # prune/sweep would break "one instance cleans only its own environment".
+    # legacy keeps the historical behavior byte-for-byte.
+    if config.execution_mode == "agora":
+        journal("startup: agora mode skips global worktree prune/sweep "
+                "(env worktrees are service-owned)")
+    else:
+        # startup hygiene: the agent removes its own worktrees, but a dir deleted
+        # out-of-band leaves a stale registration — prune cheaply, best-effort
+        # (the daemon itself creates no worktree)
+        try:
+            gitop.prune_worktrees(config.repo_path)
+            journal("startup: stale worktree registrations pruned")
+        except gitop.GitopError as exc:
+            journal(f"warning: worktree prune failed (continuing): {exc}")
 
-    # same best-effort hygiene as prune: sweep leftover review worktrees
-    # BEFORE the listener opens (no turn can start mid-sweep); dirs git kept
-    # (dirty/busy) are journaled for manual follow-up
-    try:
-        report = gitop.sweep_idle_review_worktrees(config.repo_path)
-        journal(f"startup: swept {len(report.removed)} idle review worktree(s), kept {len(report.kept) + len(report.refused)} (dirty/busy)")
-        for path in report.kept + report.refused:
-            journal(f"startup: worktree kept (dirty/busy): {path}")
-    except gitop.GitopError as exc:
-        journal(f"warning: worktree sweep failed (continuing): {exc}")
+        # same best-effort hygiene as prune: sweep leftover review worktrees
+        # BEFORE the listener opens (no turn can start mid-sweep); dirs git kept
+        # (dirty/busy) are journaled for manual follow-up
+        try:
+            report = gitop.sweep_idle_review_worktrees(config.repo_path)
+            journal(f"startup: swept {len(report.removed)} idle review worktree(s), kept {len(report.kept) + len(report.refused)} (dirty/busy)")
+            for path in report.kept + report.refused:
+                journal(f"startup: worktree kept (dirty/busy): {path}")
+        except gitop.GitopError as exc:
+            journal(f"warning: worktree sweep failed (continuing): {exc}")
 
     client = GitLabClient(config.api_base, config.pat, config.ssl_verify,
                            warn=journal, note_marker=config.note_marker)

@@ -72,6 +72,55 @@ cd <project-path> && opencode
 
 - **有界并行**：`config.json` 加 `"max_parallel": N`（默认 1＝串行；合法域 1..4）后 restart 生效——N 个 worker 消费同一队列，任意时刻 in-flight 回合 ≤N，同一 issue 的多事件仍严格串行（按 issue 锁）。机器负载与模型并发随 N 线性放大，N=2 起步够解排队痛点。
 
+## agora 模式
+
+`execution_mode` 逐实例显式启用的新执行路径（默认 `legacy`＝上文全部行为）：
+daemon 不再本地拉起 opencode worker，而是经**持久语义 Router** 分析 issue、
+以 `external_branch` 任务派发给已部署的 agora 服务，由 agora 的 worker env
+修码＋门体验证，issue-agent 只负责把验证过的 commit 精确推到开发分支。
+依赖、启用与试点步骤见 DEPLOY.md「agora 模式部署」。
+
+- **依赖**：同机已部署的 agorad 实例（F94–F103 交付栈，含 external_branch
+  交付、client_key 幂等建单与多实例隔离）。凭据面：issue-agent 以 root 牌
+  为 `issue-agent:<service_name>` 身份签发/取回 dispatcher 牌（一次性，进程
+  内缓存；root 牌仅此用途，不落日志与配置）；Gitea PAT 仍只留在 issue-agent。
+- **启用/回滚**：`.issue-agent.json` 加 `agora` 节（或等价 `ISSUE_AGENT_*`
+  环境变量）后重跑 install.sh 即启用：
+
+  ```json
+  "agora": {"execution_mode": "agora", "router_model": "<providerID/modelID>",
+            "agora_home": "<AGORA_HOME 绝对路径>", "agora_poll_interval": 15}
+  ```
+
+  回滚＝把 `execution_mode` 切回 `legacy` 重跑（或直接改 config 后
+  restart）——**agora 故障绝不自动降级双跑**：服务不可达时 issue 保留
+  `agora_pending` 待派发状态并按轮询重试，恢复后继续；绝不偷偷起本地
+  legacy worker（防超时后实际已建单造成双 worker）。不启用则安装面一个
+  agora 键都不写，legacy 部署 config 零变化。
+- **交付语义（external_branch）**：agora 门体验证（env verify＋评审锚）后
+  任务驻留 `done + awaiting_external`，绝不推 origin、绝不动默认分支；
+  issue-agent 持 PAT 把在案 commit 以 `<sha>:refs/heads/issue/<iid>-fix`
+  精确推送（非 force、只此一 ref），成功后 `task_deliver(delivered)` 收口；
+  远端已前推（non_ff）时 issue-agent 取实际远端 tip 经 `task_deliver(non_ff,
+  base=...)` 换基，agora 重排重验出新 handoff 后二次推送（≤3 次总尝试）。
+  默认分支仍只能由**人工 PR** 合并——机器人从不持有合并权。
+- **行为变化（相对 legacy）**：
+  - **持久 Router 替代旧 worker session 连续性**：每回合一任务、新 worker
+    会话（上下文干净无历史腐化）；跨轮记忆经 issue Thread＋worker 报告末行
+    「坑位：」提示传递（读码发现的隐含认知写给下轮，随报告回评上墙）。
+    legacy `session_id` 字段不被 agora 路径改写。
+  - **评审前移恒一次**：worker 必须在 done 前完成 review-loop 锚（agora 六
+    闸受理即复验），issue-agent 不再跑推送后 `_run_review_phase`——同一条
+    修复链不会再有第二次评审；`review_enabled=false` 只影响 legacy。
+  - **启动清扫隔离**：agora 模式跳过启动期全局 `git worktree prune`/评审
+    worktree 清扫——仓下 worktree 归 agora 服务（env）与其它实例所有，全局
+    清扫违反「多实例只清自身环境」；legacy 行为不变。
+  - **心跳/汇报口径**：心跳评论显示 agora 任务 state/delivery.status；终态
+    后 worker 结构化报告原样回评（含坑位行），报告缺失只发事实型说明。
+  - **暂停/关单语义**：暂停不取消在飞任务（monitor 照常完成交付）；关单＝
+    终态暂停——不调 task_cancel，在飞任务跑完并照常外部交付，重开恢复路由。
+
+
 ## 本实例绑定与已知限制
 
 - **canonical 路径钉定**：本实例只接受 `.issue-agent.json` 钉定的 canonical_path 仓库路径。

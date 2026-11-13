@@ -3258,3 +3258,162 @@ def test_relay_rejected_non_terminal_keeps_pending(tmp_path, monkeypatch):
         assert h.entry(7)["agora_task_id"] == "ag-123", "登记不覆盖"
     finally:
         h.orch.stop()
+
+
+# --- Task 6: legacy isolation anchors (计划「Task 6」Step 1) ---------------------
+
+
+class LifecycleAgoraClient(FakeAgoraClient):
+    """交付生命周期替身（Task 6 锚例）：在 FakeAgoraClient（建单幂等/
+    doctor/post）之上镜像 board/deliver/check_mail 的 wire 语义——任务行可
+    脚本化置 done+awaiting_external，deliver(delivered)→closed/delivered；
+    worker 报告经 check_mail 一次性送达（拉取即送达）。"""
+
+    def __init__(self, report="根因：竞态窗口\n改动：x.py\n坑位：替身测试勿信"):
+        super().__init__()
+        self.report = report
+        self.rows = {}    # tid -> board task 行（create 时建档）
+        self.mail = []    # 待送达 worker 消息
+        self.deliver_calls = []
+
+    def create_task(self, **kwargs):
+        tid = super().create_task(**kwargs)
+        self.rows.setdefault(tid, {
+            "state": "running",
+            "delivery": {"mode": "external_branch", "status": "pending",
+                         "commit": None, "base": None, "attempt": 0,
+                         "error": None}})
+        return tid
+
+    def board(self, tid):
+        row = self.rows.get(tid)
+        if row is None:
+            raise AgoraRejected(f"unknown task {tid} (fake)")
+        return {"task": json.loads(json.dumps(row)), "events": []}
+
+    def check_mail(self):
+        got, self.mail = self.mail, []
+        return got
+
+    def poll_interval(self):
+        return 15.0  # 真实 monitor 轮询线程的节拍面（防线程异常刷屏）
+
+    def deliver(self, tid, outcome, commit, base=None, reason=""):
+        self.deliver_calls.append({"task": tid, "outcome": outcome,
+                                   "commit": commit, "base": base,
+                                   "reason": reason})
+        row = self.rows[tid]
+        delivery = row["delivery"]
+        if outcome == "delivered":
+            delivery.update(status="delivered", commit=commit)
+            row["state"] = "closed"
+        else:
+            raise AgoraRejected(f"unsupported outcome {outcome!r} (fake)")
+        return {"ok": True, "outcome": outcome}
+
+
+def complete_external_task(harness, client, *, iid=7, tid="ag-123",
+                           worker_env=None):
+    """模拟 agora worker 完成外部任务（Task 6 锚例的 complete_external_task）：
+    done 前在 env 恰写一次评审锚（agora 六闸契约——review_loop_invocations
+    的那一次）、留一条结构化最终报告 note，任务行置 done+awaiting_external；
+    随后驱动 monitor 一轮 poll 走完 issue-agent 侧推送→delivered ack→报告
+    回评→名额释放。返回 (handoff commit, worker 侧锚写入次数)。"""
+    handoff = "a" * 40
+    anchor = Path(worker_env or harness.state_path.parent) \
+        / "worker-env" / ".review-loop" / ".last-reviewed"
+    anchor.parent.mkdir(parents=True, exist_ok=True)
+    anchor.write_text(handoff, encoding="utf-8")
+    anchor_writes = 1
+    client.mail.append({"id": 1, "ts": 0, "task": tid, "kind": "note",
+                        "from": tid, "to": "dispatcher",
+                        "body": client.report})
+    client.rows[tid] = {"state": "done",
+                        "delivery": {"mode": "external_branch",
+                                     "status": "awaiting_external",
+                                     "commit": handoff, "base": None,
+                                     "attempt": 1, "error": None}}
+    harness.orch.agora_monitor.poll_once()
+    return handoff, anchor_writes
+
+
+def test_agora_mode_runs_review_once_and_never_calls_legacy_review_phase(
+        tmp_path, monkeypatch):
+    """计划锚例（Task 6）：complete_external_task 全程——评审恰一次
+    （worker done 前的锚×1；issue-agent 侧 legacy _run_review_phase 与
+    review# 会话必须为零＝不出现第二次评审），默认分支零接触（真实 git
+    SHA 断言在 tests/test_agora_e2e.py；替身面以 gitop_argv==[]＋推送仅
+    issue/<iid>-fix 锁定）。"""
+    from agora_monitor import AgoraMonitor
+
+    journal = []
+    client = LifecycleAgoraClient()
+    router_ = FakeRouter()
+    monitor = AgoraMonitor(client=client, journal=journal.append, max_active=1)
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    phase_calls = []
+    real_phase = orchestrator.Orchestrator._run_review_phase
+
+    def spying_phase(self, *args, **kwargs):
+        phase_calls.append(args)
+        return real_phase(self, *args, **kwargs)
+
+    monkeypatch.setattr(orchestrator.Orchestrator, "_run_review_phase",
+                        spying_phase)
+    verified_pushes = []
+
+    def fake_push_verified(repo, iid, commit, remote_url, ssl_verify=True):
+        verified_pushes.append((int(iid), commit))
+        return "ok"
+
+    monkeypatch.setattr(gitop, "push_verified_commit", fake_push_verified)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        assert monitor.active_task(7) == "ag-123"
+
+        handoff, anchor_writes = complete_external_task(
+            h, client, iid=7, tid="ag-123",
+            worker_env=tmp_path / "env")
+
+        review_sessions = len([c for c in h.runner.new_calls
+                               if str(c.get("title", "")).startswith("review#")])
+        review_loop_invocations = anchor_writes + review_sessions \
+            + len(phase_calls)
+        assert review_loop_invocations == 1, \
+            "评审恒一次：worker 锚恰一次，issue-agent 不得再跑第二次评审"
+        assert phase_calls == [], "legacy _run_review_phase 零调用"
+        assert h.runner.new_calls == [] and h.runner.cont_calls == [], \
+            "legacy opencode run 零调用"
+        assert verified_pushes == [(7, handoff)], \
+            "外部推送只认在案 handoff、只落 issue/<iid>-fix"
+        assert h.gitop.push_calls == [], "legacy push 族零调用"
+        assert h.gitop_argv == [], "零裸 git 操作（默认分支零接触的替身面）"
+        assert h.entry(7)["delivery_commit"] == handoff
+        assert h.entry(7)["agora_status"] == "closed/delivered"
+        assert any("坑位：替身测试勿信" in b for _, b in h.api.posts), \
+            "最终报告回评须原样保留坑位行"
+        assert monitor.active_task(7) is None, "delivered 终局释放名额"
+    finally:
+        h.orch.stop()
+
+
+def test_agora_outage_does_not_fallback_to_legacy_runner(tmp_path, monkeypatch):
+    """计划锚例（Task 6）：agora 整体不可用 → handle_event(新 issue) →
+    legacy opencode run 调用==0、issue_entry.agora_pending is True（保留
+    待派发重试；禁自动降级 legacy——超时后实际已建单会造成双 worker）。"""
+    client = FakeAgoraClient()
+    client.doctor_result = AgoraUnavailable("agora outage (fake)")
+    h = agora_harness(tmp_path, monkeypatch, client=client)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: h.entry(7)["agora_pending"] is True), \
+            h.journal_msgs
+        assert h.runner.new_calls == [] and h.runner.cont_calls == [], \
+            "agora 不可用时 legacy opencode run 调用必须为零"
+        assert h.entry(7)["agora_pending"] is True
+        assert h.entry(7)["status"] == "pending", "claim 留存待重试"
+        assert client.created_ids == []
+    finally:
+        h.orch.stop()

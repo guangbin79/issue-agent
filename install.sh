@@ -49,6 +49,13 @@
 #         service_name    实例名（默认 canonical_path 末段目录名小写化
 #                         + "-issue-agent"；小写化是不变量）
 #         verify_command  项目门禁命令（默认通用措辞）
+#         agora           可选节点 {"execution_mode": "agora", "router_model":
+#                         "<providerID/modelID>", "agora_home": "<绝对路径>",
+#                         "agora_poll_interval": 15}——execution_mode 缺省
+#                         legacy 且一个 agora 键都不写进 config（legacy 部署
+#                         config 面零变化）；agora 模式要求 router_model 与
+#                         agora_home 非空（离线先拒），其提交经 agora worker
+#                         外部交付，启用/回滚见 README「agora 模式」
 #
 # ---- 环境变量面（沿用既有命名，新增三枚必填项的 env 直通）---------------------
 #   ISSUE_AGENT_API_BASE / ISSUE_AGENT_PAT / ISSUE_AGENT_CALLBACK_URL /
@@ -57,6 +64,9 @@
 #   ISSUE_AGENT_PORT / ISSUE_AGENT_DEFAULT_BRANCH /
 #   ISSUE_AGENT_CANONICAL_PATH / ISSUE_AGENT_IDENTITY / ISSUE_AGENT_OUT_OF_SCOPE
 #   （OUT_OF_SCOPE 用逗号分隔多个项）
+#   ISSUE_AGENT_EXECUTION_MODE / ISSUE_AGENT_ROUTER_MODEL /
+#   ISSUE_AGENT_AGORA_HOME / ISSUE_AGENT_AGORA_POLL_INTERVAL（agora 节同名字段
+#   的 env 直通，env 胜出；重装未提供时保留既有 config 的 agora 键）
 #   ISSUE_AGENT_CANONICAL_REPO 为旧测试专用钉定覆盖，保留兼容。
 #   Legacy ISSUE_AGENT_WORKTREE / ISSUE_AGENT_WORKTREE_PATH 被接受但忽略
 #   （worktree 现在完全是 agent 自己的事）。
@@ -284,6 +294,20 @@ vars_ = {"canonical_path": "CANONICAL_JSON", "default_branch": "BRANCH_JSON",
          "verify_command": "VERIFY_JSON"}
 for key in keys:
     print(f"{vars_[key]}={grab(key)}")
+# agora 节（计划 Task 6）：可选 {"execution_mode": "agora", "router_model":
+# ..., "agora_home": ..., "agora_poll_interval": N}——env 同名直通优先。
+agora = raw.get("agora")
+if not isinstance(agora, dict):
+    agora = {}
+names = {"execution_mode": "MODE_JSON", "router_model": "ROUTER_MODEL_JSON",
+         "agora_home": "AGORA_HOME_JSON",
+         "agora_poll_interval": "AGORA_POLL_JSON"}
+for key, var in names.items():
+    v = agora.get(key)
+    if isinstance(v, bool) or isinstance(v, (list, tuple, dict)):
+        v = None  # 非标量按缺省（config.py 侧自有强校验兜底）
+    q = shlex.quote(str(v)) if v else "''"
+    print(f"{var}={q}")
 EOF
 )"
 
@@ -328,6 +352,18 @@ env_over_json ISSUE_AGENT_DEFAULT_BRANCH "$BRANCH_JSON" default_branch
 # (IDENTITY/OUT_OF_SCOPE keep their env > json resolution above; the json
 # fallbacks VERIFY_COMMAND has no env passthrough.)
 VERIFY_COMMAND="${VERIFY_JSON}"
+
+# agora 模式四配置项（计划 Task 6）：env > .issue-agent.json 的 agora 节 >
+# 既有 config（重装合并，见下方 OLD_* 读取）。execution_mode 缺省 legacy；
+# 不显式启用则一个 agora 键都不写——legacy 部署 config 面零变化。
+EXECUTION_MODE="${ISSUE_AGENT_EXECUTION_MODE:-${MODE_JSON:-}}"
+ROUTER_MODEL="${ISSUE_AGENT_ROUTER_MODEL:-${ROUTER_MODEL_JSON:-}}"
+AGORA_HOME_CFG="${ISSUE_AGENT_AGORA_HOME:-${AGORA_HOME_JSON:-}}"
+AGORA_POLL="${ISSUE_AGENT_AGORA_POLL_INTERVAL:-${AGORA_POLL_JSON:-}}"
+env_over_json ISSUE_AGENT_EXECUTION_MODE "$MODE_JSON" execution_mode
+env_over_json ISSUE_AGENT_ROUTER_MODEL "$ROUTER_MODEL_JSON" router_model
+env_over_json ISSUE_AGENT_AGORA_HOME "$AGORA_HOME_JSON" agora_home
+env_over_json ISSUE_AGENT_AGORA_POLL_INTERVAL "$AGORA_POLL_JSON" agora_poll_interval
 
 # B5: reject garbage SERVICE_NAME up front, fully offline — stray
 # characters in SERVICE_NAME corrupt every derived path and the systemd
@@ -386,6 +422,7 @@ fi
 # 复用既有 config 的 pat/api_base（仅 env 未提供时；guard b 已确认同钉定）：
 # 重装/迁移免重输密钥，stderr 记录复用事实。
 OLD_API_BASE=""; OLD_PAT=""; OLD_CB=""; OLD_PORT=""
+OLD_MODE=""; OLD_ROUTER=""; OLD_AHOME=""; OLD_APOLL=""
 if [ -f "$CONFIG_FILE" ]; then
   eval "$(config_file="$CONFIG_FILE" python3 - 2>/dev/null <<'EOF' || true
 import json, os, shlex
@@ -394,7 +431,11 @@ try:
 except Exception:
     c = {}
 for key, field in (("UIA_API_BASE", "api_base"), ("UIA_PAT", "pat"),
-                   ("UIA_CB", "callback_url"), ("UIA_PORT", "port")):
+                   ("UIA_CB", "callback_url"), ("UIA_PORT", "port"),
+                   ("UIA_MODE", "execution_mode"),
+                   ("UIA_ROUTER", "router_model"),
+                   ("UIA_AHOME", "agora_home"),
+                   ("UIA_APOLL", "agora_poll_interval")):
     print(f"{key}={shlex.quote(str(c.get(field, '') or ''))}")
 EOF
 )"
@@ -402,6 +443,29 @@ EOF
   OLD_PAT="${UIA_PAT:-}"
   OLD_CB="${UIA_CB:-}"
   OLD_PORT="${UIA_PORT:-}"
+  OLD_MODE="${UIA_MODE:-}"
+  OLD_ROUTER="${UIA_ROUTER:-}"
+  OLD_AHOME="${UIA_AHOME:-}"
+  OLD_APOLL="${UIA_APOLL:-}"
+fi
+
+# agora 有效值＝env > json > 既有 config；强校验镜像 config.py（离线先死，
+# 先于任何网络探测/PAT 步骤）：execution_mode 只认 legacy/agora、agora 模式
+# 必须 router_model＋agora_home 齐、poll interval ≥1。legacy 对四字段全容忍。
+EFFECTIVE_MODE="${EXECUTION_MODE:-${OLD_MODE:-legacy}}"
+case "$EFFECTIVE_MODE" in
+  legacy|agora) ;;
+  *) die "execution_mode 须为 legacy 或 agora（ISSUE_AGENT_EXECUTION_MODE / .issue-agent.json agora 节），当前：${EFFECTIVE_MODE}" ;;
+esac
+if [ "$EFFECTIVE_MODE" = "agora" ]; then
+  [ -n "${ROUTER_MODEL:-$OLD_ROUTER}" ] || die "execution_mode=agora 缺 router_model（ISSUE_AGENT_ROUTER_MODEL 或 .issue-agent.json 的 agora 节）"
+  [ -n "${AGORA_HOME_CFG:-$OLD_AHOME}" ] || die "execution_mode=agora 缺 agora_home（ISSUE_AGENT_AGORA_HOME 或 .issue-agent.json 的 agora 节）"
+fi
+if [ -n "$AGORA_POLL" ]; then
+  case "$AGORA_POLL" in
+    ''|*[!0-9]*) die "agora_poll_interval 须为 ≥1 的整数秒（ISSUE_AGENT_AGORA_POLL_INTERVAL / .issue-agent.json agora 节），当前：${AGORA_POLL}" ;;
+  esac
+  [ "$AGORA_POLL" -ge 1 ] || die "agora_poll_interval 须为 ≥1 的整数秒，当前：${AGORA_POLL}"
 fi
 
 # validate_port：垃圾值即 die；stdout 输出规范化端口（去前导零，保证注册
@@ -598,6 +662,12 @@ SSL_EXPLICIT=$([ -n "${ISSUE_AGENT_SSL_VERIFY:-}" ] && echo 1 || echo 0)
 BRANCH_EXPLICIT=$([ -n "${ISSUE_AGENT_DEFAULT_BRANCH:-}" ] || [ -n "$BRANCH_JSON" ] && echo 1 || echo 0)
 VERIFY_EXPLICIT=$([ -n "$VERIFY_JSON" ] && echo 1 || echo 0)
 MP_EXPLICIT=$([ -n "${ISSUE_AGENT_MAX_PARALLEL:-}" ] && echo 1 || echo 0)
+# agora 四键只在本次显式提供时写入（legacy 部署 config 面零变化）；未提供
+# 时既有 config 的 agora 键经下方 unknown-key 存活规则原样保留（重装合并）。
+MODE_EXPLICIT=$([ -n "${ISSUE_AGENT_EXECUTION_MODE:-}" ] || [ -n "$MODE_JSON" ] && echo 1 || echo 0)
+ROUTER_EXPLICIT=$([ -n "${ISSUE_AGENT_ROUTER_MODEL:-}" ] || [ -n "$ROUTER_MODEL_JSON" ] && echo 1 || echo 0)
+AHOME_EXPLICIT=$([ -n "${ISSUE_AGENT_AGORA_HOME:-}" ] || [ -n "$AGORA_HOME_JSON" ] && echo 1 || echo 0)
+APOLL_EXPLICIT=$([ -n "${ISSUE_AGENT_AGORA_POLL_INTERVAL:-}" ] || [ -n "$AGORA_POLL_JSON" ] && echo 1 || echo 0)
 
 api_base="$API_BASE" pat="$PAT" repo="$CANONICAL" cb="$CALLBACK_URL" \
   secret="$SECRET" port="$PORT" ssl_verify="${ISSUE_AGENT_SSL_VERIFY:-false}" \
@@ -605,9 +675,13 @@ api_base="$API_BASE" pat="$PAT" repo="$CANONICAL" cb="$CALLBACK_URL" \
   max_parallel="${ISSUE_AGENT_MAX_PARALLEL:-1}" \
   service_name="$SERVICE_NAME" canonical="$CANONICAL" identity="$IDENTITY" \
   out_of_scope="$OUT_OF_SCOPE" verify_command="$VERIFY_COMMAND" \
+  execution_mode="$EXECUTION_MODE" router_model="$ROUTER_MODEL" \
+  agora_home="$AGORA_HOME_CFG" agora_poll_interval="$AGORA_POLL" \
   old_config="$CONFIG_FILE" cb_explicit="$CB_EXPLICIT" ssl_explicit="$SSL_EXPLICIT" \
   branch_explicit="$BRANCH_EXPLICIT" verify_explicit="$VERIFY_EXPLICIT" \
-  mp_explicit="$MP_EXPLICIT" \
+  mp_explicit="$MP_EXPLICIT" mode_explicit="$MODE_EXPLICIT" \
+  router_explicit="$ROUTER_EXPLICIT" ahome_explicit="$AHOME_EXPLICIT" \
+  apoll_explicit="$APOLL_EXPLICIT" \
   python3 - <<'EOF'
 import json, os, sys
 from pathlib import Path
@@ -630,6 +704,19 @@ cfg = {
     "max_parallel": int(os.environ["max_parallel"]),
     "worktree_path": "",  # deprecated: kept for schema compat, always empty
 }
+# agora 四键（计划 Task 6）：仅显式提供才写；poll interval 走 int 强转
+# （上方 shell 面已挡非正整数，坏类型在此按缺省丢弃而非崩溃）。
+if os.environ["mode_explicit"] == "1" and os.environ["execution_mode"]:
+    cfg["execution_mode"] = os.environ["execution_mode"]
+if os.environ["router_explicit"] == "1" and os.environ["router_model"]:
+    cfg["router_model"] = os.environ["router_model"]
+if os.environ["ahome_explicit"] == "1" and os.environ["agora_home"]:
+    cfg["agora_home"] = os.environ["agora_home"]
+if os.environ["apoll_explicit"] == "1" and os.environ["agora_poll_interval"]:
+    try:
+        cfg["agora_poll_interval"] = int(os.environ["agora_poll_interval"])
+    except ValueError:
+        pass
 # F-merge: reinstall must not silently rewrite tuned/custom fields. cfg
 # already holds this run's explicit input (env/json) or built-in defaults;
 # fields whose only source is a default keep the existing config's value,
@@ -907,4 +994,6 @@ if [ "$svc_active" = "active" ]; then
   fi
   note "服务已重启以加载更新后的快照"
 fi
-note "安装完成：${SERVICE_NAME}.service 已 active（端口 ${PORT}）；项目 ${PROJECT}；默认分支 ${DEFAULT_BRANCH}；回调 ${CALLBACK_URL}"
+MODE_NOTE=""
+if [ "$EFFECTIVE_MODE" = "agora" ]; then MODE_NOTE="；执行模式 agora"; fi
+note "安装完成：${SERVICE_NAME}.service 已 active（端口 ${PORT}）；项目 ${PROJECT}；默认分支 ${DEFAULT_BRANCH}；回调 ${CALLBACK_URL}${MODE_NOTE}"

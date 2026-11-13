@@ -206,6 +206,46 @@ bash install.sh        # 卸载/排障带同名变量：uninstall.sh、journalct
 - **无常驻 worktree**：安装/卸载不再创建或删除任何 worktree；卸载只做 best-effort `git worktree prune`。启动期自动清扫：daemon 启动时在 prune 之后、监听端口之前，按四重谓词安全收走空闲残留——同级 `<项目>__wt-*` 命名＋检出 `issue/N-fix` 分支＋无进程 cwd 占用（删前复探）＋工作树干净（git 自带脏检查，无 `--force`）。脏/占用残留不被清扫，journal 记 `startup: worktree kept (dirty/busy): <路径>`，仍需手工处理（`git worktree remove --force` 仅限未跟踪构建产物；出现 M/D 跟踪改动先人工判断）。
   - 限度：① 运行期被杀会话（超时/重启）的残留要等 daemon 下次重启的清扫才收；② 启动清扫与人工 TUI 回合建 worktree 存在秒级竞态窗口（删前复探缓解、非零）；③ 超时击杀且含未跟踪门禁产物（build.log/build.exit/ctest.log）的 worktree 因「干净才删」决策不被启动清扫，需手工清理。
 - **回退**：无。旧的 `ISSUE_AGENT_WORKTREE=0` 直作模式已随本架构移除（该变量现为无效输入）。
+- **agora 模式例外**：agora 实例的 env 本身就是 `<项目>__wt-*` worktree（服务属主），故 agora 模式 daemon **跳过**上述启动期全局 prune/清扫——多实例只清自身环境（设计 §11.5）；legacy 实例不受影响。
+
+## 13. agora 模式部署（清单与试点）
+
+execution_mode=agora 把本实例的 worker 面交给同机已部署的 agora 服务（交付语义/行为差异见 README「agora 模式」节）。受控试点由人执行，本节是清单。
+
+### 部署前置清单（逐项核对）
+
+1. **agorad 实例已在跑**：目标 `AGORA_HOME` 下 `.agora/service.json`（port）与 `.agora/root.token` 就位（agorad F94–F103 及以后版本；含 external_branch 交付、client_key 幂等建单、多实例隔离——同仓协作的旧版本实例须先全部升级）。自检：`curl -s -X POST -H "X-Agora-Token: $(cat $AGORA_HOME/.agora/root.token)" -d '{}' http://127.0.0.1:<port>/doctor` 应 200 且 models 清单含 router_model。
+2. **router_model 已定**：`providerID/modelID` 全名，且出现在 doctor 的可用模型清单里（Router 自身的模型；worker 模型由 Router 逐任务决策）。
+3. **verify_command 非空且可信**：agora 模式强校验——验收命令只能来自实例配置（`.issue-agent.json` 的 verify_command），不得由 issue 文本或 LLM 生成。
+4. **Gitea PAT 权限同 legacy**（issue 读写＋仓库推送）；PAT 仍只留 issue-agent，agora 侧零 PAT。
+5. **默认分支保护已开**：机器人仍零合并权，人工 PR 是唯一入默认分支路径。
+
+### 启用（一条命令）
+
+`.issue-agent.json` 加 agora 节后重跑 `install.sh`（或用等价 `ISSUE_AGENT_EXECUTION_MODE` / `ISSUE_AGENT_ROUTER_MODEL` / `ISSUE_AGENT_AGORA_HOME` / `ISSUE_AGENT_AGORA_POLL_INTERVAL` 环境变量；缺 router_model/agora_home 会在离线阶段直接拒绝）：
+
+```json
+{ "canonical_path": "...", "identity": "...", "out_of_scope": ["..."],
+  "agora": {"execution_mode": "agora", "router_model": "zai-coding-plan/glm-5.3",
+            "agora_home": "/home/<user>/plaza", "agora_poll_interval": 15} }
+```
+
+启动 journal 应见 `startup: agora mode skips global worktree prune/sweep`；建单后 `journalctl --user -u <service>-issue-agent` 依次出现 `turn: issue#N start (..., agora)` → `agora-monitor: recovered/delivery` 类日志。
+
+### 回滚
+
+```bash
+ISSUE_AGENT_EXECUTION_MODE=legacy bash install.sh   # 或改 .issue-agent.json 后重跑
+```
+
+切回即回滚：daemon 回到本地 worker 路径与启动清扫，`router_model`/`agora_home` 成死键留存（legacy 侧全容忍）。**注意**：在飞 agora 任务不因回滚消失——已建任务由该 agorad 照常跑完，但 issue-agent 停止轮询交付（`awaiting_external` 的 commit 需人工确认或切回 agora 收口）；agora 故障期间**绝不自动双跑**，issue 保留待派发直到服务恢复。
+
+### 试点步骤（受控，由人执行）
+
+1. 选**一个非生产实例**启用；基线全量自检：`python3 -m pytest tests/ -q`＋`bash tests/test_install.sh`（含真实 agorad 临时实例的 `tests/test_agora_e2e.py` 四场景：全链交付/non_ff 换基/重启恢复/create 后崩溃恢复）。
+2. 建首批 3–5 个真实 issue（混合简单/复杂），观察一个完整周期：Router 决策质量、一次通过率、返修次数、人工接管率、交付准确性（`issue/<iid>-fix` 落点与非 force 精确推送）、模型成本。
+3. 压一夜稳态：重启 daemon 一次验证 awaiting_external 恢复不重复建单；人为停 agorad 验证 issue 停在待派发（不降级 legacy）后恢复续跑。
+4. 对照同窗口 legacy 实例的通过率与成本；结论写入试点记录，达标后再逐实例推广（回滚面保持随时可用）。
 
 ---
 *生成于 <项目> 项目落地实战：13 任务计划、双轮对抗评审、两轮全链路 e2e、拒收验证与 webhook 秒级调通，全过程证据见 `.omo/evidence/gitlab-issue-agent/`（27+ 份）。*
