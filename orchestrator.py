@@ -325,7 +325,13 @@ class Orchestrator:
         worker LAST. The listener only enqueues, so events queue up during
         the reconcile and are consumed after the baseline snapshot — the
         advisory-2 ordering (snapshot before any webhook consumption) holds.
+
+        agora monitor FIRST（ocr R1 #1）：monitor.start() 内含账本恢复——
+        必须先于 listener/baseline reconcile 的评论重放，否则重启窗口内
+        注册表为空、直通门控失灵，会为在飞任务重复建单。
         """
+        if self.agora_monitor is not None:
+            self.agora_monitor.start()
         self._startup_orphan_cleanup()
         port = self.listener.start()
         # D1: the startup reconcile is the one call not yet behind a guard —
@@ -347,8 +353,6 @@ class Orchestrator:
             self._sweep_thread = threading.Thread(
                 target=self._sweep_loop, name="issue-agent-sweep", daemon=True)
             self._sweep_thread.start()
-        if self.agora_monitor is not None:
-            self.agora_monitor.start()
         self._journal(f"startup: listener up (port={port}), baseline reconciled, "
                       f"workers running (max_parallel={self.max_parallel})")
         return port
@@ -2083,6 +2087,24 @@ class Orchestrator:
             # last_note_id（同 note 重放＝同 key，服务端幂等取回原任务）。
             note_id = entry.get("last_note_id")
             state.save_state(self.state_path, ledger)
-        self._run_turn(iid, message=RETRY_MESSAGE, title=f"issue#{iid}: retry"[:40],
+        message = RETRY_MESSAGE
+        if self.agora_client is not None and note_id is not None:
+            # ocr R1 #2：重试转达原评论正文（直通 worker 的留言不得被
+            # RETRY_MESSAGE 顶替——「绝不丢评论」）；取不到再降级。
+            message = self._note_body(iid, note_id) or RETRY_MESSAGE
+        self._run_turn(iid, message=message, title=f"issue#{iid}: retry"[:40],
                        session_id=session_id, action="continue",
                        note_id=note_id)
+
+    def _note_body(self, iid, note_id):
+        """按 note id 取回评论正文（agora 重试的直通保真）；失败返回
+        None 交调用方降级 RETRY_MESSAGE（best-effort，绝不抛）。"""
+        try:
+            comments = self.api.list_issue_comments(self.project, int(iid))
+        except Exception as exc:
+            self._journal(f"requeue: issue#{iid} note fetch failed: {exc!r}")
+            return None
+        for comment in comments:
+            if comment.get("id") == int(note_id):
+                return comment.get("body")
+        return None

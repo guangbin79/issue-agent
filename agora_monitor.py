@@ -397,9 +397,14 @@ class AgoraMonitor:
                 or delivery.get("status") == "delivered":
             if delivery.get("commit") in (None, commit):
                 self._record_delivery_commit(iid, commit)
-            # ack 成功即服务端收口事实（board 权威，此处免再读一轮）
-            self._sync_agora_status(iid, "closed/delivered")
-            self._report_comment(iid, tid, commit)
+            # ack 成功即服务端收口事实（board 权威，此处免再读一轮）；
+            # board 快照若已给出终态则照抄（ocr R1 #4：merged 不得记成
+            # closed），报告 commit 提示以 board 在案为准。
+            board_state = task.get("state")
+            status = f"{board_state}/delivered" \
+                if board_state in _TERMINAL_STATES else "closed/delivered"
+            self._sync_agora_status(iid, status)
+            self._report_comment(iid, tid, delivery.get("commit") or commit)
             self.release(iid, tid)
             return
         self._journal(f"agora-monitor: issue#{iid} board moved after "
@@ -428,6 +433,9 @@ class AgoraMonitor:
         if delivery.get("status") == "delivered" and attempted \
                 and delivery.get("commit") == attempted:
             self._record_delivery_commit(iid, attempted)
+            # ocr R1 #3：board 确认交付必须回评报告——release 后无人再
+            # 轮询，静默释放会让汇报丢到重启。
+            self._report_comment(iid, tid, attempted)
             self.release(iid, tid)
             return
         # 仍 awaiting_external（同 commit＝未处理，异 commit＝已轮转）或
@@ -520,12 +528,18 @@ class AgoraMonitor:
         （毒消息不得无限重放，也不得拖垮同批其他任务的消息）。"""
         remaining = list(messages)
         for message in messages:
-            try:
-                self._process_message(message)
-            except Exception as exc:
-                self._journal(f"agora-monitor: mail message "
-                              f"{message.get('id')!r} processing failed: "
-                              f"{exc!r}")
+            if not isinstance(message, dict):
+                # ocr R1 #5：非对象毒元素在此丢弃——except 处理器自身的
+                # message.get 再抛会中断整批一轮
+                self._journal(f"agora-monitor: non-object mail message "
+                              f"dropped: {message!r}")
+            else:
+                try:
+                    self._process_message(message)
+                except Exception as exc:
+                    self._journal(f"agora-monitor: mail message "
+                                  f"{message.get('id')!r} processing failed: "
+                                  f"{exc!r}")
             remaining = remaining[1:]
             state.write_json_atomic(self._mail_path(),
                                     {"pending": remaining})

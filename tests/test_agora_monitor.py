@@ -915,3 +915,64 @@ def test_heartbeat_reports_agora_board_state(tmp_path, monkeypatch):
     monitor.poll_once()  # 间隔未到：不重复刷屏
     assert len(face.posts) == 1
 
+
+# --- agora review round 1 fixes (ocr 035ba80a) ----------------------------------
+
+
+def test_ack_rejected_board_delivered_still_posts_report(
+        tmp_path, monkeypatch):
+    """ocr R1 #3：deliver ack 被拒但对账见 done+delivered（同 commit）——
+    记 delivery_commit 之外必须照常回评报告，不得静默释放（释放后无人
+    再轮询，汇报会丢到重启）。"""
+    commit = hex40("a")
+    client = FakeAgoraClient(commit=commit)
+    original_deliver = client.deliver
+
+    def flip_and_reject(tid, outcome, c, base=None, reason=""):
+        client.deliver_calls.append({"task": tid, "outcome": outcome,
+                                     "commit": c, "base": base,
+                                     "reason": reason})
+        # 服务端已按本次 ack 收口，但回包被拒（stale 竞态模拟）
+        client.tasks[tid]["delivery"].update(status="delivered",
+                                             local_status="not_required")
+        raise AgoraRejected("stale (fake)")
+
+    client.deliver = flip_and_reject
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    assert entry(state_path)["delivery_commit"] == commit
+    assert monitor.tasks() == []
+    assert len(face.posts) == 1, "对账确认交付后必须回评报告"
+    assert TID in face.posts[0][1]
+    # 重放（重启后误登记）不得重复回评
+    monitor.register(7, TID)
+    client.deliver = original_deliver
+    monitor.poll_once()
+    assert len(face.posts) == 1
+
+
+def test_poison_non_object_mail_message_does_not_break_batch(
+        tmp_path, monkeypatch):
+    """ocr R1 #5：批次混入非 dict 毒元素——丢弃该元素并继续处理其余
+    消息，pending 照常排空（处理器不得因毒元素自身再抛错中断整批）。"""
+    client = FakeAgoraClient()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    client.mail = ["not-an-object",
+                   mail_msg(9, kind="note", body="毒元素后的正常汇报")]
+
+    monitor.poll_once()
+
+    assert client.check_mail_calls == 1
+    reports = json.loads(
+        Path(reports_path_of(state_path)).read_text(encoding="utf-8"))
+    assert reports["reports"][TID]["note"] == "毒元素后的正常汇报"
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] == []
+    assert any("non-object" in m or "not-an-object" in m for m in journal), \
+        journal
+

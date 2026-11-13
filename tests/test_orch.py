@@ -319,9 +319,9 @@ class FakeAgoraClient:
         self.cancel_calls = []   # task_cancel 调用记账（关单语义必须为零）
 
     def post(self, tid, kind, body):
-        self.posts.append({"task": tid, "kind": kind, "body": body})
         if self.post_failures:
-            raise self.post_failures.pop(0)
+            raise self.post_failures.pop(0)  # 未送达：不记账（先记后抛会让断言虚绿）
+        self.posts.append({"task": tid, "kind": kind, "body": body})
 
     def task_cancel(self, tid):
         self.cancel_calls.append(tid)
@@ -3162,6 +3162,65 @@ def test_close_keeps_inflight_and_reopen_restores_routing(
             comment_event(iid=7, body="重开后继续修", comment_id=103))
         assert wait_until(lambda: len(client.created_ids) == 2), h.journal_msgs
         assert client.create_calls[-1]["after"] == "ag-123", "重开恢复路由"
+    finally:
+        h.orch.stop()
+
+
+# --- agora review round 1 fixes (ocr 035ba80a) ----------------------------------
+
+
+def test_monitor_recovers_before_replays_on_startup(tmp_path, monkeypatch):
+    """ocr R1 #1：monitor（内含账本恢复）必须先于 listener 与 baseline
+    reconcile 启动——重启窗口内注册表为空，停机期到达的评论会被重放并
+    绕过直通门控，为在飞任务重复建单。"""
+    class OrderMonitor(FakeMonitor):
+        shared = []  # 构造后指向 harness.order，与 listener/reconcile 共序
+
+        def start(self):
+            self.shared.append("monitor-start")
+            super().start()
+
+    monitor = OrderMonitor()
+    h = agora_harness(tmp_path, monkeypatch, monitor=monitor, start=False)
+    monitor.shared = h.order
+    try:
+        h.orch.start()
+        assert "monitor-start" in h.order
+        assert h.order.index("monitor-start") < \
+            h.order.index("listener-start"), \
+            f"monitor 必须先于 listener 启动（实际 {h.order}）"
+        assert h.order.count("monitor-start") == 1, "幂等：只启动一次"
+    finally:
+        h.orch.stop()
+
+
+def test_relay_unavailable_retry_preserves_comment_body(tmp_path,
+                                                        monkeypatch):
+    """ocr R1 #2：relay 不可达保留待派发后，重试（requeue 通道）必须转达
+    原评论正文——不得把工人可读的用户留言换成 RETRY_MESSAGE。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        h.api.issues[7] = [{"id": 102, "body": "请改用方案 B",
+                            "user": {"login": "someone"}}]
+        client.post_failures.append(AgoraUnavailable("post down (fake)"))
+        h.listener.queue.put(
+            comment_event(iid=7, body="请改用方案 B", comment_id=102))
+        assert wait_until(lambda: h.entry(7)["agora_pending"] is True), \
+            h.journal_msgs
+
+        client.post_failures.clear()
+        requeue_retry(h, 7)
+        assert wait_until(lambda: any(p["kind"] == "question"
+                                      for p in client.posts)), h.journal_msgs
+        question = client.posts[-1]  # 重试通道发出的那条
+        assert "请改用方案 B" in question["body"], \
+            "重试必须转达原评论正文，而非 RETRY_MESSAGE"
+        assert "系统重试" not in question["body"]
     finally:
         h.orch.stop()
 
