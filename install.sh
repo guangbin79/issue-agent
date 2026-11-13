@@ -296,9 +296,15 @@ for key in keys:
     print(f"{vars_[key]}={grab(key)}")
 # agora 节（计划 Task 6）：可选 {"execution_mode": "agora", "router_model":
 # ..., "agora_home": ..., "agora_poll_interval": N}——env 同名直通优先。
-agora = raw.get("agora")
-if not isinstance(agora, dict):
+node = raw.get("agora")
+if node is None:
     agora = {}
+elif isinstance(node, dict):
+    agora = node
+else:
+    # 节本身误型（字符串/布尔/数组）——不得静默按「无节点」落 legacy（与
+    # 字段级误型同原则），发哨值交 shell 面离线拒。
+    agora = {"execution_mode": f"__AGORA_BAD_TYPE__({type(node).__name__}-node)"}
 names = {"execution_mode": "MODE_JSON", "router_model": "ROUTER_MODEL_JSON",
          "agora_home": "AGORA_HOME_JSON",
          "agora_poll_interval": "AGORA_POLL_JSON"}
@@ -439,20 +445,23 @@ try:
     c = json.load(open(os.environ["config_file"]))
 except Exception:
     c = {}
-for key, field, keep_raw in (
-        ("UIA_API_BASE", "api_base", False), ("UIA_PAT", "pat", False),
-        ("UIA_CB", "callback_url", False), ("UIA_PORT", "port", False),
-        ("UIA_MODE", "execution_mode", False),
-        ("UIA_ROUTER", "router_model", False),
-        ("UIA_AHOME", "agora_home", False),
-        ("UIA_APOLL", "agora_poll_interval", True),
-        ("UIA_VERIFY", "verify_command", False)):
-    # keep_raw（poll 整数字段）：falsy-but-present（0/False）不得被 `or ""`
-    # 抹掉——手编 0 必须进入 shell 面校验离线拒（config.py 无条件最小值 1）。
-    # 字符串字段维持 falsy→缺席：与 config.py 的 `or ""` 归一同口径。
+for key, field, mode in (
+        ("UIA_API_BASE", "api_base", "legacy"), ("UIA_PAT", "pat", "legacy"),
+        ("UIA_CB", "callback_url", "legacy"), ("UIA_PORT", "port", "legacy"),
+        ("UIA_MODE", "execution_mode", "str"),
+        ("UIA_ROUTER", "router_model", "str"),
+        ("UIA_AHOME", "agora_home", "str"),
+        ("UIA_APOLL", "agora_poll_interval", "raw"),
+        ("UIA_VERIFY", "verify_command", "str")):
+    # 三口径：legacy＝历史 falsy→缺席（字节不变）；str＝与 config 写面的
+    # 类型门同口径（非字符串按缺席——否则 str(5) 的假真值会骗过离线门，
+    # 而写面随后把它类型丢弃成空值＝崩溃循环）；raw＝保真（poll 的 0/False
+    # 必须进 shell 面校验离线拒）。
     v = c.get(field)
-    if not keep_raw:
+    if mode == "legacy":
         v = v or ""
+    elif mode == "str":
+        v = v if isinstance(v, str) else ""
     print(f"{key}={shlex.quote(str(v) if v is not None else '')}")
 EOF
 )"
