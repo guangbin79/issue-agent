@@ -195,7 +195,8 @@ class Orchestrator:
                  worktree_path: str = "",
                  teardown: Optional[Callable[[], None]] = None,
                  agora_client=None,
-                 router=None):
+                 router=None,
+                 ledger_lock=None):
         self.project = project
         self.api = api
         self.listener = listener
@@ -256,8 +257,11 @@ class Orchestrator:
         self.router = router
         self.max_parallel = max(1, int(max_parallel))
         # ledger lock: every load-mutate-save sequence (and decide+claim) runs
-        # under it, so worker and a concurrent reconcile never interleave writes.
-        self._ledger_lock = threading.Lock()
+        # under it, so worker and a concurrent reconcile never interleave
+        # writes. daemon（agora 模式）注入与 SemanticRouter persist 共用的
+        # 同一把可重入锁——Router 落 sid 与本类写账本互斥（计划 Task 2）。
+        self._ledger_lock = (ledger_lock if ledger_lock is not None
+                             else threading.Lock())
         # bounded turn slots + per-issue locks replace the historical process-
         # wide turn lock: at most max_parallel turns in flight, and a given
         # issue's turns never overlap (same-issue events queue behind the lock).

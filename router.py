@@ -118,9 +118,8 @@ def _validate_decision(reply_text, available_models) -> RouterDecision:
         if model not in available_models:
             raise RouterDecisionError(
                 f"dispatch model not in available models: {model!r}")
-    raw = {"schema_version": parsed.get("schema_version"),
-           "action": action, "title": title, "goal": goal,
-           "model": model, "reason": reason}
+    raw = dict(zip(DECISION_KEYS, (parsed.get("schema_version"), action,
+                                   title, goal, model, reason)))
     return RouterDecision(action=action, title=title, goal=goal, model=model,
                           reason=reason, raw=raw)
 
@@ -136,7 +135,8 @@ class SemanticRouter:
     def __init__(self, *, template_path, cwd, router_model, state_path,
                  timeout_s=runner.DEFAULT_TIMEOUT_S,
                  new_session=runner.new_session,
-                 continue_session=runner.continue_session, warn=None):
+                 continue_session=runner.continue_session, warn=None,
+                 ledger_lock=None):
         self._template = Path(template_path).read_text(encoding="utf-8")
         self._cwd = cwd
         self._model = router_model or None
@@ -145,6 +145,11 @@ class SemanticRouter:
         self._new_session = new_session
         self._continue_session = continue_session
         self._warn = warn if warn is not None else (lambda message: None)
+        # 与 orchestrator 共用的账本锁（OCR medium：persist 的
+        # load→mutate→save 若与 orchestrator 写交错会丢更新）。None＝不
+        # 加锁（测试/单进程场景）；生产接线传 orchestrator 同一把可重入锁
+        # ——Task 3 持锁调 decide 时 persist 嵌套获取不自锁。
+        self._ledger_lock = ledger_lock
         self._lock = threading.Lock()
         # 重启恢复：账本根已有 sid 则续用（会话真死了由 SessionInvalid 重建）
         self._session_id = state_mod.router_session_id(
@@ -182,6 +187,13 @@ class SemanticRouter:
         return _validate_decision(result.reply_text, available_models)
 
     def _persist_session_id(self, sid):
+        if self._ledger_lock is not None:
+            with self._ledger_lock:
+                self._persist_session_id_locked(sid)
+        else:
+            self._persist_session_id_locked(sid)
+
+    def _persist_session_id_locked(self, sid):
         ledger = state_mod.load_state(self._state_path, warn=self._warn)
         ledger[state_mod.ROUTER_SESSION_KEY] = sid
         state_mod.save_state(self._state_path, ledger)

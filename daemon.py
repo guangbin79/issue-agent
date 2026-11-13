@@ -176,13 +176,18 @@ def main(argv=None) -> int:
                     if config.execution_mode == "agora" else None)
     # 持久语义 Router（计划 Task 2）：agora 模式才构造（构造只读模板与
     # 账本，零网络；session 建立在首次 decide）；orchestrator 消费归
-    # Task 3，此处仅惰性接线。legacy 恒 None、不读模板。
+    # Task 3，此处仅惰性接线。legacy 恒 None、不读模板。ledger_lock 与
+    # orchestrator 共用（可重入：Router persist 与 orchestrator 写账本
+    # 互斥），warn 接 journal——会话重建与账本降级可诊断。
+    shared_ledger_lock = threading.RLock()
     semantic_router = (SemanticRouter(
         template_path=_PKG_DIR / "ROUTER.template.md",
         cwd=config.repo_path,
         router_model=config.router_model,
         state_path=_STATE_DIR / "state.json",
-        timeout_s=config.opencode_timeout)
+        timeout_s=config.opencode_timeout,
+        warn=journal,
+        ledger_lock=shared_ledger_lock)
         if config.execution_mode == "agora" else None)
     http_mod = _load_http_module()
     # Port: the unit's ISSUE_AGENT_PORT env wins; config.port otherwise
@@ -216,6 +221,7 @@ def main(argv=None) -> int:
         worktree_path=config.worktree_path,
         agora_client=agora_client,
         router=semantic_router,
+        ledger_lock=shared_ledger_lock,
         teardown=_teardown_self_cancel,
     )
     port = orch.start()

@@ -305,8 +305,11 @@ def test_daemon_legacy_mode_passes_none_and_never_builds_client(
 
 
 def test_daemon_agora_mode_builds_router_and_threads_it(tmp_path, monkeypatch):
-    """agora 模式：daemon 构造 SemanticRouter（模板/自身模型/账本根路径）
-    并以 router= 注入 orchestrator（消费归 Task 3，此处仅惰性接线）。"""
+    """agora 模式：daemon 构造 SemanticRouter（模板/自身模型/账本根路径/
+    共享账本锁/journal warn）并以 router= 注入 orchestrator（消费归
+    Task 3，此处仅惰性接线）。"""
+    import threading
+
     built = []
 
     class FakeRouter:
@@ -318,7 +321,13 @@ def test_daemon_agora_mode_builds_router_and_threads_it(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "SemanticRouter", FakeRouter)
     assert daemon.main() == 0
     assert len(built) == 1
-    assert built[0].kwargs == {
+    kwargs = dict(built[0].kwargs)
+    shared_lock = kwargs.pop("ledger_lock")
+    warn = kwargs.pop("warn")
+    assert isinstance(shared_lock, type(threading.RLock())), \
+        "可重入锁：Task 3 持账本锁调 decide 时 persist 嵌套获取不自锁"
+    assert callable(warn)
+    assert kwargs == {
         "template_path": daemon._PKG_DIR / "ROUTER.template.md",
         "cwd": str(tmp_path),
         "router_model": "zai-coding-plan/glm-5.3",
@@ -326,6 +335,8 @@ def test_daemon_agora_mode_builds_router_and_threads_it(tmp_path, monkeypatch):
         "timeout_s": 1800,
     }
     assert captured["router"] is built[0]
+    assert captured["ledger_lock"] is shared_lock, \
+        "Router 与 orchestrator 必须共用同一把账本锁"
 
 
 def test_daemon_router_reads_the_same_ledger_as_orchestrator(

@@ -289,6 +289,41 @@ def test_router_persist_surfaces_unreadable_ledger(tmp_path):
     assert any("unreadable" in w for w in warns)
 
 
+def test_router_persist_holds_injected_ledger_lock(tmp_path):
+    """persist 的 load→mutate→save 必须在注入的账本锁内——Router 与
+    orchestrator 写同一份账本（OCR medium：无锁丢更新窗口）。续用路径
+    不落盘，不进锁。"""
+    class RecordingLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self.entries = 0
+
+        def __enter__(self):
+            self._lock.acquire()
+            self.entries += 1
+            return self
+
+        def __exit__(self, *exc):
+            self._lock.release()
+            return False
+
+    gate = RecordingLock()
+    state_path = tmp_path / "state.json"
+    fake = FakeRouterRunner([
+        turn("ses_r1", decision_json()),
+        turn("ses_r1", decision_json()),
+    ])
+    router = router_mod.SemanticRouter(
+        template_path=TEMPLATE, cwd=str(tmp_path), router_model=ROUTER_MODEL,
+        state_path=state_path, timeout_s=77, ledger_lock=gate,
+        new_session=fake.new_session, continue_session=fake.continue_session)
+    router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                  available_models=MODELS)
+    router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                  available_models=MODELS)
+    assert gate.entries == 1, "恰一次新建会话持久化在锁内；续用不落盘"
+
+
 # --- 发牌隔离与 Router 自身模型 ----------------------------------------------
 
 
