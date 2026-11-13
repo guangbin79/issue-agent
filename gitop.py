@@ -557,7 +557,8 @@ _HEX40_OK = re.compile(r"[0-9a-f]{40}")
 # a terminal verdict).
 _NON_FF_MARKERS = ("(fetch first)", "non-fast-forward")
 _TRANSPORT_MARKERS = ("unable to access", "could not read from remote "
-                      "repository", "could not resolve", "connection",
+                      "repository", "could not resolve", "connection refused",
+                      "connection timed out", "connection reset",
                       "rpc failed", "the remote end hung up",
                       "unexpected disconnect")
 
@@ -569,8 +570,10 @@ def push_verified_commit(repo: PathLike, iid, commit: str, remote_url: str,
 
     The refspec is ALWAYS `<sha>:refs/heads/issue/<iid>-fix` — never force,
     never any other ref, so the default branch cannot be touched by shape.
-    *commit* must be a full 40-hex sha (RefspecViolation otherwise — the
-    same whitelist concept as the legacy push gate).
+    *commit* must be a full 40-hex sha — all-zero null OID included in the
+    refusal, since in a push refspec it means "delete the remote branch"
+    (RefspecViolation otherwise — the same whitelist concept as the legacy
+    push gate).
 
     Returns "ok" | "non_ff" | "failed" (the monitor state machine branches
     on exactly this):
@@ -583,11 +586,14 @@ def push_verified_commit(repo: PathLike, iid, commit: str, remote_url: str,
     PushFailed (scrubbed): transient, the caller keeps awaiting_external
     and retries on its own poll cadence.
     """
-    if not isinstance(commit, str) or not _HEX40_OK.fullmatch(commit):
+    if not isinstance(commit, str) or not _HEX40_OK.fullmatch(commit) \
+            or commit == "0" * 40:
+        # 全零 OID 是唯一带特殊语义的合法 hex40：push refspec 里它的含义
+        # 是「删远端分支」（子进程返回 0）——board 是半可信输入，须拒绝
         raise RefspecViolation(
-            _scrub(f"commit {str(commit)[:44]!r} is not a full 40-hex sha; "
-                   f"refspec {commit}:refs/heads/{fix_branch(iid)} refused",
-                   remote_url))
+            _scrub(f"commit {str(commit)[:44]!r} is not a pushable full "
+                   f"40-hex sha; refspec {commit}:refs/heads/"
+                   f"{fix_branch(iid)} refused", remote_url))
     env, clean_url = _net_env(remote_url)
     refspec = f"{commit}:refs/heads/{fix_branch(iid)}"
     # 分类读 stderr：钉英文输出（LC_ALL 压过继承的 LANG），本地化 git 的

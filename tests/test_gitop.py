@@ -915,3 +915,32 @@ def test_push_verified_commit_transient_rpc_failures_raise(repo, monkeypatch):
         monkeypatch.setattr(gitop, "_run", failing_run)
         with pytest.raises(PushFailed):
             push_verified_commit(repo, 7, "a" * 40, "file:///tmp/r.git")
+
+
+def test_push_verified_commit_rejects_null_oid(repo, remote_url):
+    """终闸 B2：全零 OID 在 git push refspec 语义里是「删远端分支」且
+    子进程返回 0——必须当确定性违约在边界拒绝（board 是半可信输入）。"""
+    with pytest.raises(RefspecViolation):
+        push_verified_commit(repo, 7, "0" * 40, remote_url)
+
+
+def test_push_verified_commit_narrows_connection_transport_matches(
+        repo, monkeypatch):
+    """终闸 B3：裸词 connection 不作传输标记——远端 hook 回显该词的
+    确定性拒绝不得误判瞬态（无限重试占名额）；SSH 拒连/超时仍属传输。"""
+    def canned(marker):
+        def run(cmd, cwd, env=None):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=marker)
+        return run
+
+    hook_echo = ("remote: closing connection pool\n"
+                 "! [remote rejected] issue/7-fix (pre-receive hook declined)")
+    monkeypatch.setattr(gitop, "_run", canned(hook_echo))
+    assert push_verified_commit(repo, 7, "a" * 40,
+                                "file:///tmp/r.git") == "failed"
+    for ssh in ("ssh: connect to host g.invalid port 22: Connection refused",
+                "ssh: connect to host g.invalid port 22: "
+                "Connection timed out"):
+        monkeypatch.setattr(gitop, "_run", canned(ssh))
+        with pytest.raises(PushFailed):
+            push_verified_commit(repo, 7, "a" * 40, "ssh://g.invalid/r.git")
