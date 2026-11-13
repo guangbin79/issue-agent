@@ -439,14 +439,21 @@ try:
     c = json.load(open(os.environ["config_file"]))
 except Exception:
     c = {}
-for key, field in (("UIA_API_BASE", "api_base"), ("UIA_PAT", "pat"),
-                   ("UIA_CB", "callback_url"), ("UIA_PORT", "port"),
-                   ("UIA_MODE", "execution_mode"),
-                   ("UIA_ROUTER", "router_model"),
-                   ("UIA_AHOME", "agora_home"),
-                   ("UIA_APOLL", "agora_poll_interval"),
-                   ("UIA_VERIFY", "verify_command")):
-    print(f"{key}={shlex.quote(str(c.get(field, '') or ''))}")
+for key, field, keep_raw in (
+        ("UIA_API_BASE", "api_base", False), ("UIA_PAT", "pat", False),
+        ("UIA_CB", "callback_url", False), ("UIA_PORT", "port", False),
+        ("UIA_MODE", "execution_mode", False),
+        ("UIA_ROUTER", "router_model", False),
+        ("UIA_AHOME", "agora_home", False),
+        ("UIA_APOLL", "agora_poll_interval", True),
+        ("UIA_VERIFY", "verify_command", False)):
+    # keep_raw（poll 整数字段）：falsy-but-present（0/False）不得被 `or ""`
+    # 抹掉——手编 0 必须进入 shell 面校验离线拒（config.py 无条件最小值 1）。
+    # 字符串字段维持 falsy→缺席：与 config.py 的 `or ""` 归一同口径。
+    v = c.get(field)
+    if not keep_raw:
+        v = v or ""
+    print(f"{key}={shlex.quote(str(v) if v is not None else '')}")
 EOF
 )"
   OLD_API_BASE="${UIA_API_BASE:-}"

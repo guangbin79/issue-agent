@@ -1009,6 +1009,20 @@ printf '{"canonical_path": "%s", "identity": "x", "out_of_scope": ["y"], "verify
 run_install
 assert_eq "$RC" "1" "agora_poll_interval 0 (json) exit code"
 assert_grep "$SAN/install.out" 'agora_poll_interval'
+# 手编坏值同样拒（0 会杀 daemon——config.py 无条件最小值 1；安装面必须
+# 离线拒而不是让 unknown-key 存活规则原样透传成崩溃循环）
+printf '{"canonical_path": "%s", "identity": "x", "out_of_scope": ["y"], "verify_command": "true"}\n' \
+  "$REPO" > "$REPO/.issue-agent.json"
+python3 - "$CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p))
+c["agora_poll_interval"] = 0  # 手编坏值（合法 json 数字，falsy）
+json.dump(c, open(p, "w"), indent=2)
+PY
+run_install
+assert_eq "$RC" "1" "hand-edited agora_poll_interval 0 exit code"
+assert_grep "$SAN/install.out" 'agora_poll_interval'
 
 echo
 echo "passed=$PASS failed=$FAIL"
