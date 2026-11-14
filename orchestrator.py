@@ -842,6 +842,12 @@ class Orchestrator:
                     and self._agora_relay_comment(iid, active_tid, message,
                                                   note_id):
                 return
+            # 建单前实时校验（ag-ee0c29 缺口 1）：注册表失联（重启/blocked
+            # 收口释放窗）时，账本在录 tid 必须经 board 实时核对才能放行
+            # 建新轮——否则旧单非终态即双活＋孤儿（#182）。
+            if active_tid is None \
+                    and self._agora_lane_preflight(iid, message, note_id):
+                return
             # 活动名额（monitor 侧，与 max_parallel turn 槽双重限制）：满员
             # 保留待派发（claim 留存，claim-timeout 回收后 requeue 重试），
             # 绝不超额建单。reserve 是原子 check-and-reserve——并发回合不
@@ -981,11 +987,15 @@ class Orchestrator:
                 self._journal(f"disposal: issue#{iid} task {tid} cancelled "
                               "by panel command")
 
-    def _agora_relay_comment(self, iid, tid, message, note_id):
+    def _agora_relay_comment(self, iid, tid, message, note_id,
+                             defer_on_fail=False):
         """活动任务评论直通（Task 5）：post(kind=question) 给在案 worker
         （body 带 issue/note id）。AgoraRejected（注册表陈旧竞态——board
         已终态而 poll 未及释放）返回 False 交调用方回落 Router 新回合；
-        不可达保留待派发重试（绝不丢评论、绝不降级 legacy）。"""
+        不可达保留待派发重试（绝不丢评论、绝不降级 legacy）。
+        defer_on_fail（ag-ee0c29 preflight 路径）＝瞬断/被拒但任务活着时
+        改走 defer：置 agora_pending 会让重试落进旧 router_goal 的中断恢复
+        通道（评论被旧 goal 顶替），注册表失联窗口的重试必须重跑 preflight。"""
         body = (f"issue#{iid} 新评论（note {note_id or 0}）需要你处理："
                 f"\n\n{message}")
         try:
@@ -996,21 +1006,34 @@ class Orchestrator:
             # （为在飞任务建新回合会孤儿化旧任务＋断其 mailbox）。
             if not self._agora_task_terminal(tid):
                 self._journal(f"turn: issue#{iid} relay to {tid} rejected "
-                              f"but task alive ({exc}); kept pending")
-                self._agora_keep_pending(iid, "comment relay rejected")
+                              f"but task alive ({exc}); retry scheduled")
+                self._relay_retry_later(iid, "comment relay rejected",
+                                        defer_on_fail)
                 return True
             self._journal(f"turn: issue#{iid} relay to {tid} rejected "
                           f"({exc}); task terminal, falling back to router")
             return False
         except (AgoraUnavailable, AgoraProtocolError) as exc:
             self._journal(f"turn: issue#{iid} relay to {tid} unreachable, "
-                          f"kept pending: {exc}")
-            self._agora_keep_pending(iid, "comment relay unavailable")
+                          f"retry scheduled: {exc}")
+            self._relay_retry_later(iid, "comment relay unavailable",
+                                    defer_on_fail)
             return True
         self._journal(f"turn: issue#{iid} comment relayed to worker "
                       f"({tid}, note {note_id or 0})")
         self._finalize(iid, None, None)
         return True
+
+    def _relay_retry_later(self, iid, why, defer_on_fail):
+        """直通失败的重试通道选择：活动门控路径＝保留待派发（claim 留存）；
+        preflight 路径＝defer（重试重跑 preflight，防旧 goal 顶替评论）。
+        通道与原因在此留痕（ocr R1：defer 分支不得吞 why）。"""
+        if defer_on_fail:
+            self._journal(f"turn: issue#{iid} {why}; deferred (preflight "
+                          "recheck on retry)")
+            self._defer(iid, None)
+        else:
+            self._agora_keep_pending(iid, why)
 
     def _agora_task_terminal(self, tid) -> bool:
         """board 重读判定任务终态（merged/closed/cancelled——与
@@ -1023,6 +1046,87 @@ class Orchestrator:
         task = board.get("task") if isinstance(board, dict) else None
         return isinstance(task, dict) \
             and task.get("state") in ("merged", "closed", "cancelled")
+
+    def _agora_lane_preflight(self, iid, message, note_id) -> bool:
+        """建单前实时校验（ag-ee0c29 缺口 1）：monitor 登记簿易失（重启即
+        空、blocked 收口释放窗），账本在录 tid 放行建新轮前必须重读 board
+        实时态（不信任缓存 agora_status）——旧单非终态时建新单＝双活、
+        账本 tid 被覆盖、旧单 mailbox 孤儿化（#182）。返回 True＝本回合已
+        处置（relay/defer/blocked），False＝放行建新轮。"""
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            entry = ledger["issues"].get(str(int(iid))) or {}
+            tid = entry.get("agora_task_id")
+            pending = bool(entry.get("agora_pending"))
+        if not tid:
+            return False
+        try:
+            board = self.agora_client.board(tid)
+        except AgoraRejected as exc:
+            # 终闸 B-1 教义：4xx ≠ 终态专有（限流/校验同样 4xx）——复核
+            # board 确认终态才放行新轮；复核仍拒按存活 defer，绝不为可能
+            # 活着的旧单建新轮。pending 例外：中断恢复通道（同 client_key
+            # 幂等）接管，create 会确定性撞同一 4xx 并按其口径处置。
+            if pending or self._agora_task_terminal(tid):
+                self._journal(f"turn: issue#{iid} preflight board rejected "
+                              f"for {tid} ({exc}); retry channel proceeds")
+                return False
+            self._journal(f"turn: issue#{iid} preflight board rejected for "
+                          f"{tid}, deferred: {exc}")
+            self._defer(iid, None)
+            return True
+        except Exception as exc:
+            # 读不到实时态不赌旧单死活：defer 重试（双活风险方向保守）
+            self._journal(f"turn: issue#{iid} preflight board unreadable "
+                          f"for {tid}, deferred: {exc!r}")
+            self._defer(iid, None)
+            return True
+        task = board.get("task") if isinstance(board, dict) else None
+        task_state = task.get("state") if isinstance(task, dict) else None
+        delivery = task.get("delivery") if isinstance(task, dict) else None
+        dstatus = delivery.get("status") if isinstance(delivery, dict) else None
+        if pending and task_state == "todo":
+            # 中断恢复且任务未派发（无 worker 可收 question）：同 client_key
+            # 幂等恢复通道接管。其余实时态照常分流——ocr R1 #1：pending
+            # 整段跳过会在注册表失联窗重开 #182 双活（旧 goal 顶替评论）。
+            self._journal(f"turn: issue#{iid} ledger task {tid} undispatched;"
+                          " client_key recovery owns retry")
+            return False
+        if task_state in ("merged", "closed", "cancelled"):
+            return False  # 终态→正常新轮
+        if task_state == "blocked" or dstatus == "failed":
+            # 非终态但 blocked/交付失败（无自动推进的终局）：先取消旧单
+            # 再建新轮——处置内聚，消除重复单/孤儿
+            return self._agora_cancel_stale_round(iid, tid)
+        # 非终态且活着：持续对话门控 relay（现状语义）；瞬断走 defer 重试
+        self._journal(f"turn: issue#{iid} ledger task {tid} alive on board "
+                      "(registry/cache stale); relaying comment")
+        return self._agora_relay_comment(iid, tid, message, note_id,
+                                         defer_on_fail=True)
+
+    def _agora_cancel_stale_round(self, iid, tid) -> bool:
+        """blocked/delivery-failed 旧单自动收口（daemon 派发方身份）：
+        task_cancel 旧单后放行新轮。取消不可达→defer 重试（不赌旧单
+        状态建新单）；确定性被拒且任务仍非终态→blocked 求助（人工处置）。"""
+        try:
+            self.agora_client.task_cancel(tid)
+        except AgoraRejected as exc:
+            if self._agora_task_terminal(tid):
+                self._journal(f"turn: issue#{iid} cancel stale {tid} "
+                              f"rejected but terminal ({exc}); new round")
+                return False
+            self._blocked(iid, None,
+                          f"旧任务 {tid} 取消被拒，需要人工处理 "
+                          f"issue#{iid}：{exc}")
+            return True
+        except (AgoraUnavailable, AgoraProtocolError) as exc:
+            self._journal(f"turn: issue#{iid} cancel stale {tid} "
+                          f"unreachable, deferred: {exc}")
+            self._defer(iid, None)
+            return True
+        self._journal(f"turn: issue#{iid} stale task {tid} cancelled "
+                      "(blocked/delivery failed); new round may start")
+        return False
 
     def _answer_worker_question(self, iid, tid, body):
         """worker 提问答复回调（Task 5，monitor 汇报管线调用）：T3 锁序
@@ -2204,13 +2308,25 @@ class Orchestrator:
             note_id = entry.get("last_note_id")
             state.save_state(self.state_path, ledger)
         message = RETRY_MESSAGE
+        event = None
         if self.agora_client is not None and note_id is not None:
             # ocr R1 #2：重试转达原评论正文（直通 worker 的留言不得被
             # RETRY_MESSAGE 顶替——「绝不丢评论」）；取不到再降级。
             message = self._note_body(iid, note_id) or RETRY_MESSAGE
+        if message is RETRY_MESSAGE and self.agora_client is not None:
+            # ag-ee0c29 缺口 3（#334）：占位载荷（无 note 可取——issue 新建
+            # 首回合被打断）从 Gitea 拉 issue 标题+正文组装 Router 上下文，
+            # 防 Router 缺上下文求澄清停摆；拉不到维持占位重试。只属 agora
+            # 车道——legacy 的 message 即继续指令，被正文顶替会丢重试信号。
+            issue = self._issue_context(iid)
+            if issue is not None:
+                event = {"kind": "requeue-retry",
+                         "issue": {"title": issue.get("title") or "",
+                                   "body": issue.get("body") or ""}}
+                message = issue.get("body") or message
         self._run_turn(iid, message=message, title=f"issue#{iid}: retry"[:40],
                        session_id=session_id, action="continue",
-                       note_id=note_id)
+                       event=event, note_id=note_id)
 
     def _note_body(self, iid, note_id):
         """按 note id 取回评论正文（agora 重试的直通保真）；失败返回
@@ -2224,3 +2340,12 @@ class Orchestrator:
             if comment.get("id") == int(note_id):
                 return comment.get("body")
         return None
+
+    def _issue_context(self, iid):
+        """从 Gitea 拉 issue 标题+正文（requeue 占位载荷补全，ag-ee0c29）；
+        best-effort——失败返回 None 维持占位重试，绝不抛。"""
+        try:
+            return self.api.get_issue(self.project, int(iid))
+        except Exception as exc:
+            self._journal(f"requeue: issue#{iid} context fetch failed: {exc!r}")
+            return None

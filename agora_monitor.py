@@ -668,8 +668,12 @@ class AgoraMonitor:
             return
         iid = self._iid_for_task(tid)
         if iid is None:
-            self._journal(f"agora-monitor: mail for unknown task {tid} "
-                          f"(kind={kind}) dropped")
+            # ag-ee0c29 缺口 2（#182）：账本无属主（tid 已被新单覆盖的孤儿
+            # 窗口）不得无声 dropped——warning 含 tid/kind，并按报告库历史
+            # tid 给归属提示，供人工追认。
+            self._journal(f"agora-monitor: warning: mail for unknown task "
+                          f"{tid} (kind={kind}) dropped; "
+                          f"{self._mail_owner_hint(tid)}")
             return
         if kind == "note":
             self._store_report_note(iid, tid, message.get("id"), body)
@@ -700,6 +704,15 @@ class AgoraMonitor:
                 if entry.get("agora_task_id") == tid:
                     return int(key)
         return None
+
+    def _mail_owner_hint(self, tid) -> str:
+        """unknown-task 邮件归属提示（ag-ee0c29）：按报告库历史 tid 反查
+        可能属主 iid——账本只留在录 tid，被新单覆盖后唯一线索是历史报告。"""
+        record = self._reports_load().get("reports", {}).get(str(tid)) or {}
+        iid = record.get("iid")
+        if iid is not None:
+            return f"possibly issue#{iid} (historical task); manual follow-up"
+        return "no historical attribution; manual follow-up"
 
     def _store_report_note(self, iid, tid, mid, body):
         """worker note 持久化为报告候选（最新 note_id 胜；重放旧批次不
