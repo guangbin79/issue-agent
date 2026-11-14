@@ -32,6 +32,8 @@ which note ids have already been consumed. Layout:
         "router_goal": str|null,           # 首次 create 前持久化（同 payload
         #   重试才能取回原任务，§8.1）
         "router_model": str|null,
+        "router_deliverable": str|null,  # dispatch 交付面提示（ag-da7410 A）：
+        #   "out_of_band"＝零提交 review-only；null＝external_branch 缺省
         #   ^ legacy session_id 永不被 agora 覆盖（§9.4 每回合一新会话）。
     }}}
 
@@ -53,7 +55,7 @@ PathLike = Union[str, "os.PathLike[str]"]
 
 # 账本根字段（agora 模式，计划 Task 2）：持久语义 Router 的 opencode
 # session id。放在根级而非任何 issue 条目——Router 跨 issue 共享一个会话
-# （设计 §9.6）；issue 级的 agora 六字段扩展见上方条目 schema（Task 3）。
+# （设计 §9.6）；issue 级的 agora 七字段扩展见上方条目 schema（Task 3）。
 ROUTER_SESSION_KEY = "router_session_id"
 
 
@@ -99,6 +101,7 @@ def _new_issue(status: str) -> dict:
         "agora_pending": False,
         "router_goal": None,
         "router_model": None,
+        "router_deliverable": None,
     }
 
 
@@ -123,7 +126,7 @@ def _normalize(state: dict) -> dict:
             "review_push_pending_at": entry.get("review_push_pending_at"),
             "report_probe_pending": bool(entry.get("report_probe_pending")),
             "report_probe_count": int(entry.get("report_probe_count") or 0),
-            # agora 六字段（设计 §9.6）：legacy 时代旧账缺键 → 默认值，
+            # agora 七字段（设计 §9.6）：legacy 时代旧账缺键 → 默认值，
             # 不得因往返丢字段或报错。
             "agora_task_id": entry.get("agora_task_id"),
             "agora_status": entry.get("agora_status"),
@@ -131,6 +134,7 @@ def _normalize(state: dict) -> dict:
             "agora_pending": bool(entry.get("agora_pending")),
             "router_goal": entry.get("router_goal"),
             "router_model": entry.get("router_model"),
+            "router_deliverable": entry.get("router_deliverable"),
         }
     state["issues"] = issues
     return state

@@ -175,13 +175,14 @@ def _empty_entry() -> dict:
         "review_push_pending_at": None,
         "report_probe_pending": False,
         "report_probe_count": 0,
-        # agora 六字段（设计 §9.6，与 state._new_issue 同步）
+        # agora 七字段（设计 §9.6，与 state._new_issue 同步）
         "agora_task_id": None,
         "agora_status": None,
         "delivery_commit": None,
         "agora_pending": False,
         "router_goal": None,
         "router_model": None,
+        "router_deliverable": None,
     }
 
 
@@ -882,6 +883,10 @@ class Orchestrator:
                     target_branch=gitop.fix_branch(iid),
                     verify_cmd=self.verify_command,
                     model=decision.model,
+                    # ag-da7410 A：三分流——需勘察的验证/解答类建零提交
+                    # review-only 任务（done body=结论文本），代码修复类
+                    # external_branch 缺省不动。
+                    deliverable=decision.deliverable_hint or "external_branch",
                     # 看板可辨 issue：确定性拼前缀，不依赖 Router LLM 自觉
                     title=f"issue#{iid}: {decision.title}"[:40],
                     client_key=f"{self.service_name}:issue-{iid}:note-{note_id or 0}",
@@ -998,6 +1003,9 @@ class Orchestrator:
             if action == "redispatch":
                 if self.agora_monitor is not None:
                     self.agora_monitor.redispatched(iid, tid)
+                    # ag-da7410 D：前手 delivery_commit 在案时给新 worker
+                    # 注入 handoff 上下文（免从头考古）
+                    self.agora_monitor.inject_handoff_context(iid, tid)
                 self._post_note(iid, REDISPATCH_NOTE.format(tid=tid))
                 self._journal(f"disposal: issue#{iid} task {tid} "
                               "redispatched by panel command")
@@ -1190,7 +1198,8 @@ class Orchestrator:
                     # 占位 title：经建单点统一加 issue#N 前缀，故不自带前缀
                     action="dispatch", title="recovered",
                     goal=entry["router_goal"], model=entry["router_model"],
-                    reason="recovered", raw={})
+                    reason="recovered", raw={},
+                    deliverable_hint=entry.get("router_deliverable") or None)
             issue_ctx_title = ""
             if isinstance(event, dict) and isinstance(event.get("issue"), dict):
                 issue_ctx_title = event["issue"].get("title") or ""
@@ -1221,9 +1230,11 @@ class Orchestrator:
                 self._defer(iid, None)  # RLock 可重入：锁内调用安全
                 return None
             if decision.action == "dispatch":
-                # 首次 create 前持久化 goal/model＋建单意图（§8.1/§9.6）。
+                # 首次 create 前持久化 goal/model/deliverable＋建单意图
+                # （§8.1/§9.6）。deliverable 入 payload：恢复必须逐键同构。
                 entry["router_goal"] = decision.goal
                 entry["router_model"] = decision.model
+                entry["router_deliverable"] = decision.deliverable_hint
                 entry["agora_pending"] = True
                 state.save_state(self.state_path, ledger)
             return decision
@@ -1273,10 +1284,13 @@ class Orchestrator:
         self._journal(f"turn: issue#{iid} kept pending for dispatch ({why})")
 
     def _agora_out_of_band(self, iid, decision):
-        """Router ignore/question：不建单（范围外/待澄清）。ignore 走现有
-        范围外评论＋关单策略（关单＝终态暂停语义，收口交互归 Task 5）；
-        question 只发澄清评论。两者按回合完成收尾。"""
-        if decision.action == "ignore":
+        """Router 不建单处置（ag-da7410 A 起 action=answer 同归）：answer＝
+        纯解答类，goal 本体即答案文本，直接回评 issue（不建任务不占配额
+        不建 env）；ignore 走现有范围外评论＋关单策略（关单＝终态暂停
+        语义）；question 只发澄清评论。三者按回合完成收尾。"""
+        if decision.action == "answer":
+            text = f"解答：\n\n{decision.goal}"
+        elif decision.action == "ignore":
             text = f"范围外：{decision.reason or '不属于本仓库处理范围'}"
         else:
             text = f"需要人工澄清：{decision.reason or '信息不足'}"

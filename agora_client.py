@@ -211,6 +211,11 @@ class AgoraClient:
     def dispatch(self, tid) -> None:
         self._task_call("/task_dispatch", {"task": tid})
 
+    def task_nudge(self, tid, body) -> dict:
+        """ag-da7410 C：既有 /task_nudge HTTP 面 dispenser 提示注入（服务
+        返回 {"nudged": bool, "reason": ...}；body ≤2000 字符服务端校验）。"""
+        return self._task_call("/task_nudge", {"task": tid, "body": body})
+
     def task_cancel(self, tid) -> None:
         """task_cancel（dispatcher 身份可取消自己名下任务；叶子任务级联 0）。"""
         self._task_call("/task_cancel", {"task": tid})

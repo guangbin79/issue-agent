@@ -203,7 +203,8 @@ def main(argv=None) -> int:
     # 名额与 config.max_parallel 双重限制口径；start/stop 随 orchestrator
     # 生命周期。legacy 恒 None。
     agora_monitor = (AgoraMonitor(client=agora_client, journal=journal,
-                                  max_active=config.max_parallel)
+                                  max_active=config.max_parallel,
+                                  stall_timeout=config.agora_stall_timeout)
                      if config.execution_mode == "agora" else None)
     http_mod = _load_http_module()
     # Port: the unit's ISSUE_AGENT_PORT env wins; config.port otherwise

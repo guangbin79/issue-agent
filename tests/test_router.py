@@ -7,7 +7,7 @@ subprocess. The REAL ROUTER.template.md is used so the prompt/goal
 contract tests lock the shipped template text.
 
 Security anchors pinned here: the decision key set is always a subset of
-the six schema keys (verify_cmd can never appear, whatever the issue text
+the seven schema keys (verify_cmd can never appear, whatever the issue text
 injected), dispatch requires an available model, and Router calls carry
 no write-gate credential prefix.
 
@@ -29,7 +29,8 @@ from runner import SessionInvalid, TurnResult  # noqa: E402
 
 PKG_DIR = Path(__file__).resolve().parent.parent
 TEMPLATE = PKG_DIR / "ROUTER.template.md"
-SCHEMA_KEYS = {"schema_version", "action", "title", "goal", "model", "reason"}
+SCHEMA_KEYS = {"schema_version", "action", "title", "goal", "model",
+               "deliverable_hint", "reason"}
 MODELS = ["zai-coding-plan/glm-5.3", "zai-coding-plan/glm-5.3-flash"]
 ROUTER_MODEL = "zai-coding-plan/glm-5.3"
 
@@ -223,6 +224,70 @@ def test_router_accepts_ignore_without_goal_or_model(tmp_path):
     assert decision.action == "ignore"
     assert decision.goal == ""
     assert decision.model == ""
+
+
+# --- 三分流（ag-da7410 A：answer／out_of_band／external_branch） ----------------
+
+
+def test_router_accepts_answer_action_with_goal_as_answer_text(tmp_path):
+    """纯解答类：action=answer 合法——goal＝答案文本（daemon 原样回评
+    issue），model 不消费不校验（不建任务不占配额）。"""
+    fake = FakeRouterRunner([turn(
+        "ses_r1", decision_json(action="answer", title="解答连接池配置",
+                                goal="连接池上限在 config.json 的 pool.max 字段调整。",
+                                model="", reason="纯问答，无需勘察"))])
+    router = make_router(tmp_path, fake)
+    decision = router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                             available_models=MODELS)
+    assert decision.action == "answer"
+    assert decision.goal == "连接池上限在 config.json 的 pool.max 字段调整。"
+    assert decision.deliverable_hint is None
+    assert decision.raw["deliverable_hint"] is None
+
+
+def test_router_rejects_answer_with_empty_goal(tmp_path):
+    """answer 的 goal＝答案文本本体：空答案与空 goal 同罪拒收。"""
+    fake = FakeRouterRunner([turn(
+        "ses_r1", decision_json(action="answer", goal="   ", model=""))])
+    router = make_router(tmp_path, fake)
+    with pytest.raises(router_mod.RouterDecisionError):
+        router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                      available_models=MODELS)
+
+
+def test_router_dispatch_keeps_out_of_band_hint(tmp_path):
+    """需勘察的验证/解答类：dispatch＋deliverable_hint=out_of_band 归一
+    保留（daemon 据此建零提交 review-only 任务）。"""
+    fake = FakeRouterRunner([turn(
+        "ses_r1", decision_json(deliverable_hint="out_of_band"))])
+    router = make_router(tmp_path, fake)
+    decision = router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                             available_models=MODELS)
+    assert decision.action == "dispatch"
+    assert decision.deliverable_hint == "out_of_band"
+    assert decision.raw["deliverable_hint"] == "out_of_band"
+
+
+def test_router_dispatch_normalizes_absent_hint_to_none(tmp_path):
+    """代码修复类：缺省无 hint → None（external_branch 现状不动）。"""
+    fake = FakeRouterRunner([turn("ses_r1", decision_json())])
+    router = make_router(tmp_path, fake)
+    decision = router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                             available_models=MODELS)
+    assert decision.deliverable_hint is None
+
+
+@pytest.mark.parametrize("hint", ["banana", "external_branch", 7])
+def test_router_rejects_unknown_deliverable_hint(tmp_path, hint):
+    """hint 白名单仅 out_of_band：external_branch 是缺省而非 hint 值，
+    其余一律 RouterDecisionError（坏决策不执行）。"""
+    fake = FakeRouterRunner([turn(
+        "ses_r1", decision_json(deliverable_hint=hint))])
+    router = make_router(tmp_path, fake)
+    with pytest.raises(router_mod.RouterDecisionError):
+        router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                      available_models=MODELS)
+
 
 
 # --- 持久 session：失效重建恰一次＋账本根持久化 -------------------------------
@@ -437,3 +502,14 @@ def test_template_demands_json_only_and_forbids_verify_cmd():
     text = _template_text()
     assert "schema_version" in text
     assert "verify_cmd" in text, "模板必须显式声明决策永不携带验收命令"
+
+
+def test_template_carries_three_way_routing_criteria():
+    """ag-da7410 A：三分流判据必须写进模板——纯解答 answer、需勘察
+    out_of_band、代码修复 external_branch 缺省。"""
+    text = _template_text()
+    assert "deliverable_hint" in text, "schema 必须声明 deliverable_hint 键"
+    assert "out_of_band" in text, "需勘察类 hint 唯一合法值必须点名"
+    assert "纯解答" in text, "纯解答类判据（action=answer）"
+    assert "external_branch" in text, "代码修复类缺省交付面"
+

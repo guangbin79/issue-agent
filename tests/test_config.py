@@ -267,13 +267,27 @@ def agora_config(tmp_path, **overrides):
 
 
 def test_agora_defaults_are_legacy_and_inert(tmp_path):
-    """缺省全 inert：legacy 模式、空 router/agora 字段、15s 轮询——现有
-    部署不写任何 agora 键也照常加载（零 agora 依赖）。"""
+    """缺省全 inert：legacy 模式、空 router/agora 字段、15s 轮询、僵态
+    阶梯 30min 缺省——现有部署不写任何 agora 键也照常加载（零 agora
+    依赖）。"""
     cfg = config.load_config(write_config(tmp_path))
     assert cfg.execution_mode == "legacy"
     assert cfg.router_model == ""
     assert cfg.agora_home == ""
     assert cfg.agora_poll_interval == 15
+    assert cfg.agora_stall_timeout == 1800
+
+
+def test_agora_stall_timeout_zero_disables_and_bad_values_named(tmp_path):
+    """ag-da7410 C：0＝关闸合法；负值/坏值 ConfigError 点名字段。"""
+    cfg = config.load_config(agora_config(tmp_path, agora_stall_timeout=0))
+    assert cfg.agora_stall_timeout == 0
+    cfg = config.load_config(agora_config(tmp_path, agora_stall_timeout=900))
+    assert cfg.agora_stall_timeout == 900
+    with pytest.raises(config.ConfigError, match="agora_stall_timeout"):
+        config.load_config(agora_config(tmp_path, agora_stall_timeout=-1))
+    with pytest.raises(config.ConfigError, match="agora_stall_timeout"):
+        config.load_config(agora_config(tmp_path, agora_stall_timeout="x"))
 
 
 def test_agora_mode_requires_trusted_verify_and_router_model(tmp_path):

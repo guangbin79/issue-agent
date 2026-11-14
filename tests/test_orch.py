@@ -419,6 +419,7 @@ class FakeMonitor:
         self.stopped = 0
         self.redispatches = []   # redispatched() 记账（ag-1c7315 面板重试收位）
         self.cancellations = []  # announce_cancelled() 记账（ag-1c7315）
+        self.handoff_injections = []  # inject_handoff_context 记账（ag-da7410 D）
 
     def attach_delivery(self, **kwargs):
         self.attached = kwargs
@@ -466,6 +467,9 @@ class FakeMonitor:
     def redispatched(self, iid, tid):
         self.register(iid, tid)
         self.redispatches.append((int(iid), tid))
+
+    def inject_handoff_context(self, iid, tid):
+        self.handoff_injections.append((int(iid), tid))
 
     def announce_cancelled(self, iid, tid):
         self.cancellations.append((int(iid), tid))
@@ -2701,6 +2705,39 @@ def test_crash_between_create_and_dispatch_recovers_original_task(
         h.orch.stop()
 
 
+def test_crash_between_create_and_dispatch_recovers_out_of_band_payload(
+        tmp_path, monkeypatch):
+    """ag-da7410 A：out_of_band 建单中断恢复必须复用同 deliverable——
+    hint 落账 router_deliverable，恢复 payload 与首建逐键一致（否则同
+    client_key 异 payload 被服务端拒）。"""
+    client = FakeAgoraClient()
+    client.dispatch_failures.append(AgoraUnavailable("dispatch down (fake)"))
+    client.board_task = {"state": "todo"}
+    router_ = FakeRouter(
+        agora_decision(deliverable_hint="out_of_band"))
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(
+            lambda: h.entry(7)["agora_task_id"] == "ag-123"
+            and 7 in monitor.released), h.journal_msgs
+        assert h.entry(7)["router_deliverable"] == "out_of_band"
+
+        client.dispatch_failures.clear()
+        requeue_retry(h, 7)
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        assert client.created_ids == ["ag-123"], "恢复不得建新任务"
+        first, second = client.create_calls
+        assert second["deliverable"] == first["deliverable"] \
+            == "out_of_band"
+        assert second["client_key"] == first["client_key"]
+    finally:
+        h.orch.stop()
+
+
 def test_turn_keeps_issue_pending_when_monitor_at_capacity(
         tmp_path, monkeypatch):
     """计划 L224：活动名额（与 max_parallel 双重限制）满员时保留待派发，
@@ -2786,6 +2823,7 @@ def test_doctor_unavailable_keeps_pending_without_legacy_fallback(
 
 
 def test_router_ignore_does_not_create_and_closes(tmp_path, monkeypatch):
+
     """计划 L224：Router ignore 不建单——走现有范围外评论＋关单策略（关单＝
     终态暂停语义，收口交互归 Task 5）。"""
     client = FakeAgoraClient()
@@ -2804,6 +2842,55 @@ def test_router_ignore_does_not_create_and_closes(tmp_path, monkeypatch):
         assert any("范围外：属于前端仓" in b for _, b in h.api.posts)
         assert h.api.closes == [7]
         assert h.gitop.ensure_calls, "分支准备先于路由，照常发生"
+    finally:
+        h.orch.stop()
+
+
+def test_router_out_of_band_hint_creates_review_only_task(tmp_path,
+                                                          monkeypatch):
+    """ag-da7410 A：需勘察的验证/解答类 → deliverable_hint=out_of_band 建
+    零提交 review-only 任务（done body=结论文本——结构可交卷）；hint 落账
+    router_deliverable 供中断恢复复用同 payload。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter(
+        agora_decision(deliverable_hint="out_of_band"))
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        assert client.create_calls[0]["deliverable"] == "out_of_band"
+        assert client.dispatch_calls == ["ag-123"]
+        assert monitor.registered == [(7, "ag-123")]
+        assert h.entry(7)["router_deliverable"] == "out_of_band"
+    finally:
+        h.orch.stop()
+
+
+def test_router_answer_decision_posts_answer_without_task(tmp_path,
+                                                          monkeypatch):
+    """ag-da7410 A：纯解答类 action=answer → 不建任务不派发不登记，答案
+    文本（goal 本体）回评 issue 后照常 finalize——零配额零 env。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter(agora_decision(
+        action="answer", goal="连接池上限在 config.json 的 pool.max 调整。",
+        model=""))
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        assert client.create_calls == [], "answer 绝不建单"
+        assert client.dispatch_calls == []
+        assert monitor.registered == []
+        assert h.entry(7)["agora_task_id"] is None
+        assert h.entry(7)["router_goal"] is None, "answer 不持久化建单意图"
+        assert any("连接池上限在 config.json" in b for _, b in h.api.posts)
+        assert h.api.closes == [], "answer 不关单"
     finally:
         h.orch.stop()
 
@@ -3688,13 +3775,14 @@ def test_agora_outage_does_not_fallback_to_legacy_runner(tmp_path, monkeypatch):
 
 
 def seed_blocked_agora_task(h, *, iid=7, tid="ag-123",
-                            agora_status="blocked"):
+                            agora_status="blocked", delivery_commit=None):
     """账本登记 blocked agora 任务（blocked 收口后的稳态：名额已释放、
     agora_status 头段 blocked）。"""
     st = state.load_state(h.state_path)
     entry = st["issues"].setdefault(str(iid), state._new_issue("active"))
     entry["agora_task_id"] = tid
     entry["agora_status"] = agora_status
+    entry["delivery_commit"] = delivery_commit
     state.save_state(h.state_path, st)
     return tid
 
@@ -3735,6 +3823,30 @@ def test_blocked_retry_command_redispatches_same_task_and_confirms(
         h.orch.stop()
 
 
+def test_blocked_retry_redispatch_delegates_handoff_context(tmp_path,
+                                                            monkeypatch):
+    """ag-da7410 D：面板「重试」重派后，重派上下文注入交 monitor——前手
+    delivery_commit 在案时新 worker 收到「勿从头重新推导」提示（wire 级
+    有/无两态锚在 test_agora_monitor）。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        seed_blocked_agora_task(h, delivery_commit="a" * 40)
+        client.board_task = {"state": "blocked"}
+        h.listener.queue.put(
+            comment_event(iid=7, body="重试", comment_id=102))
+        assert wait_until(lambda: client.dispatch_calls == ["ag-123"]), \
+            h.journal_msgs
+        assert monitor.redispatches == [(7, "ag-123")]
+        assert monitor.handoff_injections == [(7, "ag-123")], \
+            "重派后必须交 monitor 注入 handoff 上下文"
+    finally:
+        h.orch.stop()
+
+
 @pytest.mark.parametrize("body", ["取消任务", "取消"])
 def test_blocked_cancel_command_cancels_and_announces_fact(
         tmp_path, monkeypatch, body):
@@ -3754,6 +3866,7 @@ def test_blocked_cancel_command_cancels_and_announces_fact(
         assert wait_until(lambda: client.cancel_calls == ["ag-123"]), \
             h.journal_msgs
         assert monitor.cancellations == [(7, "ag-123")], "取消事实回评面"
+        assert monitor.handoff_injections == [], "取消不注入重派上下文"
         assert client.dispatch_calls == [] and client.created_ids == []
         assert client.posts == [], "指令本身不 relay"
         client.board_task = {"state": "cancelled"}  # 取消后 board 实时态（ag-ee0c29）

@@ -25,6 +25,7 @@ import pytest
 import gitop
 import state
 from agora_client import AgoraRejected, AgoraUnavailable
+import agora_monitor
 from agora_monitor import AgoraMonitor
 
 
@@ -211,6 +212,9 @@ class FakeAgoraClient:
         self.create_calls = []   # create_task 记账（恢复面断言零建单）
         self.cancel_calls = []   # task_cancel 记账
         self.check_mail_calls = 0
+        # ag-da7410 C：僵态阶梯面——task_nudge/dispatch 记账
+        self.nudges = []
+        self.dispatch_calls = []
 
     def check_mail(self):
         self.check_mail_calls += 1
@@ -235,6 +239,13 @@ class FakeAgoraClient:
 
     def task_cancel(self, tid):
         self.cancel_calls.append(tid)
+
+    def task_nudge(self, tid, body):
+        self.nudges.append({"task": tid, "body": body})
+        return {"nudged": True}
+
+    def dispatch(self, tid):
+        self.dispatch_calls.append(tid)
 
     def board(self, tid):
         self.board_calls.append(tid)
@@ -997,7 +1008,8 @@ def test_missing_report_posts_factual_comment_only(tmp_path, monkeypatch):
 def test_worker_question_answered_via_callback_and_posted_as_answer(
         tmp_path, monkeypatch):
     """计划 L345：worker question 交答复回调（orchestrator 在 ledger_lock
-    内交 Router）后 post(kind=answer) 回 worker。"""
+    内交 Router）后 post(kind=answer) 回 worker。ag-da7410 B：答案正文固定
+    追加续作指令行——答案送达≠回合终局，防「回应即收工」陷阱。"""
     client = FakeAgoraClient()
     client.mail = [mail_msg(3, kind="question", body="测试 X 可以删吗？")]
     monitor, state_path, _, face = conversation_monitor(
@@ -1007,8 +1019,31 @@ def test_worker_question_answered_via_callback_and_posted_as_answer(
     monitor.poll_once()
 
     assert face.answers == [(7, TID, "测试 X 可以删吗？")]
-    assert client.posts == [{"task": TID, "kind": "answer",
-                             "body": "可以删，它是替身"}]
+    assert len(client.posts) == 1
+    posted = client.posts[0]
+    assert posted["kind"] == "answer"
+    assert posted["body"].startswith("可以删，它是替身")
+    assert "答案送达后必须继续任务直至 post(done) 或 post(kind=question)" \
+        in posted["body"], "答案必须携带续作契约行"
+    assert "不得以回应答案作为回合终局" in posted["body"]
+
+
+def test_answer_relay_fallback_also_carries_continue_contract(
+        tmp_path, monkeypatch):
+    """ag-da7410 B：Router 故障走事实型兜底答复时，续作指令行同样必须在
+    场——兜底不是豁免，worker 同样不能以收到答复收工。"""
+    client = FakeAgoraClient()
+    client.mail = [mail_msg(3, kind="question", body="测试 X 可以删吗？")]
+    monitor, state_path, _, face = conversation_monitor(
+        tmp_path, monkeypatch, client,
+        face=ConversationFace(answer_error=RuntimeError("router down")))
+
+    monitor.poll_once()
+
+    assert len(client.posts) == 1
+    body = client.posts[0]["body"]
+    assert "自动化答复暂不可用" in body
+    assert "不得以回应答案作为回合终局" in body
 
 
 def test_worker_answer_relayed_to_issue_thread(tmp_path, monkeypatch):
@@ -1557,3 +1592,248 @@ def test_redispatched_clears_stale_round_report(tmp_path, monkeypatch):
         Path(reports_path_of(state_path)).read_text(encoding="utf-8")
     )["reports"][TID]
     assert replayed["note"] is None, "重放的旧轮邮件（mid≤水位）不得入库"
+
+
+# --- ag-da7410 C: 僵态升级阶梯（nudge×2 → 重派恰一次 → blocked） ----------------
+
+
+def stalls_path_of(state_path):
+    return str(state_path) + ".agora-stalls.json"
+
+
+def stall_client(state="running", deliverable="external_branch",
+                 age_s=4000.0, last_seen=None):
+    """僵态测试客户端：board 行＝running＋交付面＋created/last_seen 口径。"""
+    client = FakeAgoraClient()
+    client.tasks[TID] = {
+        "state": state, "deliverable": deliverable, "delivery": {},
+        "created": time.time() - age_s, "last_seen": last_seen}
+    return client
+
+
+def stall_monitor(tmp_path, client, face=None, stall_timeout=1800):
+    """接线完毕的僵态阶梯 monitor（iid=7 已登记，账本在案）。"""
+    if face is None:
+        face = ConversationFace()
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"issues": {"7": {
+        "status": "active", "agora_task_id": TID}}}))
+    journal = []
+    monitor = AgoraMonitor(client=client, journal=journal.append,
+                           max_active=1, stall_timeout=stall_timeout)
+    monitor.attach_delivery(repo_path=str(tmp_path / "repo"),
+                            remote_url=PAT_URL, ssl_verify=True,
+                            state_path=state_path,
+                            ledger_lock=threading.RLock())
+    monitor.attach_conversation(post_note=face.post_note,
+                                answer_question=face.answer_question,
+                                heartbeat_interval=0)
+    monitor.register(7, TID)
+    return monitor, state_path, journal, face
+
+
+def age_stall_window(state_path, tid=TID, age_s=2000.0):
+    """把阶梯 epoch 人为拨老一个窗口（模拟重派后零活动的时间流逝）。"""
+    from agora_monitor import _stall_load, _stall_save  # 内部面直调（测试缝）
+    row = _stall_load(state_path)
+    row[tid]["epoch"] = time.time() - age_s
+    _stall_save(state_path, row)
+
+
+def test_stall_ladder_nudges_twice_redispatches_once_then_blocks(
+        tmp_path, monkeypatch):
+    """ag-da7410 C 三档逐级：零活动超阈值 → task_nudge 强指令×2（间隔同
+    阈值）→ 自动重派恰一次（journal 留痕）→ 重派后仍零活动 → blocked
+    面板提示＋释放名额；此后不再升级。"""
+    client = stall_client()
+    monitor, state_path, journal, face = stall_monitor(tmp_path, client)
+
+    monitor.poll_once()
+    assert len(client.nudges) == 1, "第一档：零活动超阈值即 nudge 强指令"
+    assert client.nudges[0]["body"] == agora_monitor.STALL_NUDGE_TEXT
+    monitor.poll_once()
+    assert len(client.nudges) == 1, "窗口未满：nudge 档间隔同阈值（终闸 R1#1）"
+
+    age_stall_window(state_path)  # 模拟间隔同阈值的时间流逝
+    monitor.poll_once()
+    assert len(client.nudges) == 2, "第二档：间隔同阈值，nudge 第二次"
+
+    age_stall_window(state_path)
+    monitor.poll_once()  # 两轮 nudge 无效 → 自动重派恰一次
+    assert client.dispatch_calls == [TID], "第三档：自动重派恰一次"
+    assert client.nudges == client.nudges[:2], "重派后不再 nudge"
+    assert any("auto-redispatch" in m for m in journal), journal
+    assert monitor.tasks() == [(7, TID)], "重派后名额继续占用"
+
+    monitor.poll_once()  # 重派窗口未满：零动作
+    assert client.dispatch_calls == [TID]
+
+    age_stall_window(state_path)  # 模拟重派后时间流逝满一个窗口
+    monitor.poll_once()  # 重派后仍零活动 → blocked＋面板提示＋释放
+    assert monitor.tasks() == [], "终档释放名额"
+    assert len(face.posts) == 1
+    assert "人工" in face.posts[0][1], "面板必须给人处置提示"
+
+    monitor.poll_once()  # 终档后不再升级
+    assert client.dispatch_calls == [TID], "重派全程恰一次"
+    assert len(client.nudges) == 2
+    assert len(face.posts) == 1
+
+
+def test_stall_ladder_skips_fresh_running_and_non_target_tasks(
+        tmp_path, monkeypatch):
+    """ag-da7410 C 阈值外/非目标不触发：活动新鲜、非 running 态、非
+    external/out_of_band 交付面、stall_timeout=0 关闸——零 nudge 零重派。"""
+    fresh = stall_client(age_s=100.0)
+    monitor, _, _, _ = stall_monitor(tmp_path, fresh)
+    monitor.poll_once()
+    assert fresh.nudges == [] and fresh.dispatch_calls == []
+
+    done = stall_client(state="done")
+    monitor, _, _, _ = stall_monitor(tmp_path, done)
+    monitor.poll_once()
+    assert done.nudges == [] and done.dispatch_calls == []
+
+    internal = stall_client(deliverable=None)
+    monitor, _, _, _ = stall_monitor(tmp_path, internal)
+    monitor.poll_once()
+    assert internal.nudges == [] and internal.dispatch_calls == []
+
+    off = stall_client()
+    monitor, _, _, _ = stall_monitor(tmp_path, off, stall_timeout=0)
+    monitor.poll_once()
+    assert off.nudges == [] and off.dispatch_calls == []
+
+
+def test_stall_ladder_covers_out_of_band_tasks(tmp_path, monkeypatch):
+    """ag-da7410 C：out_of_band（需勘察的验证/解答类）同样受阶梯保护。"""
+    client = stall_client(deliverable="out_of_band")
+    monitor, _, _, _ = stall_monitor(tmp_path, client)
+    monitor.poll_once()
+    assert len(client.nudges) == 1
+
+
+def test_stall_ladder_resets_when_worker_activity_resumes(
+        tmp_path, monkeypatch):
+    """ag-da7410 C：板面活动前移（last_seen 刷新）＝worker 复活——阶梯
+    整体复位；再僵时从第一档重来（不是接着旧计数）。"""
+    client = stall_client()
+    monitor, _, journal, _ = stall_monitor(tmp_path, client)
+    monitor.poll_once()
+    assert len(client.nudges) == 1
+
+    client.tasks[TID]["last_seen"] = time.time() - 100  # worker 复活
+    monitor.poll_once()
+    assert len(client.nudges) == 1, "活动恢复窗口内零动作"
+
+    client.tasks[TID]["last_seen"] = time.time() - 2000  # 再僵满一个窗口
+    monitor.poll_once()
+    assert len(client.nudges) == 2
+    assert client.dispatch_calls == [], "复位后从第一档重来，不直跳重派"
+    assert sum("nudge 1/2" in m for m in journal) >= 2, \
+        "复位后重走第一档（两次 nudge 1/2）"
+
+
+def test_stall_ladder_state_survives_restart(tmp_path, monkeypatch):
+    """ag-da7410 C：阶梯档位持久 sidecar——重启后不重走已耗档位（重派
+    恰一次跨重启成立）。"""
+    client_a = stall_client()
+    monitor_a, state_path, journal_a, _ = stall_monitor(tmp_path, client_a)
+    monitor_a.poll_once()
+    assert len(client_a.nudges) == 1
+
+    age_stall_window(state_path)  # nudge 档间隔同阈值：窗口流逝后才进第二档
+    client_b = stall_client()  # 重启：同 state_path、新客户端新 monitor
+    monitor_b, _, journal_b, _ = stall_monitor(tmp_path, client_b)
+    monitor_b.poll_once()
+    assert len(client_b.nudges) == 1
+    assert any("nudge 2/2" in m for m in journal_b), \
+        "重启必须从第二档续走，不得重放第一档"
+
+
+def test_stall_ladder_rearms_after_panel_retry(tmp_path, monkeypatch):
+    """ag-da7410 终闸 R1#2：终档 exhausted 后面板「重试」（redispatched
+    收位）必须重武装阶梯——新 worker 再沉默时照常 nudge×2→重派→blocked，
+    exhausted 残行不得让监控永久 no-op（名额泄漏）。"""
+    client = stall_client()
+    monitor, state_path, journal, face = stall_monitor(tmp_path, client)
+    for _ in range(2):
+        monitor.poll_once()
+        age_stall_window(state_path)
+    monitor.poll_once()  # 自动重派
+    age_stall_window(state_path)
+    monitor.poll_once()  # 终档 blocked＋释放
+    assert monitor.tasks() == []
+    assert agora_monitor._stall_load(state_path)[TID]["exhausted"] is True
+
+    monitor.redispatched(7, TID)  # 面板「重试」收位（orchestrator 委托）
+    assert monitor.tasks() == [(7, TID)], "重派后重新登记"
+    row = agora_monitor._stall_load(state_path)[TID]
+    assert row["exhausted"] is False and row["nudges"] == 0, \
+        "阶梯行随轮次复位（重武装）"
+
+    age_stall_window(state_path)
+    monitor.poll_once()  # 新轮第一档 nudge
+    assert len(client.nudges) == 3, "重武装后阶梯照常从第一档走"
+
+
+# --- ag-da7410 D: 重派下行注入 handoff 上下文 -----------------------------------
+
+
+def test_stall_redispatch_injects_handoff_context_when_commit_recorded(
+        tmp_path, monkeypatch):
+    """ag-da7410 D 有 handoff 态：C 档自动重派时账本 delivery_commit 在案
+    → 下行 note 注入「前手 handoff 已在案（sha 短）…勿从头重新推导」。"""
+    client = stall_client()
+    monitor, state_path, journal, face = stall_monitor(tmp_path, client)
+    st = state.load_state(state_path)
+    st["issues"]["7"]["delivery_commit"] = hex40("a")
+    state.save_state(state_path, st)
+
+    for _ in range(2):  # nudge×2（档间窗口经 age_stall_window 流逝）
+        monitor.poll_once()
+        age_stall_window(state_path)
+    monitor.poll_once()  # 自动重派
+
+    assert client.dispatch_calls == [TID]
+    notes = [p for p in client.posts if p["kind"] == "note"]
+    assert len(notes) == 1, "重派上下文恰注入一次"
+    body = notes[0]["body"]
+    assert "前手 handoff 已在案" in body
+    assert hex40("a")[:12] in body, "sha 短格式（12 位）"
+    assert "勿从头重新推导" in body
+
+
+def test_stall_redispatch_without_handoff_injects_nothing(tmp_path,
+                                                          monkeypatch):
+    """ag-da7410 D 无 handoff 态：账本无 delivery_commit（前手从未交付）
+    → 重派零注入，不打扰新 worker。"""
+    client = stall_client()
+    monitor, state_path, journal, face = stall_monitor(tmp_path, client)
+
+    for _ in range(2):
+        monitor.poll_once()
+        age_stall_window(state_path)
+    monitor.poll_once()  # 自动重派
+
+    assert client.dispatch_calls == [TID]
+    assert client.posts == [], "无 handoff 在案不得注入"
+
+
+def test_panel_redispatch_injection_reads_ledger_commit(tmp_path,
+                                                        monkeypatch):
+    """ag-da7410 D：inject_handoff_context 独立面（面板「重试」路径由
+    orchestrator 委托）——有/无 delivery_commit 的两态直测。"""
+    client = stall_client()
+    monitor, state_path, _, _ = stall_monitor(tmp_path, client)
+
+    monitor.inject_handoff_context(7, TID)
+    assert client.posts == [], "无 delivery_commit：零动作"
+
+    st = state.load_state(state_path)
+    st["issues"]["7"]["delivery_commit"] = hex40("b")
+    state.save_state(state_path, st)
+    monitor.inject_handoff_context(7, TID)
+    assert len(client.posts) == 1
+    assert client.posts[0]["kind"] == "note"
+    assert hex40("b")[:12] in client.posts[0]["body"]

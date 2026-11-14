@@ -52,6 +52,48 @@ from agora_client import AgoraProtocolError, AgoraRejected, AgoraUnavailable
 
 _HEX40_OK = re.compile(r"[0-9a-f]{40}")
 
+# ag-da7410 B：daemon relay 答案（post answer）下行正文固定追加的续作
+# 契约行——答案送达≠回合终局（ag-895c11 旧2 实证：worker「回应即收工」
+# 7 小时考古）。对真实答复与事实型兜底答复一体生效。
+ANSWER_CONTINUE_CONTRACT = (
+    "答案送达后必须继续任务直至 post(done) 或 post(kind=question)，"
+    "不得以回应答案作为回合终局")
+
+# ag-da7410 C：僵态阶梯缺省阈值（秒，configurable 经 config.
+# agora_stall_timeout；0＝关闸）＋第一档 nudge 强指令文案（服务面
+# /task_nudge 契约 ≤2000 字符）。
+DEFAULT_STALL_TIMEOUT_S = 1800
+STALL_NUDGE_TEXT = (
+    "任务未终局：继续作业或 post(done/question)；若活已完成，快速核验后"
+    "重报 done")
+# 阶梯只作用于本 daemon 自建的 external/out_of_band 任务（deliverable
+# 恒在键，None＝agora 服务面内部合并任务，不归本监视器管）。
+_STALL_DELIVERABLES = ("external_branch", "out_of_band")
+
+# ag-da7410 D：重派下行上下文（面板「重试」与 C 档自动重派共用）——
+# 账本 delivery_commit 在案＝前手工作已交付，新 worker 快速核验后重报
+# done 即可，勿从头重新推导（ag-895c11 旧2 实证：重派 worker 无上下文
+# 提示 7 小时考古）。
+HANDOFF_CONTEXT_TEMPLATE = (
+    "前手 handoff 已在案（{sha}），工作可能已完成：快速核验现状后重报"
+    " done 即可，勿从头重新推导")
+
+
+def _stall_load(state_path) -> dict:
+    """阶梯 sidecar 读：{tid: {nudges, redispatched, exhausted, epoch,
+    last_seen}}；坏/缺文件＝空表（重启重走未落盘的当档，nudge 幂等）。"""
+    try:
+        raw = json.loads(
+            Path(str(state_path) + ".agora-stalls.json").read_text(
+                encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _stall_save(state_path, row) -> None:
+    state.write_json_atomic(str(state_path) + ".agora-stalls.json", row)
+
 # board 主状态（task 行 state）：这三个对本监视器是终态（名额可释放）
 _TERMINAL_STATES = ("merged", "closed", "cancelled")
 
@@ -70,11 +112,14 @@ class _MailDeferred(RuntimeError):
 class AgoraMonitor:
     """本实例活动 agora 任务的登记簿＋轮询线程＋外部交付状态机。"""
 
-    def __init__(self, *, client, journal=None, max_active=1):
+    def __init__(self, *, client, journal=None, max_active=1,
+                 stall_timeout=DEFAULT_STALL_TIMEOUT_S):
         self._client = client
         self._journal = journal if journal is not None else (
             lambda message: None)
         self._max_active = max(1, int(max_active))
+        # ag-da7410 C：僵态阶梯阈值（秒；0＝关闸）
+        self._stall_timeout = max(0, int(stall_timeout))
         self._guard = threading.Lock()
         self._active = {}  # iid(int) -> tid(str|None)：一 issue 一活动任务
         self._stop = threading.Event()
@@ -99,6 +144,8 @@ class AgoraMonitor:
         # 首次出现跨线程并发面——reports sidecar 写者互斥＋per-issue 对账串行
         self._store_lock = threading.Lock()
         self._reconcile_locks = {}
+        # ag-da7410 C：无账本接线（未 attach_delivery）时的阶梯内存态
+        self._stall_mem = {}
 
     # ---- 登记簿 ----
 
@@ -193,12 +240,13 @@ class AgoraMonitor:
         """per-issue 处置↔对账串行锁（ag-1c7315 B-F2）：面板「重试」的
         register 与 poll 线程的 board 读→release 互斥——迟到的 blocked
         收口不得删掉重派后的同 tid 新登记（compare-and-release 只挡异
-        tid）。"""
+        tid）。可重入（ag-da7410 C）：_stall_ladder 在对账锁内自动重派
+        要复用 redispatched() 的收位路径，同线程嵌套获取不得自锁。"""
         with self._guard:
             key = int(iid)
             lock = self._reconcile_locks.get(key)
             if lock is None:
-                lock = threading.Lock()
+                lock = threading.RLock()
                 self._reconcile_locks[key] = lock
             return lock
 
@@ -290,7 +338,164 @@ class AgoraMonitor:
                     self._record_delivery_commit(iid, commit)
                 self._report_comment(iid, tid, commit)
                 self.release(iid, tid)
-        # 其余（pending/integrating 与未到 done 的运行态）：本轮无动作
+        # 其余（pending/integrating 与未到 done 的运行态）：本轮无动作——
+        # running 且零板面活动超阈值时走僵态阶梯（ag-da7410 C）
+        if task_state == "running" \
+                and task.get("deliverable") in _STALL_DELIVERABLES:
+            self._stall_ladder(iid, tid, task)
+
+    # ---- 僵态升级阶梯（ag-da7410 C）----
+
+    def inject_handoff_context(self, iid, tid):
+        """ag-da7410 D：重派下行上下文注入（面板「重试」由 orchestrator
+        委托、C 档自动重派内置调用）——账本 delivery_commit 在案才注入；
+        best-effort：注入失败只 journal，绝不回滚已成功的重派。"""
+        if self._ledger_lock is None or self._state_path is None:
+            return
+        with self._ledger_lock:
+            ledger = state.load_state(self._state_path, warn=self._journal)
+            commit = (ledger["issues"].get(str(int(iid))) or {}
+                      ).get("delivery_commit")
+        if not commit:
+            return
+        try:
+            self._client.post(
+                tid, "note", HANDOFF_CONTEXT_TEMPLATE.format(sha=commit[:12]))
+        except (AgoraUnavailable, AgoraRejected, AgoraProtocolError) as exc:
+            self._journal(f"agora-monitor: issue#{iid} task {tid} handoff "
+                          f"context inject failed (redispatch stands): {exc}")
+        else:
+            self._journal(f"agora-monitor: issue#{iid} task {tid} handoff "
+                          f"context injected ({commit[:12]}) to new worker")
+
+    def _stall_row_load(self):
+        if self._state_path is None:
+            return dict(self._stall_mem)
+        return _stall_load(self._state_path)
+
+    def _stall_row_save(self, tid, st):
+        if self._state_path is None:
+            self._stall_mem[tid] = st
+            return
+        row = _stall_load(self._state_path)
+        row[tid] = st
+        try:
+            _stall_save(self._state_path, row)
+        except OSError as exc:
+            # 落盘失败不阻断阶梯：内存态照常推进（重启重走当档，nudge 幂等）
+            self._journal(f"agora-monitor: stall store write failed: {exc}")
+
+    def _stall_row_prune(self, tid):
+        """终态清行（ag-da7410 终闸 R1#2）：行随任务终局出账，sidecar 不
+        无界增长；面板重试经 redispatched() 重武装，不依赖残行。"""
+        if self._state_path is None:
+            self._stall_mem.pop(tid, None)
+            return
+        row = _stall_load(self._state_path)
+        if tid not in row:
+            return
+        del row[tid]
+        try:
+            _stall_save(self._state_path, row)
+        except OSError as exc:
+            self._journal(f"agora-monitor: stall store prune failed: {exc}")
+
+    @staticmethod
+    def _stall_fresh(seen):
+        return {"nudges": 0, "redispatched": False, "exhausted": False,
+                "epoch": 0.0, "last_seen": seen}
+
+    def _stall_state(self, tid, seen):
+        st = self._stall_row_load().get(tid)
+        fresh = self._stall_fresh(seen)
+        if st is None:
+            return fresh
+        if seen > st.get("last_seen", 0.0):
+            # 板面活动前移＝worker 复活：阶梯整体复位（重派预算随新活动
+            # 恢复——新活动证明旧循环已翻页）
+            return fresh
+        merged = dict(fresh)
+        merged.update({k: st[k] for k in fresh if k in st})
+        return merged
+
+    def _stall_ladder(self, iid, tid, task):
+        """running 且零板面活动（board 行 created/last_seen 口径）超阈值：
+        第一档 task_nudge 强指令×2（间隔同阈值）→ 自动重派恰一次
+        （journal 留痕）→ 重派后仍零活动 → blocked 面板提示＋释放名额。
+        档位持久 sidecar：重启不重走已耗档位（重派恰一次跨重启成立）。"""
+        if not self._stall_timeout:
+            return
+        now = time.time()
+        seen = task.get("last_seen") or 0.0
+        st = self._stall_state(tid, seen)
+        idle = now - max(task.get("created") or 0.0, seen, st["epoch"])
+        if idle < self._stall_timeout or st["exhausted"]:
+            return
+        if st["nudges"] < 2:
+            try:
+                result = self._client.task_nudge(tid, STALL_NUDGE_TEXT)
+                if isinstance(result, dict) and result.get("nudged") is False:
+                    # in-band 软拒（no_worker/注入失败，HTTP 200）：推进到
+                    # 重派对 no_worker 恰是正解，但信号不得静默（终闸 B-F2）
+                    self._journal(
+                        f"agora-monitor: issue#{iid} task {tid} nudge not "
+                        f"delivered ({result.get('reason')}); advancing tier")
+            except AgoraRejected as exc:
+                # 确定性拒绝（no_worker/注入失败）：重试同档无益，按档推进
+                self._journal(f"agora-monitor: issue#{iid} task {tid} "
+                              f"stall nudge rejected, advancing tier: {exc}")
+            except (AgoraUnavailable, AgoraProtocolError) as exc:
+                self._journal(f"agora-monitor: issue#{iid} task {tid} "
+                              f"stall nudge unreachable, retry next poll: "
+                              f"{exc}")
+                return  # 瞬态不落档：下一轮重试本档
+            st["nudges"] += 1
+            st["epoch"] = now  # 档位间隔同阈值：idle 基准随档前移（终闸 R1#1）
+            self._stall_row_save(tid, st)
+            self._journal(f"agora-monitor: issue#{iid} task {tid} stalled "
+                          f"(no board activity {int(idle)}s); stall nudge "
+                          f"{st['nudges']}/2")
+            return
+        if not st["redispatched"]:
+            try:
+                self._client.dispatch(tid)
+            except AgoraRejected as exc:
+                # 服务侧不认为 stalled（如 env 仍在写＝worker 实际活着）：
+                # 以服务口径为准，阶梯复位并退避一个窗口
+                self._journal(f"agora-monitor: issue#{iid} task {tid} "
+                              f"stall redispatch rejected, ladder reset: "
+                              f"{exc}")
+                fresh = self._stall_fresh(seen)
+                fresh["epoch"] = now
+                self._stall_row_save(tid, fresh)
+                return
+            except (AgoraUnavailable, AgoraProtocolError) as exc:
+                self._journal(f"agora-monitor: issue#{iid} task {tid} "
+                              f"stall redispatch unreachable, retry next "
+                              f"poll: {exc}")
+                return
+            st["redispatched"] = True
+            st["epoch"] = time.time()  # 重派后零活动计时从零起算
+            self.redispatched(iid, tid)  # 登记簿/报告库/阶梯行新轮复位（先复位）
+            self._stall_row_save(tid, st)  # 后落档：保住「重派恰一次」标记
+            self.inject_handoff_context(iid, tid)  # ag-da7410 D
+            self._journal(f"agora-monitor: issue#{iid} task {tid} stalled "
+                          "through 2 nudges; auto-redispatched once")
+            return
+        # 重派后仍零活动：终档——面板提示＋释放名额（服务面任务不动）
+        st["exhausted"] = True
+        self._stall_row_save(tid, st)
+        self._comment_once(
+            iid, tid,
+            f"agora 任务 {tid} 自动判僵（nudge×2＋自动重派一次后仍零板面"
+            f"活动超 {self._stall_timeout // 60} 分钟），已释放本实例占用，"
+            "需要人工处理。\n处置：在本 issue 追加评论会直达该 worker"
+            "（post(kind=question) 唤醒通道）；或由维护者在 agora 服务面"
+            "取消/介入该任务。",
+            mark="blocked")
+        self.release(iid, tid)
+        self._journal(f"agora-monitor: issue#{iid} task {tid} stalled after "
+                      "auto-redispatch; blocked on panel, slot released")
 
     # ---- 终态汇报（Task 5）----
 
@@ -329,6 +534,7 @@ class AgoraMonitor:
                                mark="cancelled")
         else:
             self._report_comment(iid, tid, delivery.get("commit"))
+        self._stall_row_prune(tid)
         self.release(iid, tid)
 
     def _finish_blocked(self, iid, tid, delivery):
@@ -344,6 +550,7 @@ class AgoraMonitor:
             text + "，需要人工处理；不自动重派。"
             "\n处置：评论『重试』重派，或『取消任务』归档。",
             mark="blocked")
+        self._stall_row_prune(tid)
         self.release(iid, tid)
 
     def redispatched(self, iid, tid):
@@ -358,6 +565,12 @@ class AgoraMonitor:
         with self._iid_reconcile_lock(iid):
             self.register(iid, tid)
             self._sync_agora_status(iid, "dispatched")
+            # ag-da7410 终闸 R1#2：阶梯行随轮次复位（epoch=now 起新钟）
+            # ——面板「重试」拿到的新 worker 若再沉默，阶梯必须重新武装，
+            # 否则 exhausted 残行让监控永久 no-op（名额泄漏跨重启）。
+            stall = self._stall_fresh(0.0)
+            stall["epoch"] = time.time()
+            self._stall_row_save(tid, stall)
             if self._state_path is None:
                 return
             with self._store_lock:  # B-F1：与 poll 线程报告入库互斥
@@ -834,6 +1047,7 @@ class AgoraMonitor:
         if not answer:
             answer = (f"自动化答复暂不可用，需要人工在 Gitea issue#{iid} "
                       f"跟进。worker 原问题（任务 {tid}）：{body}")
+        answer = f"{answer}\n\n{ANSWER_CONTINUE_CONTRACT}"
         try:
             self._client.post(tid, "answer", answer)
         except (AgoraUnavailable, AgoraProtocolError) as exc:

@@ -60,6 +60,9 @@ class Config:
     router_model: str = ""  # agora 模式必填：持久 Router 的模型
     agora_home: str = ""     # 缺省回落 $AGORA_HOME 再 ""
     agora_poll_interval: int = 15  # agora monitor 轮询秒数，≥1
+    # ag-da7410 C：僵态升级阶梯阈值（秒）——running 任务板面零活动超此值
+    # 触发 nudge×2→自动重派一次→blocked；0＝关闸
+    agora_stall_timeout: int = 1800
 
     @property
     def note_marker(self) -> str:
@@ -168,6 +171,9 @@ def load_config(path: "str | Path | None" = None) -> Config:
                     or os.environ.get("AGORA_HOME", "")),
         agora_poll_interval=_bounded_int(
             raw.get("agora_poll_interval", 15), "agora_poll_interval", 15, 1),
+        agora_stall_timeout=_bounded_int(
+            raw.get("agora_stall_timeout", 1800), "agora_stall_timeout",
+            1800, 0),
     )
     # Canonical-path pin: after all parsing so every pre-existing error
     # contract (missing fields, bad numerics) fires unchanged. Both sides

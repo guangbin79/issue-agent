@@ -7,7 +7,7 @@ router_lock 内串行（同一持久会话不并发收 prompt）；session id �
 
 安全边界（不可协商）：
 - issue 文本是不可信输入；Router 只返回 schema 决策，daemon 校验后才建单。
-- 决策键集恒为六个 schema 键——verify_cmd 等多余键在重建 raw 时被丢弃，
+- 决策键集恒为七个 schema 键——verify_cmd 等多余键在重建 raw 时被丢弃，
   「验收命令只能来自实例可信配置」不靠提示词自觉，靠本模块的硬过滤。
 - Router 绝不携带 write-gate credential_prefix：语义面无写权限需求。
 
@@ -25,8 +25,12 @@ import runner
 import state as state_mod
 from runner import SessionInvalid
 
-DECISION_KEYS = ("schema_version", "action", "title", "goal", "model", "reason")
-ALLOWED_ACTIONS = ("dispatch", "ignore", "question")
+DECISION_KEYS = ("schema_version", "action", "title", "goal", "model",
+                 "deliverable_hint", "reason")
+ALLOWED_ACTIONS = ("dispatch", "ignore", "question", "answer")
+# deliverable_hint 白名单（ag-da7410 A）：唯一显式值 out_of_band（需勘察的
+# 验证/解答类，零提交 review-only）；external_branch 是缺省而非 hint 值。
+ALLOWED_DELIVERABLE_HINTS = ("out_of_band",)
 TITLE_MAX_CHARS = 40
 ROUTER_SESSION_TITLE = "issue-agent router"
 _PLACEHOLDER_RE = re.compile(
@@ -45,6 +49,10 @@ class RouterDecision:
     model: str
     reason: str
     raw: dict
+    # ag-da7410 A：dispatch 的交付面提示——"out_of_band"＝需勘察的验证/
+    # 解答类（零提交、done body=结论文本）；None＝代码修复类缺省
+    # external_branch。answer/ignore/question 不建单，恒 None。
+    deliverable_hint: str = None
 
 
 def available_models_from_doctor(payload) -> list:
@@ -101,9 +109,12 @@ def _extract_json_object(reply_text):
 def _validate_decision(reply_text, available_models) -> RouterDecision:
     """LLM 回复 -> 归一化+校验后的 RouterDecision。
 
-    归一：多余键丢弃（raw 重建为恒等六键）、title 截 40 字、空白剥离。
-    拒绝：未知 action；dispatch 的空 goal；dispatch 的模型不在可用清单
-    （ignore/question 不建单，goal/model 不消费、允许为空）。"""
+    归一：多余键丢弃（raw 重建为恒等七键）、title 截 40 字、空白剥离、
+    deliverable_hint 缺省归一 None。
+    拒绝：未知 action；非法 deliverable_hint；dispatch 的空 goal；
+    dispatch 的模型不在可用清单；answer 的空 goal（goal＝答案文本本体）。
+    （ignore/question 不建单，goal/model 不消费、允许为空；answer 的
+    model 不消费、允许任意。）"""
     parsed = _extract_json_object(reply_text)
     action = parsed.get("action")
     if action not in ALLOWED_ACTIONS:
@@ -112,16 +123,22 @@ def _validate_decision(reply_text, available_models) -> RouterDecision:
     goal = str(parsed.get("goal") or "").strip()
     model = str(parsed.get("model") or "").strip()
     reason = str(parsed.get("reason") or "").strip()
+    hint = str(parsed.get("deliverable_hint") or "").strip() or None
+    if hint is not None and hint not in ALLOWED_DELIVERABLE_HINTS:
+        raise RouterDecisionError(f"unknown deliverable_hint: {hint!r}")
     if action == "dispatch":
         if not goal:
             raise RouterDecisionError("dispatch decision with empty goal")
         if model not in available_models:
             raise RouterDecisionError(
                 f"dispatch model not in available models: {model!r}")
+    elif action == "answer":
+        if not goal:
+            raise RouterDecisionError("answer decision with empty goal")
     raw = dict(zip(DECISION_KEYS, (parsed.get("schema_version"), action,
-                                   title, goal, model, reason)))
+                                   title, goal, model, hint, reason)))
     return RouterDecision(action=action, title=title, goal=goal, model=model,
-                          reason=reason, raw=raw)
+                          reason=reason, raw=raw, deliverable_hint=hint)
 
 
 class SemanticRouter:
