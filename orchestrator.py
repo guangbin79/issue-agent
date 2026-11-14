@@ -1443,6 +1443,22 @@ class Orchestrator:
         in-flight -> closed -> sha debounce -> push/count>0 + pending flush;
         a comment only when origin was rewritten or a flush landed)."""
         key = str(int(iid))
+        # 单写者让位（ag-8d6a70）：agora env 与主仓共享 ref 库，worker 推进
+        # 共享 issue/N-fix 即 daemon-local 分支前进；同时 external_branch 交付
+        # 经 monitor 精确推送同一 origin 分支——两写者必撞车（2026-11-14 变基
+        # 轮双路径交付竞速）。账本登记未终态 agora 任务（agora_status 头段非
+        # merged/closed/cancelled——从未同步的按未终态，安全方向；与
+        # agora_monitor._TERMINAL_STATES 同源的 board 契约）时 sweep 让位，
+        # 终态后外部交付路径收口，才可清欠账。
+        entry = ledger["issues"].get(key) or {}
+        if entry.get("agora_task_id") and \
+                (entry.get("agora_status") or "").split("/", 1)[0] \
+                not in ("merged", "closed", "cancelled"):
+            self._journal(
+                f"sweep: issue#{iid} skip(agora task "
+                f"{entry['agora_task_id']} non-terminal; external "
+                f"delivery owns {gitop.fix_branch(iid)})")
+            return
         # in-flight: live heartbeat registry first, then the ledger snapshot's
         # pending claim (covers heartbeat_interval=0 deployments whose
         # registry stays empty)

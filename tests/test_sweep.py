@@ -768,6 +768,73 @@ class TestReportProbe:
 
 
 # --------------------------------------------------------------------------
+# 单写者原则（ag-8d6a70）：agora 轮中 issue/<iid>-fix 的 origin 推送只归
+# external 交付路径（monitor push_verified_commit）——账本登记未终态
+# agora 任务时 sweep 让位，终态后才可清欠账。
+# --------------------------------------------------------------------------
+
+def _seed_ledger(h, iid=7, **fields):
+    st = {"issues": {}}
+    state.adopt_existing(st, {iid: [1]})
+    st["issues"][str(iid)].update(fields)
+    state.save_state(h.state_path, st)
+
+
+class TestAgoraSingleWriter:
+    def test_active_agora_task_yields_branch(self, tmp_path, monkeypatch):
+        """ag-8d6a70 事故重演（issue#178 等）：env 与主仓共享 ref 库，worker
+        推进共享 issue/N-fix 即 daemon-local 分支前进——账本登记在案任务
+        （agora_status 从未同步，安全方向按未终态）时 sweep 必须让位，
+        不得把变基轮中间态推上 origin 与外部交付撞车。"""
+        h = Harness(tmp_path, monkeypatch)
+        _seed_ledger(h, agora_task_id="ag-123")
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 5}
+        h.remote_tips = {7: SHA_B}
+        h.sweep()
+        assert h.pushes == [] and h.api.posts == []
+        assert h.store()["swept_shas"] == {}, "让位轮不得记账（终态后才可清欠账）"
+        assert h.journal("skip(agora"), "journal 留痕让位事实"
+
+    def test_awaiting_external_window_yields(self, tmp_path, monkeypatch):
+        """done+awaiting_external 交付窗口＝外部交付路径独占写权的关键期，
+        sweep 让位（与 monitor 单写者互斥）。"""
+        h = Harness(tmp_path, monkeypatch)
+        _seed_ledger(h, agora_task_id="ag-123",
+                     agora_status="done/awaiting_external")
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 2}
+        h.sweep()
+        assert h.pushes == [] and h.api.posts == []
+        assert h.journal("skip(agora")
+
+    def test_terminal_agora_status_resumes_payoff(self, tmp_path, monkeypatch):
+        """终态（merged/closed/cancelled）后外部交付路径已收口，sweep
+        恢复清欠账——让位不是永久放弃。"""
+        h = Harness(tmp_path, monkeypatch)
+        _seed_ledger(h, agora_task_id="ag-123",
+                     agora_status="closed/delivered")
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 2}
+        h.remote_tips = {7: SHA_B}
+        h.sweep()
+        assert h.pushes == [7]
+        assert h.store()["swept_shas"] == {"7": SHA_A}
+
+    def test_no_agora_task_legacy_lane_unchanged(self, tmp_path, monkeypatch):
+        """边界：无 agora 任务的分支（legacy 车道）sweep 照旧——不因
+        单写者闸改变 legacy 行为。"""
+        h = Harness(tmp_path, monkeypatch)
+        _seed_ledger(h)  # 有账本条目但无 agora 字段
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 2}
+        h.remote_tips = {7: SHA_B}
+        h.sweep()
+        assert h.pushes == [7]
+        assert h.store()["swept_shas"] == {"7": SHA_A}
+
+
+# --------------------------------------------------------------------------
 # wiring: config + thread lifecycle
 # --------------------------------------------------------------------------
 

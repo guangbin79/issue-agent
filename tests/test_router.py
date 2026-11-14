@@ -418,6 +418,15 @@ def test_template_states_agora_env_rules():
     assert "agora env" in text, "goal 必须声明在派发 env 内工作"
 
 
+def test_template_forbids_touching_shared_fix_branch():
+    """ag-8d6a70 单写者硬禁区：env 与主仓共享 ref 库——worker 动共享
+    issue/<iid>-fix 分支即推进 daemon 侧分支，与外部交付路径撞车。"""
+    text = _template_text()
+    assert "禁止 checkout" in text, "禁止检出共享 fix 分支"
+    assert "禁止 git push" in text
+    assert "issue/{{IID}}-fix" in text, "禁区必须点名共享分支"
+
+
 def test_template_requires_pitfall_last_line_in_final_report():
     text = _template_text()
     assert "坑位：" in text, "最终报告末行坑位提示（计划 L172 原文）"

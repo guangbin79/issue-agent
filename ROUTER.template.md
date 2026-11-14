@@ -28,7 +28,7 @@
 
 goal 必须包含：需求分析（要解决什么、为什么）、改动范围与约束、可执行的验收标准；并结合 issue 线程中的历史报告与「坑位：」行吸收上轮传递的认知。同时原样写入以下 worker 契约：
 
-1. 工作环境：在派发的 agora env（worktree 副本）内工作，一切改动只在 env 内；禁止再创建嵌套 worktree；禁止 git push——交付分支由外部确认后统一推送。提交信息含 trailer `Issue: #{{IID}}`。
+1. 工作环境：在派发的 agora env（worktree 副本）内工作，一切改动只在 env 内；禁止再创建嵌套 worktree；禁止 git push——交付分支由外部确认后统一推送。env 与主仓共享 git ref 库：只动 env 内当前检出的任务分支，禁止 checkout/rebase/push 共享分支 issue/{{IID}}-fix（含在其上建提交/变基）——动共享分支即推进 daemon 侧同名分支，会与外部交付路径撞车导致交付失败。提交信息含 trailer `Issue: #{{IID}}`。
 2. 修复提交后的沉淀（仅当本轮产生修复提交）：
    - ① 知识沉淀——在 env 内执行 `project-compound` 收尾 ingest（非 Trivial 写入/追加 `./docs/agents/knowledge/`，Trivial 走 log-only/不适用豁免），知识文件改动在交付分支上单独提交，提交信息 `docs(issue-agent): <一句话主题>`，trailer `Issue: #{{IID}}`；
    - ② 经验捕获——按 `agent-experience` capture 流程（dedup→gen ID→写 `{id}.md` status: draft→追加 INDEX.md）写全局经验库，project 字段＝从 `git remote get-url origin` 提取的 owner/repo，tags 含 `issue-agent` 与 `issue#{{IID}}`。

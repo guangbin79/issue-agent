@@ -1068,3 +1068,92 @@ def test_multiple_questions_capped_one_per_drain(tmp_path, monkeypatch):
     assert json.loads(
         Path(mail_path_of(state_path)).read_text(encoding="utf-8")
     )["pending"] == []
+
+
+# --- ag-8d6a70：blocked pre-delivery 文案＋取消事实回评缺口 -----------------------
+
+
+def test_blocked_pre_delivery_journals_actual_state_not_push_failed(
+        tmp_path, monkeypatch):
+    """ag-8d6a70：未进交付段（无 delivery.failed）的 blocked 任务从未尝试
+    推送——journal 按实况记 blocked pre-delivery，不得误报 push_failed(None)
+    （2026-11-14 #178/#181 vacuous-done 三连拒文案）。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "blocked"
+    fake_git = FakeGitDelivery(monkeypatch)
+    monitor, state_path, journal = delivery_monitor(tmp_path, monkeypatch,
+                                                    client, fake_git)
+
+    monitor.poll_once()
+
+    assert fake_git.push_calls == [] and client.deliver_calls == []
+    assert monitor.tasks() == [], "blocked 终局释放名额"
+    assert any("blocked pre-delivery" in m for m in journal), journal
+    assert not any("push_failed" in m for m in journal), \
+        ("从未推送不得记 push_failed", journal)
+
+
+def test_result_mail_cancel_after_blocked_release_comments_issue(
+        tmp_path, monkeypatch):
+    """ag-8d6a70 追加项（5）：blocked 释放名额后 root 取消——轮询面已不可
+    见，服务端 notify_transition 的 kind=result 邮件是唯一信号：重读 board
+    确认 cancelled 后回评取消事实（panel 收口；幂等重放不刷屏）。
+    今晨三单（ag-97fa3e/ag-48372f/ag-f0bc27）取消后面板停在求助/失败
+    旧评论的正是此缺口。"""
+    client = FakeAgoraClient()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    # 第一轮：blocked（未进交付段）→ 求助评论＋释放名额，面板停在旧评论
+    client.tasks[TID]["state"] = "blocked"
+    monitor.poll_once()
+    assert monitor.tasks() == []
+    assert len(face.posts) == 1, "blocked 事实评论"
+
+    # root 侧 task_cancel（服务端迁移）；monitor 已释放名额，仅剩邮件信号
+    client.tasks[TID]["state"] = "cancelled"
+    client.mail = [mail_msg(9, kind="result", body=f"任务 {TID} cancelled")]
+    monitor.poll_once()
+
+    assert monitor.tasks() == []
+    assert len(face.posts) == 2, "取消事实必须回评收口"
+    assert "取消" in face.posts[1][1]
+    assert "失败" not in face.posts[1][1], "取消不归因质量失败"
+    assert entry(state_path)["agora_status"] == "cancelled", \
+        "账本终态同步（轮询不再覆盖）"
+
+    # 重放同一封 result 邮件不得重复回评（幂等）
+    client.mail = [mail_msg(10, kind="result", body=f"任务 {TID} cancelled")]
+    monitor.poll_once()
+    assert len(face.posts) == 2
+
+
+def test_result_mail_board_unreachable_defers_for_replay(
+        tmp_path, monkeypatch):
+    """ag-8d6a70：result 邮件对账读 board 瞬断——留 pending 下一轮重放
+    （同 B-2 纪律：瞬态≠毒，取消事实不因一次网络病丢失）。"""
+    client = FakeAgoraClient()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    client.tasks[TID]["state"] = "cancelled"
+    client.mail = [mail_msg(11, kind="result", body=f"任务 {TID} cancelled")]
+    original_board = client.board
+    board_down = {"down": True}
+
+    def flaky_board(tid=None):
+        if board_down["down"]:
+            raise AgoraUnavailable("board down (fake)")
+        return original_board(tid)
+
+    monkeypatch.setattr(client, "board", flaky_board)
+    monitor.poll_once()
+    pending = json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8"))["pending"]
+    assert len(pending) == 1, "瞬断的 result 邮件必须留待重放"
+    assert face.posts == []
+
+    board_down["down"] = False
+    monitor.poll_once()
+    assert len(face.posts) == 1, "恢复后取消事实照常回评"
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] == []

@@ -5,7 +5,9 @@
 Task 4：poll 按 board(task) 的 state/delivery 驱动外部交付状态机——done＋
 awaiting_external → push_verified_commit 精确推送 → task_deliver；non_ff →
 fetch 实际远端 tip 轮转 handoff（同一任务循环，不做本地 rebase）；
-blocked/failed → 记 push_failed 不自动重派不弹回 worker。
+blocked/failed → 按实况记 push_failed/blocked pre-delivery 不自动重派
+不弹回 worker（ag-8d6a70：未进交付段的 blocked 从未推送，不误报
+push_failed(None)）。
 
 Task 5：
 - 汇报管线：check_mail 整批先原子落盘 state_path+".agora-mail.json" 再
@@ -217,12 +219,20 @@ class AgoraMonitor:
             return
         if task_state == "blocked" or delivery.get("status") == "failed":
             # 交付失败终局（rebase_conflict/push_failed/retry_exhausted…，
-            # 设计 §7.4/§8.2）：记 push_failed 不自动重派、不弹回 worker；
-            # 人工跟进（回评推送具体错误）
-            self._journal(
-                f"agora-monitor: issue#{iid} task {tid} push_failed "
-                f"({delivery.get('error')}); blocked, manual follow-up, "
-                "no auto-redispatch")
+            # 设计 §7.4/§8.2）：不自动重派、不弹回 worker，人工跟进（回评
+            # 具体错误）。未进交付段就 blocked 的任务从未尝试过推送——按
+            # 实况记 blocked pre-delivery，不误报 push_failed(None)（ag-8d6a70：
+            # 2026-11-14 #178/#181 vacuous-done 三连拒文案）
+            if delivery.get("status") == "failed":
+                self._journal(
+                    f"agora-monitor: issue#{iid} task {tid} push_failed "
+                    f"({delivery.get('error')}); blocked, manual follow-up, "
+                    "no auto-redispatch")
+            else:
+                self._journal(
+                    f"agora-monitor: issue#{iid} task {tid} blocked "
+                    "pre-delivery (no push attempted); manual follow-up, "
+                    "no auto-redispatch")
             self._finish_blocked(iid, tid, delivery)
             return
         if task_state == "done":
@@ -281,7 +291,8 @@ class AgoraMonitor:
         if task_state == "cancelled":
             self._comment_once(iid, tid,
                                f"agora 任务 {tid} 已取消（board 口径，非质量"
-                               "结论）；issue 待人工跟进。")
+                               "结论）；issue 待人工跟进。",
+                               mark="cancelled")
         else:
             self._report_comment(iid, tid, delivery.get("commit"))
         self.release(iid, tid)
@@ -293,7 +304,8 @@ class AgoraMonitor:
                     f"（{delivery.get('error') or 'unknown'}）")
         else:
             text = f"agora 任务 {tid} 被 blocked（board 口径）"
-        self._comment_once(iid, tid, text + "，需要人工处理；不自动重派。")
+        self._comment_once(iid, tid, text + "，需要人工处理；不自动重派。",
+                           mark="blocked")
         self.release(iid, tid)
 
     def _report_comment(self, iid, tid, commit):
@@ -316,19 +328,28 @@ class AgoraMonitor:
                     "汇报（可另发「重发汇报」索取）。")
         self._comment_once(iid, tid, text)
 
-    def _comment_once(self, iid, tid, text):
-        """终态评论只发一次：finalized 先落盘再评论（崩溃窗宁可少一条
-        评论也不重复刷屏；报告已持久化可查）。评论通道未接线＝零动作。"""
+    def _comment_once(self, iid, tid, text, mark="final"):
+        """终态评论按 mark 只发一次：final＝交付/终局汇报，blocked＝求助，
+        cancelled＝取消事实（ag-8d6a70：blocked 收口后再被 root 取消是
+        不同事实，各评一次，单布尔 finalized 会把取消事实吞掉）。finalized
+        先落盘再评论（崩溃窗宁可少一条评论也不重复刷屏；报告已持久化可查）。
+        评论通道未接线＝零动作。"""
         if self._state_path is None:
             return
         store = self._reports_load()
         entry = store.setdefault("reports", {}).setdefault(
             tid, {"iid": int(iid), "note": None, "note_id": -1,
-                  "finalized": False})
-        if entry.get("finalized"):
+                  "finalized": False, "sent_marks": []})
+        sent = list(entry.get("sent_marks") or [])
+        # 旧档案（布尔 finalized）迁移：True＝final 评论已发，其余 mark 照常
+        if entry.get("finalized") and "final" not in sent:
+            sent.append("final")
+        if mark in sent:
             return
         entry["iid"] = int(iid)
-        entry["finalized"] = True
+        sent.append(mark)
+        entry["sent_marks"] = sent
+        entry["finalized"] = mark == "final" or bool(entry.get("finalized"))
         state.write_json_atomic(self._reports_path(), store)
         self._comment(iid, text)
 
@@ -432,9 +453,16 @@ class AgoraMonitor:
             self._finish_terminal(iid, tid, task_state, delivery)
             return
         if task_state == "blocked" or delivery.get("status") == "failed":
-            self._journal(f"agora-monitor: issue#{iid} push_failed "
-                          f"({delivery.get('error')}); blocked, manual "
-                          "follow-up, no auto-redispatch")
+            # 同 _reconcile_task 的 blocked 分支口径：未进交付段按实况记
+            # blocked pre-delivery，只有 delivery.failed 才是 push_failed
+            if delivery.get("status") == "failed":
+                self._journal(f"agora-monitor: issue#{iid} push_failed "
+                              f"({delivery.get('error')}); blocked, manual "
+                              "follow-up, no auto-redispatch")
+            else:
+                self._journal(f"agora-monitor: issue#{iid} task {tid} "
+                              "blocked pre-delivery (no push attempted); "
+                              "manual follow-up, no auto-redispatch")
             self._finish_blocked(iid, tid, delivery)
             return
         if delivery.get("status") == "delivered" and attempted \
@@ -586,8 +614,10 @@ class AgoraMonitor:
             self._handle_worker_question(iid, tid, body)
         elif kind == "answer":
             self._comment(iid, f"worker 答复（任务 {tid}）：\n{body}")
+        elif kind == "result":
+            self._handle_result_mail(iid, tid, body)
         else:
-            # result/done/verify 等状态类消息：board 是唯一权威（不以
+            # done/verify 等状态类消息：board 是唯一权威（不以
             # worker 自述为准），只留痕
             self._journal(f"agora-monitor: mail kind={kind} for {tid} "
                           "noted (board is authoritative)")
@@ -620,7 +650,8 @@ class AgoraMonitor:
             return  # 已有更新的报告（或同条重放）
         reports[tid] = {"iid": int(iid), "note": body,
                         "note_id": int(mid) if mid is not None else -1,
-                        "finalized": bool(current.get("finalized"))}
+                        "finalized": bool(current.get("finalized")),
+                        "sent_marks": list(current.get("sent_marks") or [])}
         try:
             state.write_json_atomic(self._reports_path(), store)
         except OSError as exc:
@@ -655,6 +686,39 @@ class AgoraMonitor:
         except AgoraRejected as exc:
             self._journal(f"agora-monitor: answer post rejected for {tid}, "
                           f"dropped (deterministic): {exc}")
+
+    def _handle_result_mail(self, iid, tid, body):
+        """生命周期迁移回传（agorad notify_transition：终态与 blocked 实时
+        kind=result 直投 dispatcher）。blocked/failed 释放名额后的迁移
+        （如 root 取消 blocked 任务）轮询面已不可见——本邮件是唯一信号
+        （ag-8d6a70：2026-11-14 三单取消后面板停在求助/失败旧评论）。board
+        为权威：重读 board 确认终态才回评终局文案（不以邮件正文自述为准；
+        _comment_once 按 mark 幂等，轮询路径已回评过则零动作）。"""
+        self._journal(f"agora-monitor: result mail for {tid}: {body}")
+        try:
+            task = self._board_task(tid)
+        except AgoraRejected as exc:
+            # 确定性 4xx（任务已不在服务面）：毒邮件口径，消费不重放
+            self._journal(f"agora-monitor: result mail reconcile rejected "
+                          f"for {tid}, dropped (deterministic): {exc}")
+            return
+        except (AgoraUnavailable, AgoraProtocolError) as exc:
+            # 瞬断≠毒：留 pending 下一轮重放（取消事实不因一次网络病丢失）
+            raise _MailDeferred(f"result mail board reconcile transient "
+                                f"for {tid}: {exc}") from exc
+        task_state = task.get("state")
+        delivery = task.get("delivery") or {}
+        if task_state not in _TERMINAL_STATES:
+            return  # 非 terminal（如 blocked 迁移本身）：轮询面已覆盖
+        try:
+            self._sync_agora_status(iid, self._status_text(task_state,
+                                                           delivery))
+            self._finish_terminal(iid, tid, task_state, delivery)
+        except OSError as exc:
+            # 终闸 B-3 同口径：落盘瞬态≠毒消息——留 pending 重放（按 mark
+            # 幂等，重投不刷屏），取消事实不因一次磁盘病丢失
+            raise _MailDeferred(f"result mail finalize store failed for "
+                                f"{tid}: {exc}") from exc
 
     # ---- 心跳（Task 5：agora 回合报 board 态；legacy 心跳不变）----
 
