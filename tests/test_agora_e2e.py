@@ -229,7 +229,7 @@ class ScriptedRouter:
     def decide(self, *, iid, event, issue_context, available_models):
         self.calls += 1
         return RouterDecision(
-            action="dispatch", title=f"issue#{iid}: e2e"[:40],
+            action="dispatch", title="e2e scripted",
             goal=ROUTER_GOAL.replace("issue#7", f"issue#{iid}"),
             model=WORKER_MODEL, reason="e2e scripted", raw={})
 

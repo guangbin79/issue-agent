@@ -2615,6 +2615,8 @@ def test_run_turn_returns_after_dispatch_and_releases_issue_lock(
         assert entry["session_id"] is None, "legacy session_id 不被 agora 改写"
 
         call = client.create_calls[0]
+        assert call["title"] == "issue#7: 修复 #7", \
+            "建单标题确定性拼 issue#N 前缀（看板可辨 issue），Router 原标题保留其后"
         assert call["client_key"] == "issue-agent:issue-7:note-0"
         assert call["target_branch"] == "issue/7-fix"
         assert call["deliverable"] == "external_branch"

@@ -882,7 +882,8 @@ class Orchestrator:
                     target_branch=gitop.fix_branch(iid),
                     verify_cmd=self.verify_command,
                     model=decision.model,
-                    title=decision.title,
+                    # 看板可辨 issue：确定性拼前缀，不依赖 Router LLM 自觉
+                    title=f"issue#{iid}: {decision.title}"[:40],
                     client_key=f"{self.service_name}:issue-{iid}:note-{note_id or 0}",
                     after=self._agora_previous_tid(iid),
                 )
@@ -1186,7 +1187,8 @@ class Orchestrator:
                 self._journal(
                     f"turn: issue#{iid} recovering persisted router payload")
                 return router.RouterDecision(
-                    action="dispatch", title=f"issue#{iid}"[:40],
+                    # 占位 title：经建单点统一加 issue#N 前缀，故不自带前缀
+                    action="dispatch", title="recovered",
                     goal=entry["router_goal"], model=entry["router_model"],
                     reason="recovered", raw={})
             issue_ctx_title = ""
