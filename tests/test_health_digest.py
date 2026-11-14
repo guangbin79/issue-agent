@@ -202,6 +202,18 @@ def test_no_instances_rc1(tmp_path):
     assert "未发现" in text
 
 
+def test_config_unreadable_is_problem(tmp_path):
+    """glob 命中却读不出的 config＝真实问题，不得静默降级 legacy。"""
+    cfg_dir = tmp_path / ".config" / "demo-issue-agent"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text("{ not json", encoding="utf-8")
+    rc, text = run_digest(tmp_path, service_state=lambda svc: "active",
+                          journal_reader=lambda svc: "")
+    assert rc == 1
+    assert "config.json 不可读" in text
+    assert "服务状态: active" in text      # 其余检查照常执行
+
+
 # --- 默认 agora 探针（真实 HTTP，本机假服务） -----------------------------------
 
 class _RecordingHandler(BaseHTTPRequestHandler):
@@ -280,3 +292,33 @@ def test_default_probe_discovery_failure_no_leak(tmp_path):
                                         "demo-issue-agent", [])
     assert result["ok"] is False
     assert ROOT_TOKEN not in result["error"]
+
+
+def test_default_probe_non_dict_board_response(tmp_path):
+    """/board 200 但顶层非 dict（null/[]）→ ok:False 归类返回，不逃异常。"""
+    class _NullBoard(_RecordingHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            body = b"null" if self.path == "/board" else b"{}"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_POST = _handle
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _NullBoard)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        home = write_agora_home(tmp_path, server.server_address[1])
+        result = health_digest._agora_probe(home, "demo-issue-agent",
+                                            ["ag-1"], timeout_s=5)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result["ok"] is False
+    assert "non-dict" in result["error"]
