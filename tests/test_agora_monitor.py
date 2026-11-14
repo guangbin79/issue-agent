@@ -987,6 +987,30 @@ def test_poison_non_object_mail_message_does_not_break_batch(
         journal
 
 
+def test_unknown_task_mail_warns_with_attribution_hint(tmp_path, monkeypatch):
+    """ag-ee0c29 缺口2（#182 锚例）：账本无属主的任务邮件（账本 tid 已被
+    新单覆盖的孤儿窗口）不得无声 dropped——journal warning 含 tid/kind，
+    且按报告库历史 tid 给出归属提示（可能属主 issue#N）。"""
+    client = FakeAgoraClient()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    old = "ag-2b98a7"  # 不在注册表、不在账本（tid 已被新单覆盖）
+    state.write_json_atomic(
+        reports_path_of(state_path),
+        {"reports": {old: {"iid": 7, "note": "开工",
+                           "note_id": 1, "finalized": False,
+                           "sent_marks": []}}})
+    client.mail = [mail_msg(21, tid=old, kind="question", body="还在吗？")]
+
+    monitor.poll_once()
+
+    warnings = [m for m in journal if "unknown task" in m and old in m]
+    assert warnings, journal
+    assert any("question" in m for m in warnings), "warning 必须含 kind"
+    assert any("warning" in m for m in warnings), "不得无声 dropped"
+    assert any("issue#7" in m for m in warnings), "归属提示命名可能属主"
+
+
 # --- 终闸三分册修复（B-1/B-2/B-3/B-4） -------------------------------------------
 
 

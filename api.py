@@ -143,9 +143,18 @@ class GitLabClient:
     def issue_state(self, project, number):
         """State of one issue ("open"/"closed"/...) — the sweep's closed-skip
         probe; a transient failure raises and the caller treats it as open."""
+        return self.get_issue(project, number)["state"]
+
+    def get_issue(self, project, number):
+        """One issue's number/title/body/state — the single-issue GET
+        projection (issue_state delegates here; requeue context, ag-ee0c29)."""
         payload, _ = self._request_json(
             "GET", f"/api/v1/repos/{_repo_path(project)}/issues/{int(number)}")
-        return (payload or {}).get("state") or "open"
+        payload = payload or {}
+        return {"number": payload.get("number"),
+                "title": payload.get("title") or "",
+                "body": payload.get("body") or "",
+                "state": payload.get("state") or "open"}
 
     def close_issue(self, project, number):
         """Close issue *number* (B6: 回合判定「范围外」后的自动关单).

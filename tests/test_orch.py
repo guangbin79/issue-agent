@@ -120,6 +120,12 @@ class FakeApi:
         self.since_seen.append((int(iid), since_iso))
         return self.issues.get(int(iid), [])
 
+    def get_issue(self, project, number):
+        record = {"number": int(number), "title": f"issue {number}",
+                  "body": "", "state": "open"}
+        record.update(self.issue_records.get(int(number), {}))
+        return record
+
     def close_issue(self, project, iid):
         if self.close_error is not None:
             raise self.close_error
@@ -317,6 +323,7 @@ class FakeAgoraClient:
         self.posts = []          # {"task", "kind", "body"}
         self.post_failures = []  # 提交时抛出的异常队列
         self.board_task = {"state": "running"}  # relay 回落前的 board 重读面
+        self.board_failures = []  # board 读抛出的异常队列（4xx 模拟）
         self.cancel_calls = []   # task_cancel 调用记账（关单语义必须为零）
 
     def post(self, tid, kind, body):
@@ -326,6 +333,8 @@ class FakeAgoraClient:
 
     def board(self, tid):
         """relay 回落前的 board 重读面（终闸 B-1：4xx ≠ 终态专有）。"""
+        if self.board_failures:
+            raise self.board_failures.pop(0)
         return {"task": dict(self.board_task), "events": []}
 
     def task_cancel(self, tid):
@@ -2657,6 +2666,7 @@ def test_crash_between_create_and_dispatch_recovers_original_task(
     pending；重试走持久化 goal/model＋同 client_key，只恢复原任务。"""
     client = FakeAgoraClient()
     client.dispatch_failures.append(AgoraUnavailable("dispatch down (fake)"))
+    client.board_task = {"state": "todo"}  # dispatch 未达：board 实时态未派发
     router_ = FakeRouter()
     monitor = FakeMonitor()
     h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
@@ -2837,6 +2847,7 @@ def test_new_note_round_redecides_and_chains_after_previous_tid(
         assert h.entry(7)["session_id"] == "ses_legacy"
 
         monitor.release(7, "ag-123")  # 上轮任务终态：新评论才会重新路由
+        client.board_task = {"state": "merged"}  # 终态须 board 实时态作证（ag-ee0c29）
         h.listener.queue.put(comment_event(iid=7, comment_id=102))
         assert wait_until(
             lambda: h.entry(7)["agora_task_id"] == "ag-124"
@@ -2971,7 +2982,10 @@ def test_active_comment_reaches_worker_without_waiting_for_turn(
         assert client.created_ids == ["ag-123"], "活动窗口零新任务"
         assert len(router_.calls) == 1, "零重路由"
         assert h.entry(7)["agora_task_id"] == "ag-123", "登记 tid 不被覆盖"
-        assert turn_finalized(h, 7), "直通回合照常收尾（claim 闭环）"
+        # post 可见→finalize 落账有毫秒级 I/O 窗（终闸 B 册证基线 flake
+        # 7/40）：收尾断言必须走 wait_until 而非立即断言
+        assert wait_until(lambda: turn_finalized(h, 7)), \
+            "直通回合照常收尾（claim 闭环）"
     finally:
         h.orch.stop()
 
@@ -2988,6 +3002,7 @@ def test_terminal_comment_uses_router_for_new_round(tmp_path, monkeypatch):
         h.listener.queue.put(issue_open_event(iid=7))
         assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
         monitor.release(7, "ag-123")  # 任务终态：monitor 收口释放
+        client.board_task = {"state": "merged"}  # 终态须 board 实时态作证（ag-ee0c29）
 
         h.listener.queue.put(
             comment_event(iid=7, body="继续修复边界情况", comment_id=102))
@@ -3173,6 +3188,7 @@ def test_close_keeps_inflight_and_reopen_restores_routing(
         assert wait_until(lambda: h.entry(7)["status"] == "active"), \
             h.journal_msgs
         monitor.release(7, "ag-123")  # 在飞任务此后由 monitor 交付收口
+        client.board_task = {"state": "merged"}  # 收口＝board 终态（ag-ee0c29 建单前实时校验面）
         h.listener.queue.put(
             comment_event(iid=7, body="重开后继续修", comment_id=103))
         assert wait_until(lambda: len(client.created_ids) == 2), h.journal_msgs
@@ -3265,6 +3281,244 @@ def test_relay_rejected_non_terminal_keeps_pending(tmp_path, monkeypatch):
             "任务仍存活时绝不建新回合"
         assert len(router_.calls) == 1, "零重路由"
         assert h.entry(7)["agora_task_id"] == "ag-123", "登记不覆盖"
+    finally:
+        h.orch.stop()
+
+
+# --- ag-ee0c29: 车道自主性三缺口 -------------------------------------------------
+
+
+def test_preflight_relays_to_alive_ledger_task_despite_stale_cache(
+        tmp_path, monkeypatch):
+    """ag-ee0c29 缺口1（#182 锚例）：注册表失联＋账本缓存过期（缓存谓
+    merged、board 实时态 running）→ 建新回合前必须实时核对 board——评论
+    直通在案 worker，绝不产生双活任务、绝不覆盖账本 tid。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        # 重启/释放窗后注册表失联；账本缓存过期（谓已 merged）
+        monitor.release(7, "ag-123")
+        st = state.load_state(h.state_path)
+        st["issues"]["7"]["agora_status"] = "merged"
+        state.save_state(h.state_path, st)
+        client.board_task = {"state": "running"}  # board 实时态：仍在飞
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="补充：日志在附件", comment_id=102))
+        assert wait_until(lambda: any(p["kind"] == "question"
+                                      for p in client.posts)), h.journal_msgs
+        assert client.created_ids == ["ag-123"], \
+            "board 实时态非终态：绝不建新单（双活）"
+        assert "日志在附件" in client.posts[-1]["body"], "评论原样直通"
+        assert h.entry(7)["agora_task_id"] == "ag-123", "登记不被覆盖"
+        assert len(router_.calls) == 1, "零重路由"
+    finally:
+        h.orch.stop()
+
+
+def test_preflight_relay_transient_defers_for_preflight_rerun(
+        tmp_path, monkeypatch):
+    """ag-ee0c29 缺口1 补充：preflight 直通瞬断→defer（不置 agora_pending）
+    ——重试必须重跑 preflight 直通原 worker，而非落入旧 router_goal 的中断
+    恢复通道把评论换成旧 goal（绝不丢评论）。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        monitor.release(7, "ag-123")
+        client.board_task = {"state": "running"}
+        client.post_failures.append(AgoraUnavailable("post down (fake)"))
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="补充：日志在附件", comment_id=102))
+        assert wait_until(lambda: h.entry(7)["status"] == "defer"), \
+            h.journal_msgs
+        assert h.entry(7)["agora_pending"] is False, \
+            "preflight 失败不得走中断恢复通道（会复用旧 goal 丢评论）"
+
+        client.post_failures.clear()
+        h.api.issues[7] = [{"id": 102, "body": "补充：日志在附件",
+                            "user": {"login": "someone"}}]
+        requeue_retry(h, 7)
+        assert wait_until(lambda: any(p["kind"] == "question"
+                                      for p in client.posts)), h.journal_msgs
+        assert "日志在附件" in client.posts[-1]["body"], "评论原样直通"
+        assert client.created_ids == ["ag-123"], "重试不建新单"
+        assert len(router_.calls) == 1, "零重路由"
+    finally:
+        h.orch.stop()
+
+
+def test_preflight_cancels_blocked_stale_task_before_new_round(
+        tmp_path, monkeypatch):
+    """ag-ee0c29 缺口1：board 实时态 blocked（delivery failed）且注册表已
+    释放 → 先以派发方身份自动取消旧单再建新轮（处置内聚），旧单不再
+    孤儿化、账本 tid 正常推进。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        monitor.release(7, "ag-123")  # blocked 收口释放窗
+        client.board_task = {"state": "blocked",
+                             "delivery": {"status": "failed"}}
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="换思路：请改用方案 B", comment_id=102))
+        assert wait_until(lambda: len(client.created_ids) == 2), h.journal_msgs
+        assert client.cancel_calls == ["ag-123"], "先自动取消旧单"
+        assert wait_until(
+            lambda: client.dispatch_calls == ["ag-123", "ag-124"]), \
+            h.journal_msgs
+        assert wait_until(
+            lambda: monitor.registered == [(7, "ag-123"), (7, "ag-124")]), \
+            h.journal_msgs
+        assert h.entry(7)["agora_task_id"] == "ag-124", "登记推进到新轮"
+        assert client.create_calls[-1]["after"] == "ag-123", "新轮链上旧单"
+    finally:
+        h.orch.stop()
+
+
+def test_preflight_terminal_board_allows_new_round_without_cancel(
+        tmp_path, monkeypatch):
+    """ag-ee0c29 缺口1：board 实时态终态（merged）→ 正常新轮，绝不误触
+    task_cancel。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        monitor.release(7, "ag-123")
+        client.board_task = {"state": "merged"}
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="还有问题", comment_id=102))
+        assert wait_until(lambda: len(client.created_ids) == 2
+                          and turn_finalized(h, 7)), h.journal_msgs
+        assert client.cancel_calls == [], "终态无需取消"
+        assert h.entry(7)["agora_task_id"] == "ag-124"
+    finally:
+        h.orch.stop()
+
+
+def test_preflight_pending_alive_board_relays_not_recovers(
+        tmp_path, monkeypatch):
+    """ocr R1 #1：agora_pending 置位（gate 路径 relay 被拒但旧单已派发且
+    活着）＋注册表失联 → 重试不得跳过 board 校验走恢复通道建新单（#182
+    双活窗重开）——实时态活着照常直通原 worker。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        # gate 路径 relay 被拒但任务活着 → keep_pending 置位；随后注册表失联
+        monitor.release(7, "ag-123")
+        st = state.load_state(h.state_path)
+        st["issues"]["7"]["agora_pending"] = True
+        st["issues"]["7"]["last_note_id"] = 102
+        state.save_state(h.state_path, st)
+        h.api.issues[7] = [{"id": 102, "body": "补充：日志在附件",
+                            "user": {"login": "someone"}}]
+        client.board_task = {"state": "running"}  # 实时态：已派发且活着
+
+        requeue_retry(h, 7)
+        assert wait_until(lambda: any(p["kind"] == "question"
+                                      for p in client.posts)), h.journal_msgs
+        assert client.created_ids == ["ag-123"], \
+            "pending 不豁免实时校验：活着绝不建新单"
+        assert len(router_.calls) == 1, "零重路由（不走恢复通道）"
+    finally:
+        h.orch.stop()
+
+
+def test_preflight_board_rejected_defers_not_new_round(
+        tmp_path, monkeypatch):
+    """终闸 A 册：4xx ≠ 终态专有（限流/校验同样 4xx）——preflight board
+    被拒且复核非终态时按存活 defer，绝不放行建新单（双活窗）。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        monitor.release(7, "ag-123")
+        # board 读被 429 拒（preflight 一次＋终态复核一次，均非终态证据）
+        client.board_failures.extend([
+            AgoraRejected("429 too many requests (fake)"),
+            AgoraRejected("429 too many requests (fake)"),
+        ])
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="还有问题", comment_id=102))
+        assert wait_until(lambda: h.entry(7)["status"] == "defer"), \
+            h.journal_msgs
+        assert client.created_ids == ["ag-123"], "绝不放行建新单"
+        assert client.cancel_calls == []
+        assert len(router_.calls) == 1, "零路由"
+    finally:
+        h.orch.stop()
+
+
+def test_legacy_requeue_placeholder_keeps_retry_message(harness):
+    """ocr R1：缺口 3 占位补全只属 agora 车道——legacy 重试的 message 必须
+    仍是「系统重试」继续指令（被 issue 正文顶替会丢继续信号）。"""
+    harness.api.issue_records[7] = {"title": "构建失败", "body": "CI 全红"}
+    st = state.load_state(harness.state_path)
+    st["issues"]["7"] = orchestrator._empty_entry()
+    st["issues"]["7"].update(status="defer", session_id="ses_1")
+    state.save_state(harness.state_path, st)
+
+    harness.orch._handle_requeue(7)  # noqa: SLF001——直驱同 test_orch 惯例
+
+    assert len(harness.runner.cont_calls) == 1, "legacy 重试继续旧会话"
+    message = harness.runner.cont_calls[0]["message"]
+    assert orchestrator.RETRY_MESSAGE in message
+    assert "CI 全红" not in message, "legacy 不吃 issue 正文顶替"
+
+
+def test_requeue_placeholder_fetches_issue_context(tmp_path, monkeypatch):
+    """ag-ee0c29 缺口3（#334 锚例）：issue 新建首回合被打断（无 note 载荷）
+    → requeue 不得以 RETRY_MESSAGE 占位喂 Router——从 Gitea 拉 issue 标题+
+    正文组装完整 Router 上下文，路由不再求澄清停摆。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.api.issue_records[7] = {"title": "构建失败 #334",
+                                  "body": "CI 全红，日志见附件"}
+        st = state.load_state(h.state_path)
+        st["issues"]["7"] = orchestrator._empty_entry()
+        st["issues"]["7"]["status"] = "defer"  # 无 last_note_id：占位载荷
+        state.save_state(h.state_path, st)
+
+        requeue_retry(h, 7)
+
+        assert client.created_ids == ["ag-123"], "恢复通道照常建单派发"
+        context = router_.calls[-1]["issue_context"]
+        assert context["title"] == "构建失败 #334", "Router 收到完整标题"
+        assert context["body"] == "CI 全红，日志见附件", "Router 收到完整正文"
+        event = router_.calls[-1]["event"]
+        assert event["issue"]["title"] == "构建失败 #334"
     finally:
         h.orch.stop()
 
@@ -3498,6 +3752,7 @@ def test_blocked_cancel_command_cancels_and_announces_fact(
         assert monitor.cancellations == [(7, "ag-123")], "取消事实回评面"
         assert client.dispatch_calls == [] and client.created_ids == []
         assert client.posts == [], "指令本身不 relay"
+        client.board_task = {"state": "cancelled"}  # 取消后 board 实时态（ag-ee0c29）
 
         h.listener.queue.put(
             comment_event(iid=7, body="换个思路再看看", comment_id=103))
@@ -3537,8 +3792,9 @@ def test_disposal_commands_on_running_task_are_ignored(
 
 
 def test_disposal_command_requires_whole_line(tmp_path, monkeypatch):
-    """ag-1c7315：非整行（「请重试一下」）不触发指令——按普通评论走
-    Router 建新回合（blocked 名额已释放）；零 dispatch、零 cancel。"""
+    """ag-1c7315：非整行（「请重试一下」）不触发指令——按普通评论走建新
+    回合；ag-ee0c29 起 blocked 旧单由建单前实时校验自动取消（处置内聚，
+    非指令路径）。"""
     client = FakeAgoraClient()
     router_ = FakeRouter()
     monitor = FakeMonitor(max_active=2)
@@ -3546,13 +3802,15 @@ def test_disposal_command_requires_whole_line(tmp_path, monkeypatch):
                       monitor=monitor)
     try:
         seed_blocked_agora_task(h)
+        client.board_task = {"state": "blocked",
+                             "delivery": {"status": "failed"}}
         h.listener.queue.put(
             comment_event(iid=7, body="请重试一下", comment_id=102))
         assert wait_until(lambda: len(client.created_ids) == 1), \
             h.journal_msgs
-        # 普通回合自身会 dispatch 新建任务——这里只锁「零取消」与
-        # 「走了 Router 建新回合」，不误断 dispatch_calls
-        assert client.cancel_calls == []
+        assert monitor.cancellations == [], "非整行绝不触发指令处置面"
+        assert client.cancel_calls == ["ag-123"], \
+            "旧单由 preflight 自动取消（ag-ee0c29），非指令路径"
         assert len(router_.calls) == 1, "按普通评论走 Router 建新回合"
     finally:
         h.orch.stop()
