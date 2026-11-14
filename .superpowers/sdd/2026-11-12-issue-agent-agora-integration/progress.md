@@ -42,3 +42,6 @@ Fix: complete — ag-8d6a70 merged@a2153c2 closed（650=642+8；根因实证：e
 Ruling (用户裁定 2026-11-14): blocked 处置=方案 C——先人工（回评机制即观察仪器），vacuous-blocked 若复现成常态再立窄域自动取消单（方案 A）；不做全量自动化（B 否）。
 2026-11-14 午后：titannavi 切换 agora（verify=bash ./build_linux.sh 评审先例；重启打断的 #334 安全 requeue 且已入 agora 车道）；两实例快照均=main a2153c2。
 新需求双单：ag-723860（issue-agent health_digest.py 巡检脚本）＋ag-71ce44（dotfiles cron-dispatch 08:30 任务槽＋notify-owner 每日邮，接口契约互钉：rc 0/1 定主题前缀）。
+2026-11-14 傍晚追加：F105 部署（假冲突自愈+冲突文件点名，agorad 重启换端口→两实例 monitor 断连 30min→daemon 重启恢复，暴露 AgoraClient 端口缓存终身制缺陷）；车道自主性部署（d981659）；面板指令上线首战抓到门控漏判（done+交付失败形态）。新增修复/增强：ag-ac5771（重试门控实时 board＋端口跟随）、ag-06f271（建轮前 merge-tree 预探测＋对齐轮前置——用户裁定：冲突消灭在源头而非处置得快）。
+Ruling (用户裁定 2026-11-14 晚): 对齐策略=准点制（lazy）——不做建轮前预对齐（ag-06f271 已取消）、不做恒绿看守；真冲突走 blocked→面板「重试」一句话触发对齐轮。F105 假冲突自愈＋面板指令为准点制兜底。
+Ruling+Task (2026-11-14 晚二): 准点制策略审计发现变基轮落地缺口——rewrite 链不含旧链 vs external 交付 ff-only 永不 force → #182 反复 blocked 的真根因；legacy §4 护栏（rebase_safe_to_force+force-with-lease）未移植。派 ag-6da714（串 ag-ac5771 后）：non_ff 先护栏判定，安全则 rewrite 落地，不安全走现状链。
