@@ -1157,3 +1157,122 @@ def test_result_mail_board_unreachable_defers_for_replay(
     assert json.loads(
         Path(mail_path_of(state_path)).read_text(encoding="utf-8")
     )["pending"] == []
+
+
+# --- ag-1c7315：面板评论指令处置（处置提示行＋重派/取消收位） ---------------------
+
+
+def test_blocked_comment_carries_disposal_hint(tmp_path, monkeypatch):
+    """ag-1c7315：blocked 收口评论追加处置提示行——面板上的人知道有
+    「重试／取消任务」这双手。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "blocked"
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    assert len(face.posts) == 1
+    text = face.posts[0][1]
+    assert "重试" in text and "取消任务" in text, text
+
+
+def test_redispatched_rearms_slot_and_clears_round_marks(
+        tmp_path, monkeypatch):
+    """ag-1c7315：redispatched＝面板「重试」的 monitor 收位——重新登记
+    名额（relay/交付轮询恢复）并清旧轮 sent_marks：重派后新一轮再
+    blocked 必须照常回评求助，不被旧轮标记吞掉。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "blocked"
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()  # 第一轮 blocked：求助评论＋释放名额
+    assert len(face.posts) == 1 and monitor.tasks() == []
+
+    client.tasks[TID]["state"] = "running"
+    monitor.redispatched(7, TID)
+    assert monitor.tasks() == [(7, TID)], "重派后名额恢复"
+
+    client.tasks[TID]["state"] = "blocked"
+    monitor.poll_once()
+    assert len(face.posts) == 2, "新一轮 blocked 必须再次回评"
+
+
+def test_announce_cancelled_posts_fact_once_and_dedups_result_mail(
+        tmp_path, monkeypatch):
+    """ag-1c7315：announce_cancelled＝面板「取消任务」的事实回评——与
+    result-mail 收口回评同 mark 幂等：面板恰好一条取消事实，邮件重放
+    不刷屏；账本同步终态。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "blocked"
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    monitor.poll_once()  # blocked 求助评论（posts=1）
+
+    client.tasks[TID]["state"] = "cancelled"
+    monitor.announce_cancelled(7, TID)
+    assert len(face.posts) == 2 and "取消" in face.posts[1][1]
+
+    client.mail = [mail_msg(12, kind="result", body=f"任务 {TID} cancelled")]
+    monitor.poll_once()
+    assert len(face.posts) == 2, "result-mail 收口回评被 mark 幂等吞并"
+    assert entry(state_path)["agora_status"] == "cancelled"
+
+
+def test_redispatch_during_blocked_finalize_keeps_registration(
+        tmp_path, monkeypatch):
+    """B 册 F2（ag-1c7315 评审）：poll 线程 blocked 收口的回评窗内面板
+    「重试」重登记——迟到的 release（同 tid 过 compare-and-release 防线）
+    不得删掉新登记，否则任务在飞却无人轮询/relay（交付断头）。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "blocked"
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    in_comment = threading.Event()
+    release_comment = threading.Event()
+
+    def gated_hook(iid):  # 卡住 blocked 回评 POST：拉长 poll 的收口窗口
+        in_comment.set()
+        assert release_comment.wait(timeout=5)
+
+    face.note_hook = gated_hook
+    poll_thread = threading.Thread(target=monitor.poll_once)
+    poll_thread.start()
+    assert in_comment.wait(timeout=5), "poll 必须已进入 blocked 回评"
+    redis_thread = threading.Thread(target=monitor.redispatched,
+                                    args=(7, TID))
+    redis_thread.start()
+    redis_thread.join(timeout=2.0)  # 无串行锁版（修复前）此刻已完成
+    release_comment.set()           # 放行回评 → poll 走迟到 release 收口
+    poll_thread.join(timeout=5.0)
+    redis_thread.join(timeout=5.0)
+    assert monitor.tasks() == [(7, TID)], \
+        "迟到的 blocked release 不得删掉重派新登记"
+
+
+def test_redispatched_clears_stale_round_report(tmp_path, monkeypatch):
+    """ag-1c7315 R1（o-3）：重派轮次重置清旧轮报告但保留 note_id 重放
+    水位——旧轮 blocked 报告不得冒充新轮「worker 最终汇报」或被「重发
+    汇报」回放；重放的旧轮 pending 邮件（mid≤水位）亦不得再入库（R2）。"""
+    client = FakeAgoraClient()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    state.write_json_atomic(reports_path_of(state_path), {
+        "reports": {TID: {"iid": 7, "note": "旧轮根因分析", "note_id": 5,
+                          "finalized": False, "sent_marks": []}}})
+
+    monitor.redispatched(7, TID)
+
+    store_entry = json.loads(
+        Path(reports_path_of(state_path)).read_text(encoding="utf-8")
+    )["reports"][TID]
+    assert store_entry["note"] is None, "旧轮报告随轮次重置清空"
+    assert store_entry["note_id"] == 5, "note_id 保留＝跨轮重放水位"
+    assert monitor.report_for(7) is None, "重发汇报不得回放旧轮报告"
+
+    monitor._store_report_note(7, TID, 5, "旧轮 pending 邮件重放")
+    replayed = json.loads(
+        Path(reports_path_of(state_path)).read_text(encoding="utf-8")
+    )["reports"][TID]
+    assert replayed["note"] is None, "重放的旧轮邮件（mid≤水位）不得入库"

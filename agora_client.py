@@ -175,6 +175,10 @@ class AgoraClient:
     def dispatch(self, tid) -> None:
         self._task_call("/task_dispatch", {"task": tid})
 
+    def task_cancel(self, tid) -> None:
+        """task_cancel（dispatcher 身份可取消自己名下任务；叶子任务级联 0）。"""
+        self._task_call("/task_cancel", {"task": tid})
+
     def board(self, tid=None) -> dict:
         return self._task_call("/board", {"task": tid} if tid is not None else {})
 

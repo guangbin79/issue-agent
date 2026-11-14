@@ -43,6 +43,11 @@ Actions and what the orchestrator must do for each:
                in-flight status (active/paused/defer/pending/blocked/adopted)
     "reopen"   ledger status -> active; no session created (the next
                qualifying comment continues)
+    "redispatch" panel disposal of a BLOCKED agora task (ag-1c7315, whole
+               line 重试/解决冲突/重派): the orchestrator re-dispatches
+               the SAME task; anything else -> journal-only ignore
+    "cancel_task" panel disposal (ag-1c7315, whole line 取消任务/取消):
+               task_cancel on the blocked task; same ignore rule
     "ignore"   nothing
 
 Inputs
@@ -70,7 +75,8 @@ Rules (in evaluation order)
     (adopted counts as tracked), comment id not already processed.
     Then, before the general rule, whole-line commands (body.strip() equal):
     暂停 / pause (case-insensitive) -> "pause"; 恢复 / resume
-    (case-insensitive) -> "unpause"; 重发汇报 -> "repost". Containment
+    (case-insensitive) -> "unpause"; 重发汇报 -> "repost"; 重试 / 解决冲突 /
+    重派 -> "redispatch"; 取消任务 / 取消 -> "cancel_task". Containment
     ("这个暂停逻辑有 bug") must NOT trigger.
     General rule: ledger status paused -> ignore; adopted -> "new";
     anything else -> "continue".
@@ -180,6 +186,10 @@ def _command(body):
         return "unpause"
     if line == "重发汇报":
         return "repost"
+    if line in ("重试", "解决冲突", "重派"):
+        return "redispatch"
+    if line in ("取消任务", "取消"):
+        return "cancel_task"
     return None
 
 

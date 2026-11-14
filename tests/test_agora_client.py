@@ -110,6 +110,7 @@ def default_routes(task="ag-123"):
         ("POST", "/check_mail"): lambda rec: (200, {"messages": [{"id": 1}]}),
         ("POST", "/doctor"): lambda rec: (200, {"models": ["m"]}),
         ("POST", "/task_deliver"): lambda rec: (200, {"task": task, "delivery": {}}),
+        ("POST", "/task_cancel"): lambda rec: (200, {"ok": True}),
     }
 
 
@@ -225,6 +226,16 @@ def test_check_mail_unwraps_messages_and_post_returns_none(tmp_path):
         assert combo.client.check_mail() == [{"id": 1}]
         assert combo.client.post("ag-123", "note", "hi") is None
         assert combo.client.dispatch("ag-123") is None
+
+
+def test_task_cancel_carries_dispatcher_plane_and_task_body(tmp_path):
+    """ag-1c7315：task_cancel 走任务面（dispatcher 牌）＋最小 body。"""
+    with with_server(default_routes(), tmp_path) as combo:
+        assert combo.client.task_cancel("ag-123") is None
+    reqs = [r for r in combo.server.requests if r["path"] == "/task_cancel"]
+    assert len(reqs) == 1
+    assert reqs[0]["json"] == {"task": "ag-123"}
+    assert reqs[0]["token"] == DISPATCHER_TOKEN
 
 
 def test_poll_interval_returns_configured_float():

@@ -408,6 +408,8 @@ class FakeMonitor:
         self.report = None  # report_for 脚本化返回（None＝无持久报告）
         self.started = 0
         self.stopped = 0
+        self.redispatches = []   # redispatched() 记账（ag-1c7315 面板重试收位）
+        self.cancellations = []  # announce_cancelled() 记账（ag-1c7315）
 
     def attach_delivery(self, **kwargs):
         self.attached = kwargs
@@ -451,6 +453,13 @@ class FakeMonitor:
             return
         del self._active[key]
         self.released.append(key)
+
+    def redispatched(self, iid, tid):
+        self.register(iid, tid)
+        self.redispatches.append((int(iid), tid))
+
+    def announce_cancelled(self, iid, tid):
+        self.cancellations.append((int(iid), tid))
 
     def start(self):
         self.started += 1
@@ -3415,5 +3424,178 @@ def test_agora_outage_does_not_fallback_to_legacy_runner(tmp_path, monkeypatch):
         assert h.entry(7)["agora_pending"] is True
         assert h.entry(7)["status"] == "pending", "claim 留存待重试"
         assert client.created_ids == []
+    finally:
+        h.orch.stop()
+
+
+# --- ag-1c7315: 面板评论指令处置 blocked（重试／取消任务） ------------------------
+
+
+def seed_blocked_agora_task(h, *, iid=7, tid="ag-123",
+                            agora_status="blocked"):
+    """账本登记 blocked agora 任务（blocked 收口后的稳态：名额已释放、
+    agora_status 头段 blocked）。"""
+    st = state.load_state(h.state_path)
+    entry = st["issues"].setdefault(str(iid), state._new_issue("active"))
+    entry["agora_task_id"] = tid
+    entry["agora_status"] = agora_status
+    state.save_state(h.state_path, st)
+    return tid
+
+
+@pytest.mark.parametrize("body,status", [
+    ("重试", "blocked"),
+    ("解决冲突", "blocked/failed"),  # delivery failed 同归 blocked 处置面
+    ("重派", "blocked"),
+])
+def test_blocked_retry_command_redispatches_same_task_and_confirms(
+        tmp_path, monkeypatch, body, status):
+    """ag-1c7315：blocked＋整行「重试／解决冲突／重派」→ daemon 以
+    dispatcher 凭据对同任务 task_dispatch（零建单零路由）→ 回评重派确认
+    （含新轮说明）→ monitor 重新登记（后续评论恢复直通新 worker）。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        seed_blocked_agora_task(h, agora_status=status)
+        h.listener.queue.put(
+            comment_event(iid=7, body=body, comment_id=102))
+        assert wait_until(lambda: client.dispatch_calls == ["ag-123"]), \
+            h.journal_msgs
+        assert monitor.redispatches == [(7, "ag-123")], \
+            "重派后必须重新登记（relay 与交付轮询恢复）"
+        assert client.created_ids == [] and len(router_.calls) == 0, \
+            "重派走同任务：不建新任务、不路由"
+        assert client.cancel_calls == [] and client.posts == [], \
+            "指令本身不取消、不 relay"
+        confirms = [text for _, text in h.api.posts if "ag-123" in text]
+        assert confirms and "重派" in confirms[0] \
+            and "新 worker" in confirms[0], h.api.posts
+        assert 102 in h.entry(7)["processed_note_ids"], "指令消费即记账"
+    finally:
+        h.orch.stop()
+
+
+@pytest.mark.parametrize("body", ["取消任务", "取消"])
+def test_blocked_cancel_command_cancels_and_announces_fact(
+        tmp_path, monkeypatch, body):
+    """ag-1c7315：blocked＋整行「取消任务／取消」→ task_cancel → 回评
+    取消事实（与 result-mail 收口回评同 mark 幂等）；此后新评论走 Router
+    新回合（终态语义自然衔接）。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor(max_active=2)
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        seed_blocked_agora_task(h)
+        h.listener.queue.put(
+            comment_event(iid=7, body=body, comment_id=102))
+        assert wait_until(lambda: client.cancel_calls == ["ag-123"]), \
+            h.journal_msgs
+        assert monitor.cancellations == [(7, "ag-123")], "取消事实回评面"
+        assert client.dispatch_calls == [] and client.created_ids == []
+        assert client.posts == [], "指令本身不 relay"
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="换个思路再看看", comment_id=103))
+        assert wait_until(lambda: len(client.created_ids) == 1), \
+            h.journal_msgs
+        assert len(router_.calls) == 1, "取消终态后新评论走 Router 新回合"
+    finally:
+        h.orch.stop()
+
+
+def test_disposal_commands_on_running_task_are_ignored(
+        tmp_path, monkeypatch):
+    """ag-1c7315：running（在飞）收到「重试／取消任务」→ 忽略并 journal：
+    零 dispatch、零 cancel、零评论、零 relay——绝不误触在飞任务。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        seed_active_agora_task(h)  # running 在案：relay 稳态
+        st = state.load_state(h.state_path)
+        st["issues"]["7"]["agora_status"] = "running"
+        state.save_state(h.state_path, st)
+
+        for n, body in enumerate(("重试", "取消任务"), start=1):
+            h.listener.queue.put(
+                comment_event(iid=7, body=body, comment_id=100 + n))
+            # needle 不得是测试名子串：pytest tmp 目录名内嵌测试名，会
+            # 撞上「ledger unreadable (/tmp/…)」journal 造成假绿
+            assert wait_until(
+                lambda n=n: len(h.journal("ignored (agora_status")) >= n), \
+                h.journal_msgs
+        assert client.dispatch_calls == [] and client.cancel_calls == []
+        assert client.posts == [] and h.api.posts == [], \
+            "非 blocked 指令零动作零评论零 relay"
+    finally:
+        h.orch.stop()
+
+
+def test_disposal_command_requires_whole_line(tmp_path, monkeypatch):
+    """ag-1c7315：非整行（「请重试一下」）不触发指令——按普通评论走
+    Router 建新回合（blocked 名额已释放）；零 dispatch、零 cancel。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor(max_active=2)
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        seed_blocked_agora_task(h)
+        h.listener.queue.put(
+            comment_event(iid=7, body="请重试一下", comment_id=102))
+        assert wait_until(lambda: len(client.created_ids) == 1), \
+            h.journal_msgs
+        # 普通回合自身会 dispatch 新建任务——这里只锁「零取消」与
+        # 「走了 Router 建新回合」，不误断 dispatch_calls
+        assert client.cancel_calls == []
+        assert len(router_.calls) == 1, "按普通评论走 Router 建新回合"
+    finally:
+        h.orch.stop()
+
+
+def test_disposal_command_failure_posts_fact_note(tmp_path, monkeypatch):
+    """ag-1c7315：重派被服务端拒（确定性 4xx）→ 回评失败事实（面板不
+    静默）且不重新登记。"""
+    client = FakeAgoraClient()
+    client.dispatch_failures.append(AgoraRejected("任务不在 blocked (fake)"))
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        seed_blocked_agora_task(h)
+        h.listener.queue.put(
+            comment_event(iid=7, body="重试", comment_id=102))
+        assert wait_until(
+            lambda: any("执行失败" in text for _, text in h.api.posts)), \
+            h.journal_msgs
+        assert monitor.redispatches == [] and monitor.registered == [], \
+            "失败不得重新登记"
+    finally:
+        h.orch.stop()
+
+
+def test_redispatch_respects_capacity_gate(tmp_path, monkeypatch):
+    """ag-1c7315 R1（o-2）：面板「重试」与正常回合同受 max_active 容量闸
+    （F3 绝不超额建单）——满员时不 dispatch、不占位，回评提示稍后重发。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor(max_active=1)
+    monitor.reserve(8)  # 他 issue 占满名额
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        seed_blocked_agora_task(h)
+        h.listener.queue.put(
+            comment_event(iid=7, body="重试", comment_id=102))
+        assert wait_until(
+            lambda: any("名额已满" in text for _, text in h.api.posts)), \
+            h.journal_msgs
+        assert client.dispatch_calls == [], "满员不得 dispatch"
+        assert monitor.redispatches == [] and monitor.registered == [], \
+            "满员不得重新登记"
+        assert h.entry(7)["agora_status"] == "blocked", \
+            "门未过，账本状态不动（重发「重试」即重试通道）"
     finally:
         h.orch.stop()
