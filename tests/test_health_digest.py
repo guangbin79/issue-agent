@@ -345,7 +345,7 @@ def test_repo_fetch_failure_is_problem_and_not_fatal(tmp_path):
                           journal_reader=lambda svc: "",
                           repos=(str(bad), str(good)))
     assert rc == 1
-    assert "fetch 失败" in text
+    assert "fetch 失败（fatal" in text        # 带 stderr 原因，可直接定位
     assert "同步" in text                      # 其余仓照常出结论
 
 

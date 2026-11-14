@@ -225,13 +225,19 @@ def check_instance(svc, config_root, state_root, now, service_state,
 
 
 def _git(repo, *args, timeout_s=30):
-    """在 repo 跑 git；返回 (rc, stdout)。OSError/超时归一为 rc≠0。"""
+    """在 repo 跑 git；返回 (rc, stdout, stderr)。OSError/超时归一为 rc≠0。"""
     try:
         proc = subprocess.run(["git", "-C", str(repo), *args],
                               capture_output=True, text=True, timeout=timeout_s)
-        return proc.returncode, proc.stdout
+        return proc.returncode, proc.stdout, proc.stderr
     except (OSError, subprocess.SubprocessError):
-        return 1, ""
+        return 1, "", ""
+
+
+def _err_tail(err):
+    """stderr 首个非空行（git 病因行，截 80 字符，带括号）；空则空串。"""
+    lines = [ln.strip() for ln in err.splitlines() if ln.strip()]
+    return f"（{lines[0][:80]}）" if lines else ""
 
 
 def check_local_repos(repos, emit):
@@ -242,17 +248,19 @@ def check_local_repos(repos, emit):
     problems = []
     for entry in repos:
         repo = Path(entry).expanduser()
-        rc, _ = _git(repo, "fetch", "-q", timeout_s=120)
+        rc, _, err = _git(repo, "fetch", "-q", timeout_s=120)
         if rc != 0:
-            emit(f"{entry}: fetch 失败")
-            problems.append(f"本地消费仓 {entry}: fetch 失败")
+            hint = _err_tail(err)
+            emit(f"{entry}: fetch 失败{hint}")
+            problems.append(f"本地消费仓 {entry}: fetch 失败{hint}")
             continue
         dirty = ("（dirty）"
                  if _git(repo, "status", "--porcelain")[1].strip() else "")
-        rc, out = _git(repo, "rev-list", "--count", "HEAD..@{u}")
+        rc, out, err = _git(repo, "rev-list", "--count", "HEAD..@{u}")
         if rc != 0:
-            emit(f"{entry}: 上游对比失败{dirty}")
-            problems.append(f"本地消费仓 {entry}: 上游对比失败")
+            hint = _err_tail(err)
+            emit(f"{entry}: 上游对比失败{hint}")
+            problems.append(f"本地消费仓 {entry}: 上游对比失败{hint}")
         elif out.strip() == "0":
             emit(f"{entry}: 同步{dirty}")
         else:
