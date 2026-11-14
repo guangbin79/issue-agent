@@ -502,11 +502,13 @@ class AgoraMonitor:
         （base）重写到 handoff 是否零丢失——本地 issue/<iid>-fix 必须就是
         在案 handoff（force 只推已验证的精确 commit，不带分支漂移后的
         内容出门），且 rebase_safe_to_force 证明旧链提交在新链全有
-        range-diff 对应。双条件全过 → force-with-lease 锚定 base 落地
-        并记 align-rewrite 一行；任一不过 → False（维持 non_ff 轮转
-        现状链，绝不 force）。落地走 push_force_classified（ag-cad1d6）：
-        确定性 force 拒绝抛 ForcePushRejected 由调用方分类路由（轮转/
-        终局），传输病/未命中形态向上抛——poll 层按传输病有界重试。"""
+        range-diff 对应。双条件全过 → 精确 sha refspec（handoff 本身，
+        ag-852c8f：推送的即验证过的内容，探测→push 窗口对协议外写手
+        免疫）＋force-with-lease 锚定 base 落地并记 align-rewrite 一行；
+        任一不过 → False（维持 non_ff 轮转现状链，绝不 force）。落地走
+        push_force_classified（ag-cad1d6）：确定性 force 拒绝抛
+        ForcePushRejected 由调用方分类路由（轮转/终局），传输病/未命中
+        形态向上抛——poll 层按传输病有界重试。"""
         branch = gitop.fix_branch(iid)
         if gitop.local_branch_tip(self._repo_path, branch) != handoff:
             self._journal(f"agora-monitor: issue#{iid} local {branch} "
@@ -518,8 +520,13 @@ class AgoraMonitor:
             self._journal(f"agora-monitor: issue#{iid} rewrite unsafe "
                           f"({reason}); rotating handoff, no force")
             return False
+        # ag-852c8f（High-2）：精确 sha refspec——推 handoff 本身而非分支
+        # 当前位置，探测→push 窗口内协议外写手移动共享分支无法改变出门
+        # 内容（推送的即验证过的）；写手动远端则 lease（期望值＝探测时
+        # 远端 tip base）失配，push 失败进分类路径，绝不产假 ack 成功
         gitop.push_force_classified(
-            self._repo_path, self._remote_url, f"{branch}:{branch}",
+            self._repo_path, self._remote_url,
+            f"{handoff}:refs/heads/{branch}",
             self._ssl_verify, force_with_lease=f"{branch}:{base}")
         self._journal(f"agora-monitor: issue#{iid} align-rewrite landed "
                       f"via force-with-lease ({handoff[:12]} over "
