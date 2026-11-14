@@ -467,9 +467,12 @@ def test_non_ff_safe_rewrite_lands_via_force_with_lease(tmp_path, monkeypatch):
 
     monitor.poll_once()
 
+    # ag-852c8f（High-2）：refspec 必须是精确 sha 形态——推的即探测时
+    # 验证过的 handoff 内容，探测→push 窗口内本地分支被协议外写手移动
+    # 也无法改变出门内容；lease 期望值＝探测时远端 tip（base）
     assert fake_git.force_push_calls == [{
         "repo": monitor._repo_path, "remote_url": PAT_URL,
-        "refspec": "issue/7-fix:issue/7-fix", "ssl_verify": True,
+        "refspec": f"{handoff}:refs/heads/issue/7-fix", "ssl_verify": True,
         "force_with_lease": f"issue/7-fix:{base}"}]
     assert fake_git.rebase_calls[0] == {
         "branch": "issue/7-fix", "remote_tip": base, "local_tip": handoff}

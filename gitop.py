@@ -31,7 +31,9 @@ surface is exactly:
   outside that parent
 
 Safety contract:
-- push accepts exactly one refspec shape, issue/<iid>-fix:issue/<iid>-fix;
+- push accepts exactly two refspec shapes: issue/<iid>-fix:issue/<iid>-fix,
+  and the exact-sha form <40-hex>:refs/heads/issue/<iid>-fix (ag-852c8f:
+  pushing the verified commit itself, immune to probe→push branch drift);
   anything else (notably any default-branch refspec) raises RefspecViolation
   before a single git byte is executed
 - force pushes go only through push_fix_branch_resilient: plain push first;
@@ -69,7 +71,23 @@ PathLike = Union[str, "os.PathLike[str]"]
 
 _REFSPEC_OK = re.compile(r"^issue/(\d+)-fix:issue/\1-fix$")
 
+# ag-852c8f（High-2）：精确 sha refspec——源是完整 40-hex、目标钉死
+# refs/heads/issue/<iid>-fix。推送内容与本地分支名解耦：探测→push 窗口
+# 内协议外写手移动共享分支无法改变出门内容，假 ack 窗口根除。
+# 全零 OID 除外（push refspec 语义＝删远端分支，push_verified_commit 同拒）。
+_REFSPEC_SHA_OK = re.compile(r"^([0-9a-f]{40}):refs/heads/issue/(\d+)-fix$")
+
 _REVIEW_BRANCH_OK = re.compile(r"^refs/heads/issue/\d+-fix$")
+
+
+def _refspec_allowed(refspec: str) -> bool:
+    """白名单二形态（ag-852c8f）：issue/<iid>-fix:issue/<iid>-fix（legacy
+    分支形态）或 <40-hex>:refs/heads/issue/<iid>-fix（精确 sha 形态，全零
+    OID＝删分支语义除外）。"""
+    if _REFSPEC_OK.match(refspec):
+        return True
+    m = _REFSPEC_SHA_OK.match(refspec)
+    return bool(m) and m.group(1) != "0" * 40
 
 
 class GitopError(Exception):
@@ -412,7 +430,7 @@ def _push_core(repo: PathLike, remote_url: str, refspec: str,
     pin_english=True 时钉 LC_ALL=C——失败输出要喂词表分类（ag-cad1d6），
     本地化 git 的译文才不会把分类标记 miss 掉（push_verified_commit
     同款纪律）。legacy push() 不钉，行为与抽取前逐字节一致。"""
-    if not isinstance(refspec, str) or not _REFSPEC_OK.match(refspec):
+    if not isinstance(refspec, str) or not _refspec_allowed(refspec):
         raise RefspecViolation(
             f"refspec {refspec!r} outside issue/<iid>-fix whitelist"
         )
@@ -581,7 +599,9 @@ def push_fix_branch_resilient(repo: PathLike, iid, remote_url: str,
         raise PermanentPushFailed(
             _scrub(f"rewrite unsafe, refusing force push: {reason}", remote_url)
         )
-    push(repo, remote_url, f"{branch}:{branch}", ssl_verify,
+    # ag-852c8f：精确 sha refspec——推探测时验证的 local_tip 本身，探测→
+    # push 窗口内本地分支被移动也带不出未验证内容（同形假 ack 窗口对齐）
+    push(repo, remote_url, f"{local_tip}:refs/heads/{branch}", ssl_verify,
          force_with_lease=f"{branch}:{remote_tip}")
     return "force-pushed"
 

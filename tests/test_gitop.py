@@ -711,6 +711,109 @@ def test_push_force_classified_real_protected_remote_rejects(
                cwd=bare_remote) == first, "被拒后远端不动"
 
 
+# --- 精确 sha refspec：根除假 ack（ag-852c8f High-2） ----------------------------
+
+
+def test_push_sha_refspec_form_passes_whitelist(repo, monkeypatch):
+    """白名单第二形态（仅此形态，最小开口）：<40-hex>:refs/heads/issue/
+    <iid>-fix 直接出门到 argv；全零 OID（push refspec 语义＝删远端分支）、
+    短 sha、钉错目标 ref 一律 RefspecViolation——git 字节未执行前拒。"""
+    fake = FakeRun()
+    monkeypatch.setattr("gitop._run", fake)
+    url = "https://oauth2:SECRETPAT@host/repo.git"
+    tip = "a" * 40
+    lease = f"issue/7-fix:{'b' * 40}"
+    push(repo, url, f"{tip}:refs/heads/issue/7-fix", ssl_verify=False,
+         force_with_lease=lease)
+    assert fake.calls[0][-2] == "https://host/repo.git", "PAT 不上 argv"
+    assert fake.calls[0][-1] == f"{tip}:refs/heads/issue/7-fix"
+    assert fake.calls[0][-3] == f"--force-with-lease={lease}"
+    for bad in (
+            f"{'0' * 40}:refs/heads/issue/7-fix",   # 删分支语义
+            "deadbeef:refs/heads/issue/7-fix",      # 非 40-hex
+            f"{tip}:refs/heads/master",             # 目标非 fix 分支
+            f"{tip}:issue/7-fix",                   # 目标缺 refs/heads/ 前缀
+    ):
+        with pytest.raises(RefspecViolation):
+            push(repo, url, bad, ssl_verify=False)
+
+
+def test_sha_refspec_push_lands_verified_sha_not_moved_branch(
+        repo, remote_url, bare_remote):
+    """窗口模拟·本地侧（High-2 机制复现的反面）：探测（tip==handoff）后
+    本地分支被协议外写手移动——sha refspec 推的仍是探测时验证的 commit，
+    远端落地即验证内容，delivered ack 诚实。branch:branch 旧形态在此
+    场景会把 rogue tip 带出门（假 ack）。"""
+    branch = fix_branch(7)
+    git("checkout", "-B", branch, cwd=repo)
+    base = commit_file(repo, "base.txt", "base\n", "base")
+    git("push", remote_url, f"{branch}:{branch}", cwd=repo)
+    handoff = commit_file(repo, "fix.txt", "fix\n", "fix")  # 探测时 tip
+    commit_file(repo, "rogue.txt", "rogue\n", "rogue")      # 窗口内写手移动分支
+
+    push_force_classified(repo, remote_url, f"{handoff}:refs/heads/{branch}",
+                          force_with_lease=f"{branch}:{base}")
+
+    assert git("rev-parse", f"refs/heads/{branch}", cwd=bare_remote) == \
+        handoff, "落地的是验证过的 sha，不是分支当前位置"
+
+
+def test_sha_refspec_lease_mismatch_after_remote_moves_fails_no_fake_ack(
+        repo, remote_url, bare_remote):
+    """窗口模拟·远端侧：探测→push 之间远端 ref 被协议外写手移动——
+    lease 期望值（探测时远端 tip）失配 → push 失败上抛，远端保持移动后
+    内容：写手只能把落地打成失败（重探重试），绝无「落地未验证内容而
+    ack 报 handoff」的假 ack 成功。"""
+    branch = fix_branch(7)
+    git("checkout", "-B", branch, cwd=repo)
+    probed = commit_file(repo, "probed.txt", "p\n", "probed tip")  # 探测时远端 tip
+    git("push", remote_url, f"{branch}:{branch}", cwd=repo)
+    moved = commit_file(repo, "moved.txt", "m\n", "external writer moved remote")
+    git("push", remote_url, f"{branch}:{branch}", cwd=repo)
+    handoff = commit_file(repo, "fix.txt", "f\n", "verified rewrite")
+
+    with pytest.raises(PushFailed) as excinfo:
+        push_force_classified(repo, remote_url,
+                              f"{handoff}:refs/heads/{branch}",
+                              force_with_lease=f"{branch}:{probed}")
+    assert not isinstance(excinfo.value, ForcePushRejected), \
+        "stale info 未命中词表：保守面＝可重试 PushFailed"
+    assert git("rev-parse", f"refs/heads/{branch}", cwd=bare_remote) == \
+        moved, "失配拒绝后远端不动（保持移动后内容）"
+
+
+def test_resilient_force_lands_probed_tip_not_moved_branch(
+        repo, remote_url, bare_remote, monkeypatch):
+    """legacy 同形窗口对齐（ag-852c8f 交付物 3）：rescue 的 rev-parse 探测
+    （local_tip）与 push 之间本地分支被移动——落地必须是探测时过
+    range-diff 验证的 local_tip，不是分支当前位置。"""
+    import gitop
+    branch = fix_branch(7)
+    git("checkout", "-B", branch, cwd=repo)
+    base = commit_file(repo, "base.txt", "base\n", "base")
+    git("push", remote_url, f"{branch}:{branch}", cwd=repo)
+    old = commit_file(repo, "old.txt", "old\n", "old chain")
+    git("push", remote_url, f"{branch}:{branch}", cwd=repo)
+    git("reset", "--hard", base, cwd=repo)
+    commit_file(repo, "newbase.txt", "nb\n", "new base")
+    git("cherry-pick", old, cwd=repo)
+    verified = git("rev-parse", "HEAD", cwd=repo)  # 探测将读到的 local_tip
+
+    real_tip = gitop.remote_branch_tip
+
+    def moving_tip(*args, **kwargs):
+        tip = real_tip(*args, **kwargs)
+        # 探测（rev-parse local_tip）与 push 之间的协议外写手
+        git("commit", "--allow-empty", "-m", "rogue external writer",
+            cwd=repo)
+        return tip
+    monkeypatch.setattr(gitop, "remote_branch_tip", moving_tip)
+
+    assert push_fix_branch_resilient(repo, 7, remote_url) == "force-pushed"
+    assert git("rev-parse", f"refs/heads/{branch}", cwd=bare_remote) == \
+        verified, "rescue 落地探测验证的 tip，不携带 rogue 移动"
+
+
 def test_rebase_safe_to_force_remote_ancestor_is_safe(repo, remote_url,
                                                       bare_remote):
     git("checkout", "-B", fix_branch(7), cwd=repo)
