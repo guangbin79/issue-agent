@@ -101,6 +101,12 @@ SESSION_INVALID_NOTE = "原会话已失效，已自动开启新会话继续处�
 REVIEW_FAILED_NOTE = "评审未完成（超时/崩溃），修复已推送，建议人工复查。"
 REPOST_NOT_FOUND_NOTE = ("「重发汇报」：本会话历史中未找到三段式汇报"
                          "（根因/改动文件清单/验证方式），请人工核查。")
+# ag-1c7315: panel disposal ack for 「重试」 — the human must see the new
+# round semantics (new worker/credentials, fail streak reset, env rebuilt
+# from the current remote tip) on the issue panel.
+REDISPATCH_NOTE = ("已按「重试」重派 agora 任务 {tid}：新 worker／新凭据、"
+                   "失败计数清零、环境按当前远端 tip 重建；后续评论将直达"
+                   "新 worker。")
 
 # task 8: prompt for the post-push review phase. The spawned headless child
 # runs the REAL /review-loop command (resolved via its own user-level
@@ -459,6 +465,11 @@ class Orchestrator:
             self._run_turn(iid, message=message, title=title,
                            session_id=session_id, action=action, event=event,
                            note_id=note_ids[-1] if note_ids else 0)
+            return
+        # ag-1c7315: panel disposal commands for a blocked agora task
+        # (whole-line 重试/取消任务 — classified by the fsm)
+        if action in ("redispatch", "cancel_task"):
+            self._agora_disposal_command(iid, action, event)
             return
         # pause / unpause / close / reopen: ledger mutation inside the lock
         with self._ledger_lock:
@@ -900,6 +911,75 @@ class Orchestrator:
             finally:
                 if self.agora_monitor is not None and not registered:
                     self.agora_monitor.release(iid)
+
+    def _agora_disposal_command(self, iid, action, event):
+        """面板评论指令处置 blocked（ag-1c7315，用户裁定：处置面搬到
+        issue 面板）：「重试／解决冲突／重派」→ 以 dispatcher 凭据对同
+        任务 task_dispatch（重派＝新凭据新 worker、fail_streak 清零、
+        env 按当前远端 tip 重建）→ 回评确认；「取消任务／取消」→
+        task_cancel → 回评取消事实（与 result-mail 收口回评同 mark 幂等）。
+        仅当账本登记任务处于 blocked（quality 或 delivery failed）；其余
+        状态（含无 agora 任务、legacy 模式、paused 不派工纪律）忽略并
+        journal，绝不误触 running/在飞。重派与正常回合同受 monitor 容量
+        闸（F3）。指令评论消费即记 note id。"""
+        verb = "重试" if action == "redispatch" else "取消任务"
+        with self._iid_lock(iid):  # 与同 issue 回合串行（同回合锁序）
+            with self._ledger_lock:
+                ledger = state.load_state(self.state_path,
+                                          warn=self._journal)
+                key = str(int(iid))
+                entry = ledger["issues"].get(key)
+                note_ids = self._note_ids(event)
+                if entry is not None and note_ids:
+                    state.mark_processed(ledger, iid, note_ids)
+                    entry = ledger["issues"][key]
+                    state.save_state(self.state_path, ledger)
+                tid = (entry or {}).get("agora_task_id")
+                head = ((entry or {}).get("agora_status") or "").split(
+                    "/", 1)[0]
+                paused = bool(entry) and entry.get("status") == "paused"
+            if entry is None or self.agora_client is None or not tid \
+                    or head != "blocked" \
+                    or (action == "redispatch" and paused):
+                self._journal(
+                    f"disposal: issue#{iid} 「{verb}」 ignored "
+                    f"(agora_status={head or 'none'}, task={tid or 'none'}, "
+                    f"paused={paused})")
+                return
+            if action == "redispatch" and self.agora_monitor is not None \
+                    and not self.agora_monitor.reserve(iid):
+                # F3 同款容量闸（ag-1c7315 评审 R1 o-2）：满员不派工——
+                # 绝不超额建单；评论已消费，重发「重试」即重试通道
+                self._journal(f"disposal: issue#{iid} 「重试」 deferred "
+                              "(monitor at capacity)")
+                self._post_note(iid, "活动名额已满，本次「重试」未执行；"
+                                      "稍后重新评论「重试」即可。")
+                return
+            try:
+                if action == "redispatch":
+                    self.agora_client.dispatch(tid)
+                else:
+                    self.agora_client.task_cancel(tid)
+            except (AgoraRejected, AgoraUnavailable,
+                    AgoraProtocolError) as exc:
+                if action == "redispatch" and self.agora_monitor is not None:
+                    self.agora_monitor.release(iid)  # 归还 reserve 占位（未转正）
+                self._journal(f"disposal: issue#{iid} 「{verb}」 for {tid} "
+                              f"failed: {exc}")
+                self._post_note(iid, f"「{verb}」执行失败（任务 {tid}）："
+                                      f"{exc}")
+                return
+            if action == "redispatch":
+                if self.agora_monitor is not None:
+                    self.agora_monitor.redispatched(iid, tid)
+                self._post_note(iid, REDISPATCH_NOTE.format(tid=tid))
+                self._journal(f"disposal: issue#{iid} task {tid} "
+                              "redispatched by panel command")
+            else:
+                if self.agora_monitor is not None:
+                    self.agora_monitor.announce_cancelled(iid, tid)
+                self._journal(f"disposal: issue#{iid} task {tid} cancelled "
+                              "by panel command")
 
     def _agora_relay_comment(self, iid, tid, message, note_id):
         """活动任务评论直通（Task 5）：post(kind=question) 给在案 worker

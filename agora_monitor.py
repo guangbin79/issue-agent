@@ -84,6 +84,10 @@ class AgoraMonitor:
         self._hb_interval = 0
         self._hb = {}  # iid -> {"start","last","status"}（_guard 保护）
         self._questions_this_drain = 0  # 每轮 drain 的 LLM 答复预算（B-4）
+        # ag-1c7315（评审 R1）：处置路径（worker 线程）与轮询（poll 线程）
+        # 首次出现跨线程并发面——reports sidecar 写者互斥＋per-issue 对账串行
+        self._store_lock = threading.Lock()
+        self._reconcile_locks = {}
 
     # ---- 登记簿 ----
 
@@ -174,6 +178,19 @@ class AgoraMonitor:
         with self._guard:
             return sorted(self._active.items())
 
+    def _iid_reconcile_lock(self, iid):
+        """per-issue 处置↔对账串行锁（ag-1c7315 B-F2）：面板「重试」的
+        register 与 poll 线程的 board 读→release 互斥——迟到的 blocked
+        收口不得删掉重派后的同 tid 新登记（compare-and-release 只挡异
+        tid）。"""
+        with self._guard:
+            key = int(iid)
+            lock = self._reconcile_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._reconcile_locks[key] = lock
+            return lock
+
     # ---- 轮询与交付状态机 ----
 
     def poll_once(self):
@@ -204,6 +221,12 @@ class AgoraMonitor:
         self._heartbeat_tick()
 
     def _reconcile_task(self, iid, tid):
+        """ag-1c7315：整段对账持 per-issue 串行锁（见 _iid_reconcile_lock）
+        ——board 读到 release 原子于处置路径。"""
+        with self._iid_reconcile_lock(iid):
+            self._reconcile_task_inner(iid, tid)
+
+    def _reconcile_task_inner(self, iid, tid):
         task = self._board_task(tid)
         task_state = task.get("state")
         delivery = task.get("delivery") or {}
@@ -298,15 +321,53 @@ class AgoraMonitor:
         self.release(iid, tid)
 
     def _finish_blocked(self, iid, tid, delivery):
-        """blocked 收口（delivery.failed＝push 类失败回评具体错误）。"""
+        """blocked 收口（delivery.failed＝push 类失败回评具体错误）＋处置
+        提示行（ag-1c7315：面板上的人知道有「重试／取消任务」这双手）。"""
         if delivery.get("status") == "failed":
             text = (f"agora 任务 {tid} 外部交付 push_failed"
                     f"（{delivery.get('error') or 'unknown'}）")
         else:
             text = f"agora 任务 {tid} 被 blocked（board 口径）"
-        self._comment_once(iid, tid, text + "，需要人工处理；不自动重派。",
-                           mark="blocked")
+        self._comment_once(
+            iid, tid,
+            text + "，需要人工处理；不自动重派。"
+            "\n处置：评论『重试』重派，或『取消任务』归档。",
+            mark="blocked")
         self.release(iid, tid)
+
+    def redispatched(self, iid, tid):
+        """面板「重试」指令的 monitor 收位（ag-1c7315）：重新登记（relay
+        与交付轮询恢复）＋账本头段离开 blocked（关掉一个 poll 窗口内的
+        二次「重试」重派竞态），并清该 tid 旧轮的终局评论标记与报告
+        （重派是新一轮：再 blocked／终态照常回评，旧轮报告不得冒充新轮
+        汇报）；清标与登记同入对账串行锁（评审 R2：迟到的 blocked/终态
+        release 不得删掉本登记，等待锁的 poll 对账也不得读到旧轮残留）。
+        note_id 保留为跨轮重放水位——旧轮 pending 邮件（mid≤水位）不得
+        借重置冒充新轮报告，新轮 note 的 mid 单调更高照常入库。"""
+        with self._iid_reconcile_lock(iid):
+            self.register(iid, tid)
+            self._sync_agora_status(iid, "dispatched")
+            if self._state_path is None:
+                return
+            with self._store_lock:  # B-F1：与 poll 线程报告入库互斥
+                store = self._reports_load()
+                entry = store.get("reports", {}).get(tid)
+                if entry is not None:
+                    entry["sent_marks"] = []
+                    entry["finalized"] = False
+                    entry["note"] = None  # note_id 保留＝跨轮重放水位
+                    state.write_json_atomic(self._reports_path(), store)
+
+    def announce_cancelled(self, iid, tid):
+        """面板「取消任务」指令的事实回评（ag-1c7315）：mark=cancelled 与
+        result-mail 收口回评同 mark 幂等——面板恰好一条取消事实，后到的
+        邮件回评零动作；取消 API 已成功＝board 权威，账本同步终态。"""
+        self._sync_agora_status(iid, "cancelled")
+        self._comment_once(
+            iid, tid,
+            f"agora 任务 {tid} 已按面板「取消任务」指令取消；issue 待人工"
+            "跟进。",
+            mark="cancelled")
 
     def _report_comment(self, iid, tid, commit):
         """交付成功面回评：报告已先持久化（mail 处理时入库）；原样保留
@@ -333,24 +394,26 @@ class AgoraMonitor:
         cancelled＝取消事实（ag-8d6a70：blocked 收口后再被 root 取消是
         不同事实，各评一次，单布尔 finalized 会把取消事实吞掉）。finalized
         先落盘再评论（崩溃窗宁可少一条评论也不重复刷屏；报告已持久化可查）。
-        评论通道未接线＝零动作。"""
+        评论通道未接线＝零动作。ag-1c7315（B-F1）：store 段持写者互斥锁
+        ——处置 worker 线程（announce_cancelled）与本 poll 线程路径并发。"""
         if self._state_path is None:
             return
-        store = self._reports_load()
-        entry = store.setdefault("reports", {}).setdefault(
-            tid, {"iid": int(iid), "note": None, "note_id": -1,
-                  "finalized": False, "sent_marks": []})
-        sent = list(entry.get("sent_marks") or [])
-        # 旧档案（布尔 finalized）迁移：True＝final 评论已发，其余 mark 照常
-        if entry.get("finalized") and "final" not in sent:
-            sent.append("final")
-        if mark in sent:
-            return
-        entry["iid"] = int(iid)
-        sent.append(mark)
-        entry["sent_marks"] = sent
-        entry["finalized"] = mark == "final" or bool(entry.get("finalized"))
-        state.write_json_atomic(self._reports_path(), store)
+        with self._store_lock:
+            store = self._reports_load()
+            entry = store.setdefault("reports", {}).setdefault(
+                tid, {"iid": int(iid), "note": None, "note_id": -1,
+                      "finalized": False, "sent_marks": []})
+            sent = list(entry.get("sent_marks") or [])
+            # 旧档案（布尔 finalized）迁移：True＝final 评论已发，其余 mark 照常
+            if entry.get("finalized") and "final" not in sent:
+                sent.append("final")
+            if mark in sent:
+                return
+            entry["iid"] = int(iid)
+            sent.append(mark)
+            entry["sent_marks"] = sent
+            entry["finalized"] = mark == "final" or bool(entry.get("finalized"))
+            state.write_json_atomic(self._reports_path(), store)
         self._comment(iid, text)
 
     def _comment(self, iid, text):
@@ -640,24 +703,26 @@ class AgoraMonitor:
 
     def _store_report_note(self, iid, tid, mid, body):
         """worker note 持久化为报告候选（最新 note_id 胜；重放旧批次不
-        回退）。终态回评与重发汇报共用此库。"""
-        store = self._reports_load()
-        reports = store.setdefault("reports", {})
-        current = reports.get(tid) or {}
-        current_id = current.get("note_id")
-        if current_id is not None and mid is not None \
-                and int(mid) <= int(current_id):
-            return  # 已有更新的报告（或同条重放）
-        reports[tid] = {"iid": int(iid), "note": body,
-                        "note_id": int(mid) if mid is not None else -1,
-                        "finalized": bool(current.get("finalized")),
-                        "sent_marks": list(current.get("sent_marks") or [])}
-        try:
-            state.write_json_atomic(self._reports_path(), store)
-        except OSError as exc:
-            # 终闸 B-3：落盘瞬态失败≠毒消息——留 pending 下一轮重放，
-            # 不让报告永久丢失成降级评论
-            raise _MailDeferred(f"reports store write failed: {exc}") from exc
+        回退）。终态回评与重发汇报共用此库。ag-1c7315（B-F1）：写段持
+        写者互斥锁——与处置侧 redispatched 清标互斥。"""
+        with self._store_lock:
+            store = self._reports_load()
+            reports = store.setdefault("reports", {})
+            current = reports.get(tid) or {}
+            current_id = current.get("note_id")
+            if current_id is not None and mid is not None \
+                    and int(mid) <= int(current_id):
+                return  # 已有更新的报告（或同条重放）
+            reports[tid] = {"iid": int(iid), "note": body,
+                            "note_id": int(mid) if mid is not None else -1,
+                            "finalized": bool(current.get("finalized")),
+                            "sent_marks": list(current.get("sent_marks") or [])}
+            try:
+                state.write_json_atomic(self._reports_path(), store)
+            except OSError as exc:
+                # 终闸 B-3：落盘瞬态失败≠毒消息——留 pending 下一轮重放，
+                # 不让报告永久丢失成降级评论
+                raise _MailDeferred(f"reports store write failed: {exc}") from exc
 
     def _handle_worker_question(self, iid, tid, body):
         """worker 提问 → 答复回调（orchestrator 在 ledger_lock 内交
@@ -693,8 +758,14 @@ class AgoraMonitor:
         （如 root 取消 blocked 任务）轮询面已不可见——本邮件是唯一信号
         （ag-8d6a70：2026-11-14 三单取消后面板停在求助/失败旧评论）。board
         为权威：重读 board 确认终态才回评终局文案（不以邮件正文自述为准；
-        _comment_once 按 mark 幂等，轮询路径已回评过则零动作）。"""
+        _comment_once 按 mark 幂等，轮询路径已回评过则零动作）。ag-1c7315
+        （评审 R2）：board 读→release 整段持 per-issue 对账串行锁——迟到的
+        终态收口不得删掉「重试」刚重登记的同 tid 名额（B-F2 邮件面）。"""
         self._journal(f"agora-monitor: result mail for {tid}: {body}")
+        with self._iid_reconcile_lock(iid):
+            self._handle_result_mail_inner(iid, tid, body)
+
+    def _handle_result_mail_inner(self, iid, tid, body):
         try:
             task = self._board_task(tid)
         except AgoraRejected as exc:

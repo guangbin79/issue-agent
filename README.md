@@ -70,6 +70,16 @@ cd <project-path> && opencode
 恢复
 ```
 
+**blocked 任务处置**（agora 模式）：agora 任务 blocked（质量或外部交付失败）后，
+在 issue 里发**整行**评论即可从面板驱动处置；非 blocked 状态收到指令只忽略并
+记日志，不影响在飞任务：
+
+```text
+重试        （别名：解决冲突 / 重派 —— 对同任务重派：新 worker 新凭据、失败计数清零、环境按当前远端 tip 重建）
+取消任务    （别名：取消 —— 归档该 blocked 任务；此后新评论走 Router 新回合）
+```
+
+
 - **有界并行**：`config.json` 加 `"max_parallel": N`（默认 1＝串行；合法域 1..4）后 restart 生效——N 个 worker 消费同一队列，任意时刻 in-flight 回合 ≤N，同一 issue 的多事件仍严格串行（按 issue 锁）。机器负载与模型并发随 N 线性放大，N=2 起步够解排队痛点。
 
 ## agora 模式
