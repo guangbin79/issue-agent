@@ -33,8 +33,10 @@ Task 5：
 agora 任务自身的 origin push 只经 push_verified_commit（精确 SHA、绝不动
 默认支）；唯一 force 例外＝变基轮护栏判定零丢失后的 force-with-lease
 落地（daemon 侧双条件：本地分支即在案 handoff＋range-diff 零丢失，
-worker 永无 force 权）；agora 不推 issue 仓远端——外部交付权威在
-issue-agent。
+worker 永无 force 权）；force 落地被确定性拒绝（受保护分支/pre-receive）
+时按轮转预算路由：转 non_ff 轮转（≤3 有界）或 deliver(failed,
+force_rejected) 终局，绝不无限重试（ag-cad1d6 High-1）；agora 不推
+issue 仓远端——外部交付权威在 issue-agent。
 """
 
 import json
@@ -52,6 +54,11 @@ _HEX40_OK = re.compile(r"[0-9a-f]{40}")
 
 # board 主状态（task 行 state）：这三个对本监视器是终态（名额可释放）
 _TERMINAL_STATES = ("merged", "closed", "cancelled")
+
+# non_ff 轮转预算（服务端契约 task_deliver）：≤3 次总尝试，第 4 次起
+# retry_exhausted 终局拒——attempt 已达 3 再收到确定性 force 拒绝时不再
+# 轮转，直接 deliver(failed, force_rejected) 终局（ag-cad1d6 High-1）
+_MAX_DELIVERY_ATTEMPTS = 3
 
 
 class _MailDeferred(RuntimeError):
@@ -274,7 +281,7 @@ class AgoraMonitor:
                         f"handoff commit {handoff!r}; terminal release")
                     self.release(iid, tid)
                     return
-                self._deliver_handoff(iid, tid, handoff)
+                self._deliver_handoff(iid, tid, handoff, delivery)
             elif delivery.get("status") == "delivered":
                 # delivered ack 后收口读竞态/瞬断的恢复面（评审环 ocr #4）：
                 # 本次 board 读即确认——补记 delivery_commit、回评汇报并释放
@@ -433,7 +440,9 @@ class AgoraMonitor:
             self._journal(f"agora-monitor: issue#{iid} comment failed: "
                           f"{exc!r}")
 
-    def _deliver_handoff(self, iid, tid, handoff):
+    def _deliver_handoff(self, iid, tid, handoff, delivery):
+        """*delivery*＝board 在案交付快照（force 拒绝时的轮转预算
+        attempt 判定材料，ag-cad1d6）。"""
         if self._repo_path is None:
             self._journal("agora-monitor: delivery context not attached; "
                           "cannot push")
@@ -453,7 +462,33 @@ class AgoraMonitor:
             # 换基重验出新 handoff 再推，不做本地 rebase）
             base = gitop.fetch_fix_branch_tip(
                 self._repo_path, iid, self._remote_url, self._ssl_verify)
-            if self._land_align_rewrite(iid, handoff, base):
+            try:
+                landed = self._land_align_rewrite(iid, handoff, base)
+            except gitop.ForcePushRejected as exc:
+                # ag-cad1d6 High-1：确定性 force 拒绝（受保护分支禁
+                # force/pre-receive/服务器拒绝改写）——重试同一改写永不
+                # 可能成功，绝不按传输病无限重试占名额。内容未落地（被
+                # 拒＝ref 未动）且护栏双条件已过（走到 force 的前提）→
+                # 有轮转预算：转 non_ff（既有 ≤3 有界，轮转出的新
+                # handoff 以 fast-forward 落地，无需 force）；预算尽：
+                # deliver(failed, force_rejected) 终局。
+                if (delivery or {}).get("attempt", 0) >= _MAX_DELIVERY_ATTEMPTS:
+                    self._journal(
+                        f"agora-monitor: issue#{iid} force landing rejected "
+                        f"as deterministic ({exc}); rotation budget "
+                        f"exhausted (attempt="
+                        f"{(delivery or {}).get('attempt')}), reporting "
+                        "failed(force_rejected)")
+                    self._ack(iid, tid, "failed", handoff,
+                              reason="force_rejected")
+                else:
+                    self._journal(
+                        f"agora-monitor: issue#{iid} force landing rejected "
+                        f"as deterministic ({exc}); rotating handoff "
+                        "(bounded, next handoff lands as fast-forward)")
+                    self._ack(iid, tid, "non_ff", handoff, base=base)
+                return
+            if landed:
                 self._ack(iid, tid, "delivered", handoff)
             else:
                 self._ack(iid, tid, "non_ff", handoff, base=base)
@@ -467,10 +502,11 @@ class AgoraMonitor:
         （base）重写到 handoff 是否零丢失——本地 issue/<iid>-fix 必须就是
         在案 handoff（force 只推已验证的精确 commit，不带分支漂移后的
         内容出门），且 rebase_safe_to_force 证明旧链提交在新链全有
-        range-diff 对应。双条件全过 → push --force-with-lease 锚定 base
-        落地并记 align-rewrite 一行；任一不过 → False（维持 non_ff 轮转
-        现状链，绝不 force）。护栏内的 git 病向上抛——poll 层按传输病
-        有界重试，语义与普通推送一致。"""
+        range-diff 对应。双条件全过 → force-with-lease 锚定 base 落地
+        并记 align-rewrite 一行；任一不过 → False（维持 non_ff 轮转
+        现状链，绝不 force）。落地走 push_force_classified（ag-cad1d6）：
+        确定性 force 拒绝抛 ForcePushRejected 由调用方分类路由（轮转/
+        终局），传输病/未命中形态向上抛——poll 层按传输病有界重试。"""
         branch = gitop.fix_branch(iid)
         if gitop.local_branch_tip(self._repo_path, branch) != handoff:
             self._journal(f"agora-monitor: issue#{iid} local {branch} "
@@ -482,8 +518,9 @@ class AgoraMonitor:
             self._journal(f"agora-monitor: issue#{iid} rewrite unsafe "
                           f"({reason}); rotating handoff, no force")
             return False
-        gitop.push(self._repo_path, self._remote_url, f"{branch}:{branch}",
-                   self._ssl_verify, force_with_lease=f"{branch}:{base}")
+        gitop.push_force_classified(
+            self._repo_path, self._remote_url, f"{branch}:{branch}",
+            self._ssl_verify, force_with_lease=f"{branch}:{base}")
         self._journal(f"agora-monitor: issue#{iid} align-rewrite landed "
                       f"via force-with-lease ({handoff[:12]} over "
                       f"{base[:12]})")

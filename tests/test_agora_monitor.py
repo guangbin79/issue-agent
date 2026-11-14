@@ -283,7 +283,8 @@ class FakeGitDelivery:
     """gitop 交付原语替身＋legacy 推送面间谍：agora 交付只准走
     push_verified_commit/fetch_fix_branch_tip，legacy push 族调用必须为零
     （无 lease 的裸 push 同记违约）；变基轮护栏面（ag-6da714）＝
-    rebase_safe_to_force/local_branch_tip/带 force_with_lease 的 push。
+    rebase_safe_to_force/local_branch_tip/force 落地 push_force_classified
+    （ag-cad1d6：落地失败分类走 gitop 层词表，此处只注入结果）。
     缺省 rebase_safe 不安全 → non_ff 维持轮转现状链（既有轮转测试形态）。"""
 
     def __init__(self, monkeypatch, push_results=None, push_error=None,
@@ -311,6 +312,8 @@ class FakeGitDelivery:
         for name in ("push_fix_branch", "push_fix_branch_resilient"):
             monkeypatch.setattr(gitop, name, legacy(name))
         monkeypatch.setattr(gitop, "push", self.fake_push)
+        monkeypatch.setattr(gitop, "push_force_classified",
+                            self.fake_force_push)
         monkeypatch.setattr(gitop, "push_verified_commit",
                             self.fake_push_verified)
         monkeypatch.setattr(gitop, "fetch_fix_branch_tip", self.fake_fetch_tip)
@@ -320,9 +323,12 @@ class FakeGitDelivery:
 
     def fake_push(self, repo, remote_url, refspec, ssl_verify=True,
                   force_with_lease=""):
-        if not force_with_lease:
-            self.legacy_calls.append("push")
-            return
+        # ag-cad1d6：变基轮落地改走 push_force_classified——push 的任何
+        # 调用（含带 lease 形态）都记 legacy 违约
+        self.legacy_calls.append("push")
+
+    def fake_force_push(self, repo, remote_url, refspec, ssl_verify=True,
+                        force_with_lease=""):
         self.force_push_calls.append(
             {"repo": repo, "remote_url": remote_url, "refspec": refspec,
              "ssl_verify": ssl_verify,
@@ -555,6 +561,100 @@ def test_force_push_transport_error_keeps_awaiting_external_for_retry(
     assert entry(state_path)["delivery_commit"] == handoff
     assert monitor.tasks() == []
     assert not any("SECRETPAT123" in m for m in journal)
+
+
+# --- force 落地失败分类（ag-cad1d6 High-1：恢复有界） -----------------------------
+
+
+def test_force_landing_deterministic_rejection_rotates_bounded(
+        tmp_path, monkeypatch):
+    """High-1：护栏双条件过后的 force 落地被确定性拒绝（受保护分支禁
+    force/pre-receive/服务器拒绝改写）——重试同改写永不可能成功：分类
+    命中 → 转 non_ff 轮转（deliver 必须发出、服务端 attempt 前进，既有
+    ≤3 有界），绝不按传输病无限重试占名额。"""
+    handoff = hex40("a")
+    base = hex40("b")
+    client = FakeAgoraClient(commit=handoff)
+    fake_git = FakeGitDelivery(
+        monkeypatch, push_results={handoff: "non_ff"}, fetch_tip=base,
+        rebase_safe=(True, "range-diff: no old-chain commit lost"),
+        branch_tip=handoff,
+        force_push_error=gitop.ForcePushRejected(
+            "push issue/7-fix:issue/7-fix failed: remote: error: GH006: "
+            "Protected branch update failed\n ! [remote rejected] "
+            "issue/7-fix -> issue/7-fix (pre-receive hook declined)"))
+    monitor, state_path, journal = delivery_monitor(tmp_path, monkeypatch,
+                                                    client, fake_git)
+
+    monitor.poll_once()
+
+    ack = client.deliver_calls[0]  # deliver 必须发出：绝不无限重试
+    assert ack["outcome"] == "non_ff"
+    assert ack["base"] == base
+    assert ack["commit"] == handoff
+    assert client.tasks[TID]["delivery"]["attempt"] == 1, "服务端 attempt 前进"
+    assert monitor.tasks() == [(7, TID)], "轮转中名额保持占用"
+    assert entry(state_path)["delivery_commit"] is None
+    assert any("force landing rejected" in m and "rotating" in m
+               for m in journal), journal
+    assert not any("SECRETPAT123" in m for m in journal)
+
+
+def test_force_landing_rejection_budget_exhausted_reports_failed(
+        tmp_path, monkeypatch):
+    """High-1 终局臂：轮转预算已尽（attempt≥3，第 4 次 non_ff 服务端
+    retry_exhausted 终局拒）时的确定性 force 拒绝 → 直接 deliver(failed,
+    force_rejected) 终局：blocked＋名额释放，不弹回 worker。"""
+    handoff = hex40("a")
+    base = hex40("b")
+    client = FakeAgoraClient(commit=handoff)
+    client.tasks[TID]["delivery"]["attempt"] = 3
+    fake_git = FakeGitDelivery(
+        monkeypatch, push_results={handoff: "non_ff"}, fetch_tip=base,
+        rebase_safe=(True, "range-diff: no old-chain commit lost"),
+        branch_tip=handoff,
+        force_push_error=gitop.ForcePushRejected(
+            "push issue/7-fix:issue/7-fix failed: remote: error: denying "
+            "non-fast-forward refs/heads/issue/7-fix"))
+    monitor, _, journal = delivery_monitor(tmp_path, monkeypatch, client,
+                                           fake_git)
+
+    monitor.poll_once()
+
+    ack = client.deliver_calls[0]
+    assert ack["outcome"] == "failed"
+    assert ack["reason"] == "force_rejected"
+    assert client.tasks[TID]["state"] == "blocked"
+    assert client.tasks[TID]["delivery"]["error"] == "force_rejected"
+    assert monitor.tasks() == [], "终局释放名额"
+    assert any("force_rejected" in m and "exhausted" in m for m in journal), \
+        journal
+
+
+def test_force_landing_unclassified_failure_keeps_awaiting_external(
+        tmp_path, monkeypatch):
+    """词表未命中两态：非 force-拒绝形态（未知远端拒绝/传输病）维持
+    现状——不 deliver 不释放，awaiting_external 按轮询节奏有界重试
+    （poll 层传输病通道）。"""
+    handoff = hex40("a")
+    base = hex40("b")
+    client = FakeAgoraClient(commit=handoff)
+    fake_git = FakeGitDelivery(
+        monkeypatch, push_results={handoff: "non_ff"}, fetch_tip=base,
+        rebase_safe=(True, "range-diff: no old-chain commit lost"),
+        branch_tip=handoff,
+        force_push_error=gitop.PushFailed(
+            "push issue/7-fix:issue/7-fix failed: ! [remote rejected] "
+            "issue/7-fix -> issue/7-fix (funny unknown reason)"))
+    monitor, _, journal = delivery_monitor(tmp_path, monkeypatch, client,
+                                           fake_git)
+
+    monitor.poll_once()
+
+    assert client.deliver_calls == []
+    assert client.tasks[TID]["delivery"]["status"] == "awaiting_external"
+    assert monitor.tasks() == [(7, TID)]
+    assert any("transport error" in m for m in journal), journal
 
 
 def test_blocked_delivery_records_push_failed_without_redispatch(

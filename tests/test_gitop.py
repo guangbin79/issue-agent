@@ -23,6 +23,7 @@ import pytest
 
 import gitop
 from gitop import (
+    ForcePushRejected,
     GitopError,
     PushFailed,
     RefspecViolation,
@@ -39,6 +40,7 @@ from gitop import (
     push_verified_commit,
     sweep_idle_review_worktrees,
     push,
+    push_force_classified,
     push_fix_branch,
     rebase_safe_to_force,
     push_fix_branch_resilient,
@@ -623,6 +625,90 @@ def test_push_force_with_lease_argv_shape_and_sha_gate(repo, monkeypatch):
     with pytest.raises(RefspecViolation):
         push(repo, url, "issue/7-fix:issue/7-fix", ssl_verify=False,
              force_with_lease="issue/7-fix:not-a-sha")
+
+
+# --- push_force_classified: force 落地失败分类（ag-cad1d6 High-1） ---------------
+
+
+def _canned_run(blob):
+    """_run 替身：固定 stderr/returncode=1（git push 失败面）。"""
+    def run(argv, cwd, env=None):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr=blob)
+    return run
+
+
+def test_push_force_classified_marks_deterministic_rejections(
+        repo, monkeypatch):
+    """词表命中态：受保护分支禁 force／pre-receive 拒绝／服务器配置性
+    拒绝改写（denyNonFastForwards）都是确定性拒绝——抛 ForcePushRejected
+    （仍属 PushFailed），调用方轮转或终局，绝不按传输病无限重试。"""
+    lease = f"issue/7-fix:{'a' * 40}"
+    for blob in (
+        "remote: error: GH006: Protected branch update failed for "
+        "refs/heads/issue/7-fix\n ! [remote rejected] issue/7-fix -> "
+        "issue/7-fix (pre-receive hook declined)",
+        "remote: error: Cannot force-push to this protected branch",
+        "remote: error: denying non-fast-forward refs/heads/issue/7-fix "
+        "(you should pull first)",
+    ):
+        monkeypatch.setattr(gitop, "_run", _canned_run(blob))
+        with pytest.raises(ForcePushRejected):
+            push_force_classified(repo, "file:///tmp/r.git",
+                                  "issue/7-fix:issue/7-fix",
+                                  force_with_lease=lease)
+
+
+def test_push_force_classified_transport_and_unknown_stay_transient(
+        repo, monkeypatch):
+    """词表未命中两态：传输病与未知远端拒绝维持 PushFailed 单态上抛
+    （poll 层有界重试面）——分类只对词表命中的确定性形态生效，miss 即
+    保守重试，不误终局。"""
+    lease = f"issue/7-fix:{'a' * 40}"
+    for blob in ("fatal: unable to access 'https://x/y.git': "
+                 "Could not resolve host: x",
+                 "! [remote rejected] issue/7-fix -> issue/7-fix "
+                 "(no such user)"):
+        monkeypatch.setattr(gitop, "_run", _canned_run(blob))
+        with pytest.raises(PushFailed) as excinfo:
+            push_force_classified(repo, "file:///tmp/r.git",
+                                  "issue/7-fix:issue/7-fix",
+                                  force_with_lease=lease)
+        assert not isinstance(excinfo.value, ForcePushRejected)
+
+
+def test_push_force_classified_pins_english_locale_and_lease_argv(
+        repo, monkeypatch):
+    """分类词表吃 stderr 小写子串（_TRANSPORT_MARKERS 同款纪律）：必须
+    钉 LC_ALL=C，本地化 git 译文才不会 miss；lease argv 形态与 push()
+    一致。"""
+    fake = FakeRun()
+    monkeypatch.setattr(gitop, "_run", fake)
+    tip = "a" * 40
+    push_force_classified(repo, "https://oauth2:SECRETPAT@host/repo.git",
+                          "issue/7-fix:issue/7-fix", ssl_verify=False,
+                          force_with_lease=f"issue/7-fix:{tip}")
+    assert fake.envs[0].get("LC_ALL") == "C"
+    assert fake.calls[0][-3] == f"--force-with-lease=issue/7-fix:{tip}"
+    assert "SECRETPAT" not in " ".join(fake.calls[0])
+
+
+def test_push_force_classified_real_protected_remote_rejects(
+        repo, remote_url, bare_remote):
+    """真实锚：bare 远端 receive.denyNonFastForwards=true（file:// 上真实
+    生效，输出「denying non-fast-forward」）拒 force 改写 →
+    ForcePushRejected，远端 ref 不动。"""
+    git("config", "receive.denyNonFastForwards", "true", cwd=bare_remote)
+    git("checkout", "-B", fix_branch(7), cwd=repo)
+    first = commit_file(repo, "one.txt", "1\n", "one")
+    git("push", remote_url, f"{fix_branch(7)}:{fix_branch(7)}", cwd=repo)
+    git("reset", "--hard", "HEAD~1", cwd=repo)
+    commit_file(repo, "two.txt", "2\n", "two (rewritten)")
+    with pytest.raises(ForcePushRejected):
+        push_force_classified(repo, remote_url,
+                              f"{fix_branch(7)}:{fix_branch(7)}",
+                              force_with_lease=f"{fix_branch(7)}:{first}")
+    assert git("rev-parse", f"refs/heads/{fix_branch(7)}",
+               cwd=bare_remote) == first, "被拒后远端不动"
 
 
 def test_rebase_safe_to_force_remote_ancestor_is_safe(repo, remote_url,

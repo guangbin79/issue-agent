@@ -86,6 +86,13 @@ class PermanentPushFailed(PushFailed):
     tip instead of spinning every round (issue#264)."""
 
 
+class ForcePushRejected(PushFailed):
+    """Deterministic force-push rejection (protected branch / pre-receive /
+    deny-non-fast-forward, ag-cad1d6 High-1): retrying the same rewrite can
+    never succeed — the caller rotates or terminates, never retries the
+    force landing itself."""
+
+
 class RefspecViolation(GitopError):
     """Refspec outside the issue/<iid>-fix whitelist (e.g. a default-branch refspec)."""
 
@@ -398,24 +405,20 @@ def knowledge_changes_present(repo: PathLike, iid, base_ref: str) -> bool:
     return bool(changed.strip())
 
 
-def push(repo: PathLike, remote_url: str, refspec: str, ssl_verify: bool = True,
-         force_with_lease: str = "") -> None:
-    """Push to the explicit URL, restricted to the fix-branch refspec shape.
-
-    Any other refspec (in particular anything targeting the default
-    branch) raises RefspecViolation before git is invoked.
-
-    force_with_lease (optional) = "<branch>:<expected-remote-tip-sha>":
-    emits --force-with-lease so the update lands only if the remote is
-    still at the observed tip (never blind-overwrites a moved branch).
-    The branch part must match the whitelisted refspec shape; the tip
-    must be a full hex sha.
-    """
+def _push_core(repo: PathLike, remote_url: str, refspec: str,
+               ssl_verify: bool, force_with_lease: str,
+               pin_english: bool = False) -> None:
+    """push() 的共享执行核：refspec/lease 白名单校验＋argv 组装＋运行；
+    pin_english=True 时钉 LC_ALL=C——失败输出要喂词表分类（ag-cad1d6），
+    本地化 git 的译文才不会把分类标记 miss 掉（push_verified_commit
+    同款纪律）。legacy push() 不钉，行为与抽取前逐字节一致。"""
     if not isinstance(refspec, str) or not _REFSPEC_OK.match(refspec):
         raise RefspecViolation(
             f"refspec {refspec!r} outside issue/<iid>-fix whitelist"
         )
     env, clean_url = _net_env(remote_url)
+    if pin_english:
+        env = {"LC_ALL": "C", **(env or {})}
     argv = ["git", "-C", str(repo), *_ssl_args(remote_url, ssl_verify),
             "push"]
     if force_with_lease:
@@ -436,6 +439,40 @@ def push(repo: PathLike, remote_url: str, refspec: str, ssl_verify: bool = True,
                 remote_url,
             )
         )
+
+
+def push(repo: PathLike, remote_url: str, refspec: str, ssl_verify: bool = True,
+         force_with_lease: str = "") -> None:
+    """Push to the explicit URL, restricted to the fix-branch refspec shape.
+
+    Any other refspec (in particular anything targeting the default
+    branch) raises RefspecViolation before git is invoked.
+
+    force_with_lease (optional) = "<branch>:<expected-remote-tip-sha>":
+    emits --force-with-lease so the update lands only if the remote is
+    still at the observed tip (never blind-overwrites a moved branch).
+    The branch part must match the whitelisted refspec shape; the tip
+    must be a full hex sha.
+    """
+    _push_core(repo, remote_url, refspec, ssl_verify, force_with_lease)
+
+
+def push_force_classified(repo: PathLike, remote_url: str, refspec: str,
+                          ssl_verify: bool = True,
+                          force_with_lease: str = "") -> None:
+    """变基轮 force 落地专用（ag-cad1d6 High-1）：与 push() 同形执行＋
+    LC_ALL=C 钉英文输出，失败按 _FORCE_REJECT_MARKERS 分类——确定性
+    拒绝抛 ForcePushRejected（改写永不可能被接受，调用方轮转或终局，
+    绝不无限重试）；传输病/词表未命中形态照旧抛 PushFailed（poll 层
+    有界重试）。"""
+    try:
+        _push_core(repo, remote_url, refspec, ssl_verify, force_with_lease,
+                   pin_english=True)
+    except PushFailed as exc:
+        lowered = str(exc).lower()
+        if any(marker in lowered for marker in _FORCE_REJECT_MARKERS):
+            raise ForcePushRejected(str(exc)) from exc
+        raise
 
 
 def remote_branch_tip(repo: PathLike, remote_url: str, branch: str,
@@ -579,6 +616,20 @@ _TRANSPORT_MARKERS = ("unable to access", "could not read from remote "
                       "connection timed out", "connection reset",
                       "rpc failed", "the remote end hung up",
                       "unexpected disconnect")
+
+# ag-cad1d6（High-1）变基轮 force 落地的确定性拒绝形态：受保护分支禁
+# force / pre-receive 钩子拒绝 / 服务器配置性拒绝改写。命中＝同一改写的
+# 重试永不可能成功（调用方轮转或终局）；未命中维持 PushFailed 上抛
+# （poll 层有界重试）——词表纪律同 _TRANSPORT_MARKERS：LC_ALL=C 下的
+# 英文小写子串匹配，miss 只会退回重试（保守面），不会误终局。
+_FORCE_REJECT_MARKERS = (
+    "protected branch",            # GitHub GH006 / GitLab / Gitea
+    "cannot force-push",           # GitHub "Cannot force-push to this
+                                   #  protected branch"
+    "force push is not allowed",
+    "pre-receive hook declined",   # 通用远端钩子拒绝
+    "denying non-fast-forward",    # receive.denyNonFastForwards
+)
 
 
 def push_verified_commit(repo: PathLike, iid, commit: str, remote_url: str,
