@@ -367,3 +367,47 @@ def test_illegal_token_characters_rejected_before_header(tmp_path):
     (home / ".agora" / "root.token").write_text("root-tok\nEvil: y")
     with pytest.raises(AgoraUnavailable):
         make_client(str(home)).doctor()
+
+
+# --- port/base discovery cache invalidation (ag-ac5771 缺陷2) -----------------
+
+
+def test_client_follows_service_json_port_change_after_refused(tmp_path):
+    """ag-ac5771 缺陷2：agorad 重启换端口（service.json 变更）后，长跑
+    daemon 客户端持旧端口缓存曾经终身制（Connection refused 无限打旧端口）。
+    拒连必须失效端口/base 发现缓存并重发现一次：下次调用自动跟随新端口
+    成功；dispatcher 牌缓存不动（零重签）。"""
+    with fake_agora(default_routes()) as old_server:
+        home = agora_home(tmp_path, old_server.server_address[1])
+        client = make_client(home)
+        assert client.check_mail() == [{"id": 1}]  # 首连成功（发现+签发）
+    old_port = old_server.server_address[1]
+    # 占死旧端口：新 server 必拿不同端口（确定性）。SO_REUSEADDR——旧 server
+    # 已关连接的服务端 socket 残留 TIME_WAIT 时不致 EADDRINUSE（对活监听仍拒绑）。
+    blocker = socket.socket()
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    blocker.bind(("127.0.0.1", old_port))
+    try:
+        with fake_agora(default_routes()) as new_server:
+            assert new_server.server_address[1] != old_port
+            with open(os.path.join(home, ".agora", "service.json"),
+                      "w", encoding="utf-8") as f:
+                json.dump({"port": new_server.server_address[1]}, f)
+            assert client.check_mail() == [{"id": 1}], \
+                "拒连后自动失效端口缓存、跟随 service.json 新端口"
+            assert [r["path"] for r in new_server.requests] == ["/check_mail"], \
+                "dispatcher 牌缓存不动：拒连只失效端口/base 发现缓存"
+    finally:
+        blocker.close()
+
+
+def test_vanished_service_json_on_reconnect_is_unavailable(tmp_path):
+    """ag-ac5771 缺陷2测试锚：拒连触发重发现时 service.json 已消失——仍按
+    AgoraUnavailable（发现失败口径不变）。"""
+    with fake_agora(default_routes()) as server:
+        home = agora_home(tmp_path, server.server_address[1])
+        client = make_client(home)
+        client.check_mail()
+    os.unlink(os.path.join(home, ".agora", "service.json"))
+    with pytest.raises(AgoraUnavailable):
+        client.check_mail()

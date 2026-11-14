@@ -58,6 +58,9 @@ class AgoraClient:
         self._root_token = None
         self._dispatcher_token = None
         self._cred_lock = threading.Lock()  # Task 3 起 monitor/turn 并发：恰签发一次
+        # ag-ac5771 R1 #2：_base/_root_token 成对写锁（勿用 _cred_lock——
+        # _ensure_dispatcher_token 持锁调 _discover 再取本锁会自锁）
+        self._discover_lock = threading.Lock()
 
     def poll_interval(self) -> float:
         """monitor 轮询间隔（秒）。"""
@@ -65,27 +68,32 @@ class AgoraClient:
 
     # ---- 服务发现与凭据 ----
 
+    def _read_service(self):
+        """读 service.json + root.token（不落缓存）。失败一律 AgoraUnavailable。"""
+        agora_dir = Path(self.home) / ".agora"
+        try:
+            service = json.loads(
+                (agora_dir / "service.json").read_text(encoding="utf-8"))
+            port = int(service["port"])
+            if not 1 <= port <= 65535:  # 越界值会在 urlopen 抛 OverflowError（非 OSError）逸出分类
+                raise ValueError(f"port out of range: {port}")
+            root_token = (agora_dir / "root.token").read_text(
+                encoding="utf-8").strip()
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise AgoraUnavailable(
+                f"agora service discovery failed under {self.home}: "
+                f"{type(exc).__name__}") from exc
+        root_token = _checked_token(
+            root_token, AgoraUnavailable,
+            f"agora root token under {self.home}")
+        return f"http://127.0.0.1:{port}", root_token
+
     def _discover(self):
         """读 service.json + root.token（首次一次，进程内缓存）。"""
         if self._base is None:
-            agora_dir = Path(self.home) / ".agora"
-            try:
-                service = json.loads(
-                    (agora_dir / "service.json").read_text(encoding="utf-8"))
-                port = int(service["port"])
-                if not 1 <= port <= 65535:  # 越界值会在 urlopen 抛 OverflowError（非 OSError）逸出分类
-                    raise ValueError(f"port out of range: {port}")
-                root_token = (agora_dir / "root.token").read_text(
-                    encoding="utf-8").strip()
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                raise AgoraUnavailable(
-                    f"agora service discovery failed under {self.home}: "
-                    f"{type(exc).__name__}") from exc
-            root_token = _checked_token(
-                root_token, AgoraUnavailable,
-                f"agora root token under {self.home}")
-            self._base = f"http://127.0.0.1:{port}"
-            self._root_token = root_token
+            with self._discover_lock:
+                if self._base is None:  # 双检：并发首发现只落一次
+                    self._base, self._root_token = self._read_service()
         return self._root_token
 
     def _ensure_dispatcher_token(self):
@@ -114,9 +122,10 @@ class AgoraClient:
                 text = text.replace(token, "***")
         return text
 
-    def _call(self, path, body, token):
+    def _call(self, path, body, token, _rediscover=True):
+        base_used = self._base  # 终闸B S1：重发判定的比较基准＝本次实发 base
         request = urllib.request.Request(
-            self._base + path, data=json.dumps(body).encode("utf-8"),
+            base_used + path, data=json.dumps(body).encode("utf-8"),
             method="POST",
             headers={"Content-Type": "application/json",
                      "X-Agora-Token": token})
@@ -137,6 +146,33 @@ class AgoraClient:
             raise AgoraUnavailable(message) from exc
         except (OSError, http.client.HTTPException) as exc:
             # URLError/拒连/读超时/截断（IncompleteRead 非 OSError 子类，并入同分类）
+            # ag-ac5771 缺陷2：拒连可能是 agorad 重启换端口（service.json
+            # 变更）而端口/base 发现缓存终身制——重读 service.json，对本次
+            # 实发 base 端口确变才失效缓存重发一次（R1 #1：同址瞬断/读超时
+            # 已可能送达服务端，重发＝双发非幂等 POST；5xx 同理不在此支）。
+            # dispatcher 牌缓存不动。
+            # shortcut: 读超时等已送达形态与端口变更共窗时仍重发一次（双发面
+            # 有界：dispatch 被服务端拒、post 重复留言）；要更强保证需按异常
+            # 形态区分预发/后发失败，urllib 异常形状跨版本不稳定故不做。
+            if _rediscover and base_used is not None:
+                try:
+                    base, root_token = self._read_service()
+                except AgoraUnavailable as disc_exc:
+                    # R1 #4：保留原连接语境（journal 只打 str(exc)）
+                    raise AgoraUnavailable(self._scrub(
+                        f"{path} unreachable: {exc}; "
+                        f"rediscovery failed: {disc_exc}")) from exc
+                with self._discover_lock:  # 成对写（R1 #2）：与 _discover 同锁
+                    port_changed = base != base_used  # 基准＝本次实发 base（终闸B S1）
+                    if port_changed:
+                        self._base, self._root_token = base, root_token
+                if port_changed:
+                    if token != self._dispatcher_token:
+                        # root 牌调用（cred_for_sid）改携新牌重发（终闸C：
+                        # 旧 root 牌已随换牌出 _scrub 词表，服务端回显即泄漏；
+                        # root.token 同轮换时携旧牌也必被拒）
+                        token = self._root_token
+                    return self._call(path, body, token, _rediscover=False)
             raise AgoraUnavailable(self._scrub(
                 f"{path} unreachable: {exc}")) from exc
         try:

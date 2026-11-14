@@ -3714,6 +3714,7 @@ def test_blocked_retry_command_redispatches_same_task_and_confirms(
                       monitor=monitor)
     try:
         seed_blocked_agora_task(h, agora_status=status)
+        client.board_task = {"state": "blocked"}  # 门控实时态（ag-ac5771）
         h.listener.queue.put(
             comment_event(iid=7, body=body, comment_id=102))
         assert wait_until(lambda: client.dispatch_calls == ["ag-123"]), \
@@ -3745,6 +3746,7 @@ def test_blocked_cancel_command_cancels_and_announces_fact(
                       monitor=monitor)
     try:
         seed_blocked_agora_task(h)
+        client.board_task = {"state": "blocked"}  # 门控实时态（ag-ac5771）
         h.listener.queue.put(
             comment_event(iid=7, body=body, comment_id=102))
         assert wait_until(lambda: client.cancel_calls == ["ag-123"]), \
@@ -3782,7 +3784,7 @@ def test_disposal_commands_on_running_task_are_ignored(
             # needle 不得是测试名子串：pytest tmp 目录名内嵌测试名，会
             # 撞上「ledger unreadable (/tmp/…)」journal 造成假绿
             assert wait_until(
-                lambda n=n: len(h.journal("ignored (agora_status")) >= n), \
+                lambda n=n: len(h.journal("ignored (board=")) >= n), \
                 h.journal_msgs
         assert client.dispatch_calls == [] and client.cancel_calls == []
         assert client.posts == [] and h.api.posts == [], \
@@ -3825,6 +3827,7 @@ def test_disposal_command_failure_posts_fact_note(tmp_path, monkeypatch):
     h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
     try:
         seed_blocked_agora_task(h)
+        client.board_task = {"state": "blocked"}  # 门控实时态（ag-ac5771）
         h.listener.queue.put(
             comment_event(iid=7, body="重试", comment_id=102))
         assert wait_until(
@@ -3845,6 +3848,7 @@ def test_redispatch_respects_capacity_gate(tmp_path, monkeypatch):
     h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
     try:
         seed_blocked_agora_task(h)
+        client.board_task = {"state": "blocked"}  # 门控实时态（ag-ac5771）
         h.listener.queue.put(
             comment_event(iid=7, body="重试", comment_id=102))
         assert wait_until(
@@ -3855,5 +3859,59 @@ def test_redispatch_respects_capacity_gate(tmp_path, monkeypatch):
             "满员不得重新登记"
         assert h.entry(7)["agora_status"] == "blocked", \
             "门未过，账本状态不动（重发「重试」即重试通道）"
+    finally:
+        h.orch.stop()
+
+
+@pytest.mark.parametrize("body,ledger_status", [
+    ("重试", "done"),
+    ("重试", "done/failed"),
+    ("取消任务", "done"),
+    ("取消任务", "done/failed"),
+])
+def test_disposal_gate_trusts_board_over_stale_done_ledger(
+        tmp_path, monkeypatch, body, ledger_status):
+    """ag-ac5771 缺陷1：#182 实证形态——账本 agora_status 停在 done（T5
+    「done/failed」后缀书写/读取口径不齐），任务实际 blocked。门控不信任
+    缓存：board 实时 blocked → 「重试」照常 dispatch、「取消任务」照常
+    cancel。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        seed_blocked_agora_task(h, agora_status=ledger_status)
+        client.board_task = {"state": "blocked",
+                             "delivery": {"status": "failed",
+                                          "error": "rebase_conflict"}}
+        h.listener.queue.put(
+            comment_event(iid=7, body=body, comment_id=102))
+        fired = (client.dispatch_calls if body == "重试"
+                 else client.cancel_calls)
+        assert wait_until(lambda: fired == ["ag-123"]), h.journal_msgs
+        assert client.created_ids == [] and client.posts == []
+    finally:
+        h.orch.stop()
+
+
+@pytest.mark.parametrize("board_state", ["running", "merged"])
+def test_disposal_gate_ignores_when_board_not_blocked(
+        tmp_path, monkeypatch, board_state):
+    """ag-ac5771：board 实时非 blocked → 忽略（现状语义保真）——即使账本
+    缓存仍说 blocked（反向缓存陈旧），也绝不 dispatch 在飞任务/取消已
+    merged 任务。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        seed_blocked_agora_task(h)  # 账本缓存 blocked（陈旧）
+        client.board_task = {"state": board_state}
+        for n, body in enumerate(("重试", "取消任务"), start=1):
+            h.listener.queue.put(
+                comment_event(iid=7, body=body, comment_id=100 + n))
+            assert wait_until(
+                lambda n=n: len(h.journal("ignored (board=")) >= n), \
+                h.journal_msgs
+        assert client.dispatch_calls == [] and client.cancel_calls == []
+        assert client.posts == [] and h.api.posts == [], "忽略即零评论零动作"
     finally:
         h.orch.stop()

@@ -924,10 +924,14 @@ class Orchestrator:
         任务 task_dispatch（重派＝新凭据新 worker、fail_streak 清零、
         env 按当前远端 tip 重建）→ 回评确认；「取消任务／取消」→
         task_cancel → 回评取消事实（与 result-mail 收口回评同 mark 幂等）。
-        仅当账本登记任务处于 blocked（quality 或 delivery failed）；其余
-        状态（含无 agora 任务、legacy 模式、paused 不派工纪律）忽略并
-        journal，绝不误触 running/在飞。重派与正常回合同受 monitor 容量
-        闸（F3）。指令评论消费即记 note id。"""
+        仅当任务实时处于 blocked 才执行：账本 agora_status 是缓存口径，
+        常停在 done（「done/failed」后缀的书写/读取两侧不齐，ag-ac5771
+        缺陷1实证）——门控对账本 tid 实时 board 重读定夺（state==blocked
+        即可执行，quality/delivery 不分）；board 读不到才退回缓存口径
+        （现状保真，服务端拒绝与失败回评兜底）。其余情形（无 agora 任务、
+        legacy 模式、paused 不派工纪律）忽略并 journal，绝不误触
+        running/在飞。重派与正常回合同受 monitor 容量闸（F3）。指令评论
+        消费即记 note id。"""
         verb = "重试" if action == "redispatch" else "取消任务"
         with self._iid_lock(iid):  # 与同 issue 回合串行（同回合锁序）
             with self._ledger_lock:
@@ -945,12 +949,27 @@ class Orchestrator:
                     "/", 1)[0]
                 paused = bool(entry) and entry.get("status") == "paused"
             if entry is None or self.agora_client is None or not tid \
-                    or head != "blocked" \
                     or (action == "redispatch" and paused):
                 self._journal(
                     f"disposal: issue#{iid} 「{verb}」 ignored "
                     f"(agora_status={head or 'none'}, task={tid or 'none'}, "
                     f"paused={paused})")
+                return
+            # ag-ac5771 缺陷1：不信任缓存态——board 实时重读，state==blocked
+            # 即可执行；读不到实时态退回缓存口径（现状保真）
+            try:
+                task = self.agora_client.board(tid).get("task")
+                realtime = task.get("state") if isinstance(task, dict) else None
+                blocked = realtime == "blocked"
+                why = f"board={realtime}"
+            except (AgoraUnavailable, AgoraRejected,
+                    AgoraProtocolError) as exc:
+                blocked = head == "blocked"
+                why = f"agora_status={head or 'none'}, board unreadable ({exc})"
+            if not blocked:
+                self._journal(
+                    f"disposal: issue#{iid} 「{verb}」 ignored "
+                    f"({why}, task={tid}, paused={paused})")
                 return
             if action == "redispatch" and self.agora_monitor is not None \
                     and not self.agora_monitor.reserve(iid):
