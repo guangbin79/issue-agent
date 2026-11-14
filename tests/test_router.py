@@ -512,4 +512,3 @@ def test_template_carries_three_way_routing_criteria():
     assert "out_of_band" in text, "需勘察类 hint 唯一合法值必须点名"
     assert "纯解答" in text, "纯解答类判据（action=answer）"
     assert "external_branch" in text, "代码修复类缺省交付面"
-
