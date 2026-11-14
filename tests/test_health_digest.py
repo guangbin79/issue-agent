@@ -349,6 +349,19 @@ def test_repo_fetch_failure_is_problem_and_not_fatal(tmp_path):
     assert "同步" in text                      # 其余仓照常出结论
 
 
+def test_repo_weird_filename_does_not_crash(tmp_path):
+    """quotepath=false＋非 UTF-8 文件名：decode 容错，不得整份巡检崩溃。"""
+    make_git_pair(tmp_path)
+    clone = clone_consumer(tmp_path)
+    _git("config", "core.quotepath", "false", cwd=clone)
+    (clone / os.fsdecode(b"bad\xe9.txt")).write_text("x", encoding="utf-8")
+    make_instance(tmp_path, "demo-issue-agent")
+    rc, text = run_digest(tmp_path, service_state=lambda svc: "active",
+                          journal_reader=lambda svc: "", repos=(str(clone),))
+    assert rc == 0
+    assert "同步" in text
+
+
 # --- 默认 agora 探针（真实 HTTP，本机假服务） -----------------------------------
 
 class _RecordingHandler(BaseHTTPRequestHandler):
