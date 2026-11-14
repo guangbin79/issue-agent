@@ -113,6 +113,11 @@ daemon 不再本地拉起 opencode worker，而是经**持久语义 Router** 分
   精确推送（非 force、只此一 ref），成功后 `task_deliver(delivered)` 收口；
   远端已前推（non_ff）时 issue-agent 取实际远端 tip 经 `task_deliver(non_ff,
   base=...)` 换基，agora 重排重验出新 handoff 后二次推送（≤3 次总尝试）。
+  变基轮（重写历史类交付）撞 non_ff 时先过 legacy 同款护栏：远端旧链全部
+  提交在新链有 range-diff 对应、且本地 `issue/<iid>-fix` 就是在案 handoff
+  （零丢失＋精确 commit 双条件）才由 daemon 以 force-with-lease 落地
+  （align-rewrite，journal 一行）；真分叉（旧链有提交丢失）不 force，
+  仍走上面的换基重排链路——worker 永不获 force 权。
   默认分支仍只能由**人工 PR** 合并——机器人从不持有合并权。
 - **行为变化（相对 legacy）**：
   - **持久 Router 替代旧 worker session 连续性**：每回合一任务、新 worker

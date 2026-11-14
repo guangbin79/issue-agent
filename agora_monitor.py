@@ -4,10 +4,12 @@
 
 Task 4：poll 按 board(task) 的 state/delivery 驱动外部交付状态机——done＋
 awaiting_external → push_verified_commit 精确推送 → task_deliver；non_ff →
-fetch 实际远端 tip 轮转 handoff（同一任务循环，不做本地 rebase）；
-blocked/failed → 按实况记 push_failed/blocked pre-delivery 不自动重派
-不弹回 worker（ag-8d6a70：未进交付段的 blocked 从未推送，不误报
-push_failed(None)）。
+fetch 实际远端 tip，先过变基轮护栏（ag-6da714，legacy 协议 §4 移植）：
+旧链零丢失且本地分支即在案 handoff → force-with-lease 重写落地
+（align-rewrite，journal 一行），否则携 base 轮转 handoff（同一任务循环，
+不做本地 rebase）；blocked/failed → 按实况记 push_failed/blocked
+pre-delivery 不自动重派不弹回 worker（ag-8d6a70：未进交付段的 blocked
+从未推送，不误报 push_failed(None)）。
 
 Task 5：
 - 汇报管线：check_mail 整批先原子落盘 state_path+".agora-mail.json" 再
@@ -28,8 +30,10 @@ Task 5：
 
 活动名额（max_active，接线 config.max_parallel）为原子 check-and-reserve
 （F3）；_run_turn 返回不释放——释放权只在本状态机（终态）与回合失败出口。
-agora 任务自身的 origin push 只经 push_verified_commit（精确 SHA、绝不
-force、绝不动默认支）；agora 不推 issue 仓远端——外部交付权威在
+agora 任务自身的 origin push 只经 push_verified_commit（精确 SHA、绝不动
+默认支）；唯一 force 例外＝变基轮护栏判定零丢失后的 force-with-lease
+落地（daemon 侧双条件：本地分支即在案 handoff＋range-diff 零丢失，
+worker 永无 force 权）；agora 不推 issue 仓远端——外部交付权威在
 issue-agent。
 """
 
@@ -443,15 +447,47 @@ class AgoraMonitor:
         if result == "ok":
             self._ack(iid, tid, "delivered", handoff)
         elif result == "non_ff":
-            # 远端已前进：取实际 tip 轮转 handoff——同一任务循环，等门体
-            # 换基重验出新 handoff 再推，不做本地 rebase
+            # 远端已前进：取实际远端 tip，先过变基轮护栏（ag-6da714，
+            # legacy 协议 §4 移植）——安全则 force-with-lease 重写落地；
+            # 不安全/漂移才携 base 轮转 handoff（同一任务循环，等门体
+            # 换基重验出新 handoff 再推，不做本地 rebase）
             base = gitop.fetch_fix_branch_tip(
                 self._repo_path, iid, self._remote_url, self._ssl_verify)
-            self._ack(iid, tid, "non_ff", handoff, base=base)
+            if self._land_align_rewrite(iid, handoff, base):
+                self._ack(iid, tid, "delivered", handoff)
+            else:
+                self._ack(iid, tid, "non_ff", handoff, base=base)
         else:  # failed：确定性失败，重试同 commit 永不可能成功——终局上报
             self._journal(f"agora-monitor: issue#{iid} deterministic push "
                           f"failure for {handoff[:12]}; reporting failed")
             self._ack(iid, tid, "failed", handoff, reason="push_failed")
+
+    def _land_align_rewrite(self, iid, handoff, base):
+        """变基轮护栏（ag-6da714，legacy 协议 §4 移植）：判定把远端旧链
+        （base）重写到 handoff 是否零丢失——本地 issue/<iid>-fix 必须就是
+        在案 handoff（force 只推已验证的精确 commit，不带分支漂移后的
+        内容出门），且 rebase_safe_to_force 证明旧链提交在新链全有
+        range-diff 对应。双条件全过 → push --force-with-lease 锚定 base
+        落地并记 align-rewrite 一行；任一不过 → False（维持 non_ff 轮转
+        现状链，绝不 force）。护栏内的 git 病向上抛——poll 层按传输病
+        有界重试，语义与普通推送一致。"""
+        branch = gitop.fix_branch(iid)
+        if gitop.local_branch_tip(self._repo_path, branch) != handoff:
+            self._journal(f"agora-monitor: issue#{iid} local {branch} "
+                          "drifted off handoff; rotating, no force")
+            return False
+        ok, reason = gitop.rebase_safe_to_force(
+            self._repo_path, branch, base, handoff)
+        if not ok:
+            self._journal(f"agora-monitor: issue#{iid} rewrite unsafe "
+                          f"({reason}); rotating handoff, no force")
+            return False
+        gitop.push(self._repo_path, self._remote_url, f"{branch}:{branch}",
+                   self._ssl_verify, force_with_lease=f"{branch}:{base}")
+        self._journal(f"agora-monitor: issue#{iid} align-rewrite landed "
+                      f"via force-with-lease ({handoff[:12]} over "
+                      f"{base[:12]})")
+        return True
 
     def _ack(self, iid, tid, outcome, commit, base=None, reason=""):
         """task_deliver 三态确认；ack 被拒/超时先重读 board 对账（可能已

@@ -14,6 +14,9 @@ surface is exactly:
   issue/<iid>-fix, three-state ok/non_ff/failed (never force)
 - fetch_fix_branch_tip: agora external delivery — explicit-URL fetch of
   issue/<iid>-fix into the agent-remote namespace, returns the tip sha
+- local_branch_tip: read-only local branch position probe ('' when absent,
+  never creates the branch) — the agora align-rewrite guard proves a
+  force-with-lease push would land exactly the verified handoff commit
 - fix_branch_pushed: read-only tip-equality probe (the repost precondition)
 - tracked_dirty: post-turn observability probe — did the agent illegally
   modify the main working copy?
@@ -37,7 +40,9 @@ Safety contract:
   --force-with-lease anchored at the observed remote tip, and only after a
   range-diff orphan check proves the rewrite lost no old-chain commit; any
   uncertainty re-raises the original PushFailed (blocked + human note path
-  unchanged)
+  unchanged). The agora monitor composes the same guarded primitives
+  (rebase_safe_to_force + push force_with-lease) at its own layer for the
+  rebase-round non_ff landing — push_verified_commit itself stays never-force
 - the remote URL carries the credentials (https://{user}:{PAT}@host/...); the
   credential never reaches a git argv: fetch/push rewrite the URL without
   userinfo and feed the PAT to git via a 0700 GIT_ASKPASS helper reading
@@ -450,6 +455,19 @@ def remote_branch_tip(repo: PathLike, remote_url: str, branch: str,
                 branch, (ls.stderr or ls.stdout).strip()), remote_url)
         )
     return ls.stdout.split()[0] if ls.stdout.strip() else ""
+
+
+def local_branch_tip(repo: PathLike, branch: str) -> str:
+    """Tip sha of the local refs/heads/<branch> ('' when absent).
+
+    Read-only position probe — never creates the branch. The agora
+    align-rewrite guard uses it to prove a force-with-lease push would
+    land exactly the verified handoff commit.
+    """
+    if not _branch_exists(repo, branch):
+        return ""
+    return _git(repo, ["rev-parse", "--verify",
+                       f"refs/heads/{branch}"]).strip()
 
 
 def fix_branch_pushed(repo: PathLike, iid, remote_url: str,

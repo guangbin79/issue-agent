@@ -33,6 +33,7 @@ from gitop import (
     fix_branch,
     fix_branch_pushed,
     has_new_commits_vs_ref,
+    local_branch_tip,
     knowledge_changes_present,
     prune_worktrees,
     push_verified_commit,
@@ -889,6 +890,15 @@ def test_fetch_fix_branch_tip_reads_remote_into_agent_remote_namespace(
          "refs/remotes/agent-remote/master"],
         capture_output=True)
     assert probe.returncode != 0, "默认支跟踪 ref 不得被创建"
+
+
+def test_local_branch_tip_reads_tip_and_reports_absent(repo):
+    """ag-6da714 变基轮护栏材料：本地分支 tip 只读探测——在则返回
+    40-hex、不在则空串；绝不创建分支（force 只许落在在案 handoff 上）。"""
+    assert local_branch_tip(repo, fix_branch(7)) == ""
+    sha = _commit_on_fix_branch(repo, "fix.txt", "fix\n", "fix work")
+    assert local_branch_tip(repo, fix_branch(7)) == sha
+    assert local_branch_tip(repo, "issue/999-fix") == ""
 
 
 def test_push_verified_commit_pins_english_locale(repo, monkeypatch):
