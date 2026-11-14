@@ -17,7 +17,9 @@ blocked/pending 计数（pending＝claim 后在办占位，只计数不计问题
 systemctl/journalctl/agorad 依赖。纯 stdlib；零外网（agora 仅 localhost）。
 """
 
+import http.client
 import json
+import os
 import subprocess
 import sys
 import time
@@ -26,7 +28,9 @@ from pathlib import Path
 
 # agorad 任务终态口径（agorad report._TERMINAL）：merged/closed＝已合并，
 # blocked/cancelled＝已拍人处置；todo/dispatched/running/done/
-# verify_failed/reopened 均算在飞（done＝待并/待外部交付）。
+# verify_failed/reopened 均算在飞（done＝待并/待外部交付）。故意与
+# agora_monitor._TERMINAL_STATES（blocked 仍占轮询位）分叉：巡检面只数
+# 还在机制内流转的任务，blocked 由账本③/journal②单独可见。
 _TERMINAL_STATES = frozenset({"merged", "closed", "blocked", "cancelled"})
 _JOURNAL_KEYWORDS = ("CRITICAL", "Traceback", "blocked")
 
@@ -48,7 +52,8 @@ def _journal_text(svc):
     try:
         proc = subprocess.run(["journalctl", "--user", "-u", svc,
                                "--since", "24 hours ago"],
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True,
+                              errors="replace", timeout=30)
         return proc.stdout if proc.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
         return None
@@ -88,7 +93,10 @@ def _agora_probe(agora_home, service_name, task_ids, timeout_s=3.0):
         call("/doctor", {})
         tasks = {}
         for tid in task_ids:
-            row = call("/board", {"task": tid}).get("task")
+            payload = call("/board", {"task": tid})
+            if not isinstance(payload, dict):  # 200 但协议外响应体（null/[]）
+                raise ValueError(f"/board {tid}: non-dict response")
+            row = payload.get("task")
             if not isinstance(row, dict):
                 raise ValueError(f"/board {tid}: missing task row")
             delivery = row.get("delivery") or {}
@@ -100,7 +108,8 @@ def _agora_probe(agora_home, service_name, task_ids, timeout_s=3.0):
                     delivery.get("status") == "awaiting_external",
             }
         return {"ok": True, "tasks": tasks}
-    except (OSError, ValueError) as exc:  # HTTPError/JSONDecodeError 均是其子类
+    except (OSError, ValueError,
+            http.client.HTTPException) as exc:  # IncompleteRead 非 OSError 子类
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -119,6 +128,9 @@ def check_instance(svc, config_root, state_root, now, service_state,
     """检查一个实例：emit(line) 输出一节；返回该实例的问题描述列表。"""
     problems = []
     cfg = _read_json(config_root / svc / "config.json")
+    if cfg is None:  # glob 命中却读不出＝真实健康问题，不能静默降级 legacy
+        emit("config: 不可读")
+        problems.append("config.json 不可读")
     mode = (cfg or {}).get("execution_mode") or "legacy"
     emit(f"== {svc}（{mode} 模式）==")
 
@@ -164,7 +176,8 @@ def check_instance(svc, config_root, state_root, now, service_state,
         problems.append(f"账本 blocked issue {blocked} 个")
 
     if mode == "agora":
-        agora_home = (cfg or {}).get("agora_home") or ""
+        agora_home = ((cfg or {}).get("agora_home")
+                      or os.environ.get("AGORA_HOME", ""))  # 对齐 config.py 口径
         result = agora_probe(agora_home, svc, task_ids)
         if not result.get("ok"):
             emit(f"agora: 不可达（{result.get('error', 'unknown')}）")
@@ -176,7 +189,9 @@ def check_instance(svc, config_root, state_root, now, service_state,
                         if r["state"] not in _TERMINAL_STATES]
             awaiting = [r for r in rows
                         if r["awaiting_external"] and r["created"] > 0]
-            age = f"最老 awaiting_external {(now - min(r['created'] for r in awaiting)) / 3600:.1f} 小时" if awaiting else "无 awaiting_external"
+            age = (f"最老 awaiting_external "
+                   f"{max(0.0, now - min(r['created'] for r in awaiting)) / 3600:.1f} 小时"
+                   if awaiting else "无 awaiting_external")
             emit(f"agora: 可达；在飞任务 {len(inflight)}；{age}")
     return problems
 
