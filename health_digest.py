@@ -33,8 +33,9 @@ from pathlib import Path
 
 # agorad 任务终态口径（agorad report._TERMINAL）：merged/closed＝已合并，
 # blocked/cancelled＝已拍人处置。本巡检故意只认 merged/closed/cancelled
-# 为终态：blocked 仍需人处置，入「在飞·卡死」桶逐单点名计问题——
-# 与 agora_monitor._TERMINAL_STATES（blocked 仍占轮询位）口径不同。
+# 为终态：blocked 仍需人处置，入「在飞·卡死」桶逐单点名计问题
+# （口径与 agora_monitor._TERMINAL_STATES 一致，动机不同——那是轮询
+# 名额释放，这是巡检可见性）。
 _TERMINAL_STATES = frozenset({"merged", "closed", "cancelled"})
 _JOURNAL_KEYWORDS = ("CRITICAL", "Traceback", "blocked", "dropped")
 
@@ -225,10 +226,15 @@ def check_instance(svc, config_root, state_root, now, service_state,
 
 
 def _git(repo, *args, timeout_s=30):
-    """在 repo 跑 git；返回 (rc, stdout, stderr)。OSError/超时归一为 rc≠0。"""
+    """在 repo 跑 git；返回 (rc, stdout, stderr)。
+
+    OSError/超时归一为 rc≠0；decode 容错（quotepath=false＋非 UTF-8
+    文件名不得让巡检崩溃，对齐 _journal_text 的 errors="replace"）。
+    """
     try:
         proc = subprocess.run(["git", "-C", str(repo), *args],
-                              capture_output=True, text=True, timeout=timeout_s)
+                              capture_output=True, text=True,
+                              errors="replace", timeout=timeout_s)
         return proc.returncode, proc.stdout, proc.stderr
     except (OSError, subprocess.SubprocessError):
         return 1, "", ""
