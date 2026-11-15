@@ -17,6 +17,7 @@ Run: python3 -m pytest tests/test_gitop.py -q   (from scripts/issue-agent/)
 import itertools
 import shutil
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -401,6 +402,52 @@ def test_sweep_skips_worktree_outside_parent(repo, tmp_path):
 
     assert report.removed == [] and report.kept == [] and report.refused == []
     assert wt.exists()
+
+
+def test_sweep_terminal_gate_keeps_nonterminal_issue(repo, tmp_path):
+    """terminal_iids 闸：非终态 issue 的 worktree 永不删（所有权信号，
+    不依赖目录命名——agora env／在飞任务的活环境由此保护）。"""
+    done_wt = add_review_worktree(repo, tmp_path, "work__wt-review-done", fix_branch(11))
+    live_wt = add_review_worktree(repo, tmp_path, "work__wt-review-live", fix_branch(12))
+
+    report = sweep_idle_review_worktrees(repo, terminal_iids={"11"})
+
+    assert names(report.removed) == ["work__wt-review-done"]
+    assert names(report.kept) == ["work__wt-review-live"], "non-terminal issue never swept"
+    assert live_wt.exists()
+
+
+def test_sweep_terminal_gate_keeps_unknown_iid(repo, tmp_path):
+    """terminal_iids 闸开时，未入册的 iid 按非终态处理（保守不删）。"""
+    wt = add_review_worktree(repo, tmp_path, "work__wt-review-unknown", fix_branch(33))
+
+    report = sweep_idle_review_worktrees(repo, terminal_iids=set())
+
+    assert report.removed == []
+    assert names(report.kept) == ["work__wt-review-unknown"]
+
+
+def test_sweep_idle_gate_keeps_recently_touched(repo, tmp_path):
+    """idle_after 闸：有 mtime 晚于 cutoff 的文件＝近期在用，保留。"""
+    wt = add_review_worktree(repo, tmp_path, "work__wt-review-fresh", fix_branch(21))
+
+    cutoff = datetime.now() - timedelta(hours=1)
+    report = sweep_idle_review_worktrees(repo, terminal_iids={"21"}, idle_after=cutoff)
+
+    assert report.removed == []
+    assert names(report.kept) == ["work__wt-review-fresh"]
+
+
+def test_sweep_idle_gate_removes_when_nothing_recent(repo, tmp_path):
+    """idle_after 闸：无任何 mtime 晚于 cutoff＝静默可删（future cutoff
+    无人能晚于，确定性构造静默态）。"""
+    wt = add_review_worktree(repo, tmp_path, "work__wt-review-quiet", fix_branch(22))
+
+    cutoff = datetime.now() + timedelta(hours=1)
+    report = sweep_idle_review_worktrees(repo, terminal_iids={"22"}, idle_after=cutoff)
+
+    assert names(report.removed) == ["work__wt-review-quiet"]
+    assert report.kept == []
 
 
 def test_sweep_skips_detached_head_worktree(repo, tmp_path):

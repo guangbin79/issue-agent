@@ -111,7 +111,8 @@ def test_daemon_passes_worktree_path_to_orchestrator(tmp_path, monkeypatch):
     assert captured["worktree_path"] == "/repo_agent"  # passed through; the orchestrator ignores it
 
 
-def _prune_scaffold(tmp_path, monkeypatch, prune_impl, sweep_impl=None, events=None):
+def _prune_scaffold(tmp_path, monkeypatch, prune_impl, sweep_impl=None, events=None,
+                    cfg=None):
     """daemon.main with a fake orchestrator + injected prune/sweep seams."""
     import signal
     import threading
@@ -140,9 +141,10 @@ def _prune_scaffold(tmp_path, monkeypatch, prune_impl, sweep_impl=None, events=N
         def stop(self):
             pass
 
-    cfg = Config(api_base="http://gitea", pat="t",
-                 repo_path=str(tmp_path), callback_url="http://cb",
-                 secret_token="s", project="grp/repo")
+    if cfg is None:
+        cfg = Config(api_base="http://gitea", pat="t",
+                     repo_path=str(tmp_path), callback_url="http://cb",
+                     secret_token="s", project="grp/repo")
     monkeypatch.setattr(daemon, "load_config", lambda *a, **k: cfg)
     monkeypatch.setattr(daemon, "GitLabClient",
                         lambda *a, **k: types.SimpleNamespace())
@@ -211,6 +213,52 @@ def test_daemon_sweep_failure_continues(tmp_path, monkeypatch, capsys):
     _prune_scaffold(tmp_path, monkeypatch, lambda repo: None, sweep_impl=broken_sweep)
     assert daemon.main() == 0
     assert "warning: worktree sweep failed (continuing): boom" in capsys.readouterr().out
+
+
+def test_daemon_agora_mode_sweeps_with_gates(tmp_path, monkeypatch, capsys):
+    """agora 模式不再整体跳过 sweep：以终态 issue（done 且无在飞标记）
+    ＋静默双闸运行；prune 仍跳过（worktree 登记归服务所有）。"""
+    import json
+    import time
+    import types
+
+    import gitop as gitop_mod
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text(json.dumps({"issues": {
+        "332": {"status": "done"},
+        "57": {"status": "active"},
+        "9": {"status": "done",
+              "review_push_pending_at": "2026-11-14T00:00:00"},
+        "10": {"status": "done", "agora_pending": True},
+    }}))
+
+    pruned = []
+    calls = {}
+
+    def gated_sweep(repo, **kwargs):
+        calls["repo"] = repo
+        calls["kwargs"] = kwargs
+        return gitop_mod.SweepReport([], [], [])
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+    _prune_scaffold(tmp_path, monkeypatch, lambda repo: pruned.append(repo),
+                    sweep_impl=gated_sweep, cfg=_agora_cfg(tmp_path))
+    monkeypatch.setattr(daemon, "AgoraClient", FakeClient)
+
+    assert daemon.main() == 0
+    assert pruned == [], "prune stays skipped in agora mode"
+    assert calls["repo"] == str(tmp_path)
+    assert calls["kwargs"]["terminal_iids"] == {"332"}, (
+        "only done issues without in-flight markers are terminal")
+    idle_after = calls["kwargs"]["idle_after"]
+    age_h = (time.time() - idle_after.timestamp()) / 3600
+    assert 23 < age_h < 25, f"idle window ~24h, got {age_h:.2f}h"
+    assert "gated sweep" in capsys.readouterr().out
 
 
 # --- agora wiring (plan Task 1) ---------------------------------------------
@@ -383,29 +431,3 @@ def test_daemon_agora_mode_builds_monitor_and_threads_it(tmp_path, monkeypatch):
     assert kwargs == {"client": captured["agora_client"], "max_active": 1,
                       "stall_timeout": 1800}
     assert captured["agora_monitor"] is built[0]
-
-
-# --- Task 6: startup hygiene isolation (设计 §11.5) -----------------------------
-
-
-def test_daemon_agora_mode_skips_startup_worktree_hygiene(tmp_path, monkeypatch,
-                                                          capsys):
-    """Task 6 legacy 隔离：agora 模式跳过启动期全局 prune_worktrees/
-    sweep_idle_review_worktrees——仓下 worktree 归 agora 服务（env）与其它
-    实例所有，全局清扫破坏「多实例只清自身环境」；legacy 路径照旧（上方
-    prune/sweep 测试锁定）。"""
-    import gitop as gitop_mod
-
-    def forbidden_prune(repo):
-        raise AssertionError("agora mode must not run global prune_worktrees")
-
-    def forbidden_sweep(repo):
-        raise AssertionError(
-            "agora mode must not run global sweep_idle_review_worktrees")
-
-    _wiring_scaffold(tmp_path, monkeypatch, _agora_cfg(tmp_path))
-    monkeypatch.setattr(gitop_mod, "prune_worktrees", forbidden_prune)
-    monkeypatch.setattr(gitop_mod, "sweep_idle_review_worktrees", forbidden_sweep)
-    assert daemon.main() == 0
-    assert "agora mode skips global worktree prune/sweep" in \
-        capsys.readouterr().out

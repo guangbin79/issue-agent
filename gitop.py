@@ -28,7 +28,8 @@ surface is exactly:
   dirty/untracked check is the gate; refusals come back as "kept").
   Startup-only use, mandate relaxation user-approved 2026-10-09; scan
   root = parent(config.repo_path), never touches ~/.dotfiles or anything
-  outside that parent
+  outside that parent; optional terminal_iids/idle_after gates (agora
+  mode) narrow it to terminal-issue worktrees quiet for the idle window
 
 Safety contract:
 - push accepts exactly two refspec shapes: issue/<iid>-fix:issue/<iid>-fix,
@@ -77,7 +78,7 @@ _REFSPEC_OK = re.compile(r"^issue/(\d+)-fix:issue/\1-fix$")
 # 全零 OID 除外（push refspec 语义＝删远端分支，push_verified_commit 同拒）。
 _REFSPEC_SHA_OK = re.compile(r"^([0-9a-f]{40}):refs/heads/issue/(\d+)-fix$")
 
-_REVIEW_BRANCH_OK = re.compile(r"^refs/heads/issue/\d+-fix$")
+_REVIEW_BRANCH_OK = re.compile(r"^refs/heads/issue/(\d+)-fix$")  # group(1)=iid (terminal gate)
 
 
 def _refspec_allowed(refspec: str) -> bool:
@@ -385,15 +386,38 @@ def _worktree_entries(main_repo: PathLike):
     return entries
 
 
+def _recently_touched(root: PathLike, cutoff_ts: float) -> bool:
+    """True when any entry at/under *root* has an lstat mtime newer than
+    *cutoff_ts* (epoch seconds); early-exits on the first fresh entry.
+    lstat, not stat: symlink farms neither loop nor get followed."""
+    if os.lstat(root).st_mtime > cutoff_ts:
+        return True
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            try:
+                mtime = os.lstat(os.path.join(dirpath, name)).st_mtime
+            except OSError:
+                continue  # raced away mid-walk; next startup re-judges
+            if mtime > cutoff_ts:
+                return True
+    return False
+
+
 def sweep_idle_review_worktrees(main_repo: PathLike,
-                                cwd_probe=None) -> SweepReport:
+                                cwd_probe=None,
+                                terminal_iids=None,
+                                idle_after=None) -> SweepReport:
     """Remove idle leftover review worktrees; startup-only, never --force.
 
     A candidate must be a REGISTERED worktree that is (1) not the main
     repo, (2) a sibling of it (parent(main_repo)), (3) named
     <main_repo>__wt-*, (4) checked out on issue/<iid>-fix (detached HEAD
     is never a candidate), and (5) unoccupied per cwd_probe — probed
-    immediately before each removal (TOCTOU guard). Removal is plain
+    immediately before each removal (TOCTOU guard); when the gates are
+    on, also (6) terminal_iids 所有权闸 — the branch iid must belong to
+    the terminal set (unknown iids are kept conservatively) and
+    (7) idle_after 静默闸 (datetime, compared via timestamp) — nothing
+    under the worktree may be newer than the cutoff. Removal is plain
     `git worktree remove`: git's own dirty/untracked check is the dirty
     gate, refusals land in kept. Enumeration failure raises GitopError;
     the daemon caller wraps in try/except like prune_worktrees.
@@ -405,11 +429,18 @@ def sweep_idle_review_worktrees(main_repo: PathLike,
     prefix = f"{main_path.name}__wt-"
     for entry_path, branch in _worktree_entries(main_repo):
         path = Path(entry_path)
+        match = _REVIEW_BRANCH_OK.match(branch) if branch else None
         if (path == main_path
                 or path.parent != main_path.parent
                 or not path.name.startswith(prefix)
-                or branch is None
-                or not _REVIEW_BRANCH_OK.match(branch)):
+                or match is None):
+            continue
+        if terminal_iids is not None and match.group(1) not in terminal_iids:
+            report.kept.append(entry_path)  # non-terminal/unknown issue: not ours
+            continue
+        if (idle_after is not None
+                and _recently_touched(entry_path, idle_after.timestamp())):
+            report.kept.append(entry_path)  # activity inside the idle window
             continue
         if cwd_probe(entry_path):
             report.refused.append(entry_path)

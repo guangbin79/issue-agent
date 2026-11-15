@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -36,6 +37,7 @@ _SERVICE_NAME = os.environ.get("ISSUE_AGENT_SERVICE_NAME", "issue-agent")
 _STATE_DIR = Path.home() / ".local" / "state" / _SERVICE_NAME
 _SNAPSHOT_DIR = Path.home() / ".local" / "lib" / _SERVICE_NAME
 _DEFAULT_PORT = int(os.environ.get("ISSUE_AGENT_PORT", "8644"))
+_SWEEP_IDLE_AFTER = timedelta(hours=24)
 
 
 def _teardown_self_cancel():
@@ -147,14 +149,46 @@ def main(argv=None) -> int:
     _STATE_DIR.mkdir(parents=True, exist_ok=True)
     protocol_path = _render_protocol(_PKG_DIR, config)
 
-    # startup hygiene (Task 6 legacy isolation, 设计 §11.5): these are GLOBAL
-    # passes over the shared repo — in agora mode the worktrees under that repo
-    # belong to agora envs (service-owned) and other instances, so a global
-    # prune/sweep would break "one instance cleans only its own environment".
-    # legacy keeps the historical behavior byte-for-byte.
+    # startup hygiene (Task 6 legacy isolation, 设计 §11.5): legacy keeps
+    # the historical prune+sweep behavior byte-for-byte; in agora mode the
+    # worktrees under that repo include agora envs (service-owned) and other
+    # instances, so a global prune would break "one instance cleans only its
+    # own environment" — instead agora runs a GATED sweep (below) whose two
+    # gates keep service-owned envs out of reach.
     if config.execution_mode == "agora":
-        journal("startup: agora mode skips global worktree prune/sweep "
-                "(env worktrees are service-owned)")
+        # Gated sweep instead of a blanket skip: a worktree is only swept
+        # when its issue is terminal in OUR ledger (ownership gate — live
+        # and unknown issues, whatever the directory is named, are never
+        # swept, so agora envs for in-flight tasks are out of reach) and
+        # it has been quiet for the idle window (recency gate). Prune
+        # stays skipped: worktree registrations may be service-owned.
+        from state import load_state
+        try:
+            ledger = load_state(_STATE_DIR / "state.json")
+            terminal = {
+                str(iid) for iid, entry in ledger.get("issues", {}).items()
+                if isinstance(entry, dict)
+                and entry.get("status") == "done"
+                and not entry.get("review_push_pending_at")
+                and not entry.get("report_probe_pending")
+                and not entry.get("agora_pending")
+            }
+        except Exception as exc:  # ledger unusable → sweep nothing (fail-safe)
+            terminal = set()
+            journal(f"warning: gated sweep ledger unreadable, "
+                    f"sweeping nothing: {exc}")
+        try:
+            report = gitop.sweep_idle_review_worktrees(
+                config.repo_path, terminal_iids=terminal,
+                idle_after=datetime.now() - _SWEEP_IDLE_AFTER)
+            journal("startup: agora mode gated sweep (terminal-issue + "
+                    "idle gates; prune skipped — registrations are "
+                    "service-owned)")
+            journal(f"startup: swept {len(report.removed)} idle review worktree(s), kept {len(report.kept) + len(report.refused)} (dirty/busy)")
+            for path in report.kept + report.refused:
+                journal(f"startup: worktree kept (dirty/busy): {path}")
+        except gitop.GitopError as exc:
+            journal(f"warning: worktree sweep failed (continuing): {exc}")
     else:
         # startup hygiene: the agent removes its own worktrees, but a dir deleted
         # out-of-band leaves a stale registration — prune cheaply, best-effort
