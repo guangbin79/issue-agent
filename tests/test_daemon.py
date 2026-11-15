@@ -261,6 +261,42 @@ def test_daemon_agora_mode_sweeps_with_gates(tmp_path, monkeypatch, capsys):
     assert "gated sweep" in capsys.readouterr().out
 
 
+def test_daemon_agora_mode_unreadable_ledger_warns_and_sweeps_nothing(
+        tmp_path, monkeypatch, capsys):
+    """账本不可读（load_state 内部兜底返回空账本）时经 warn 回调留痕：
+    终态集合为空＝fail-safe 不扫，但不得静默。"""
+    import gitop as gitop_mod
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text("{not json")
+
+    calls = {}
+
+    def gated_sweep(repo, **kwargs):
+        calls["kwargs"] = kwargs
+        return gitop_mod.SweepReport([], [], [])
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeSide:
+        def __init__(self, **kwargs):
+            pass
+
+    _prune_scaffold(tmp_path, monkeypatch, lambda repo: None,
+                    sweep_impl=gated_sweep, cfg=_agora_cfg(tmp_path))
+    monkeypatch.setattr(daemon, "AgoraClient", FakeClient)
+    # router 自身也读账本会打同名 warning——桩掉，只留 gated sweep 的声源
+    monkeypatch.setattr(daemon, "SemanticRouter", FakeSide)
+    monkeypatch.setattr(daemon, "AgoraMonitor", FakeSide)
+
+    assert daemon.main() == 0
+    assert calls["kwargs"]["terminal_iids"] == set(), "unreadable ledger sweeps nothing"
+    assert "ledger unreadable" in capsys.readouterr().out
+
+
 # --- agora wiring (plan Task 1) ---------------------------------------------
 
 

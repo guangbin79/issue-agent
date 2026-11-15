@@ -390,8 +390,11 @@ def _recently_touched(root: PathLike, cutoff_ts: float) -> bool:
     """True when any entry at/under *root* has an lstat mtime newer than
     *cutoff_ts* (epoch seconds); early-exits on the first fresh entry.
     lstat, not stat: symlink farms neither loop nor get followed."""
-    if os.lstat(root).st_mtime > cutoff_ts:
-        return True
+    try:
+        if os.lstat(root).st_mtime > cutoff_ts:
+            return True
+    except OSError:
+        return False  # vanished/stale registration: let git worktree remove decide
     for dirpath, dirnames, filenames in os.walk(root):
         for name in dirnames + filenames:
             try:

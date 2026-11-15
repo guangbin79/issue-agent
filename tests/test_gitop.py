@@ -450,6 +450,19 @@ def test_sweep_idle_gate_removes_when_nothing_recent(repo, tmp_path):
     assert report.kept == []
 
 
+def test_sweep_idle_gate_survives_stale_registration(repo, tmp_path):
+    """idle_after 闸遇到 stale 登记（目录已删、git 登记仍在）不崩：
+    root lstat 视为静默，交 git worktree remove 兜底（失败落 kept）。"""
+    wt = add_review_worktree(repo, tmp_path, "work__wt-review-gone", fix_branch(23))
+    shutil.rmtree(wt)  # deleted without unregistering
+
+    report = sweep_idle_review_worktrees(
+        repo, terminal_iids={"23"}, idle_after=datetime.now() + timedelta(hours=1))
+
+    assert names(report.removed) == ["work__wt-review-gone"]
+    assert report.kept == []
+
+
 def test_sweep_skips_detached_head_worktree(repo, tmp_path):
     wt = tmp_path / "work__wt-review-d"
     git("worktree", "add", "--detach", str(wt), "HEAD", cwd=repo)

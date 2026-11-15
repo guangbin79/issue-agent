@@ -164,7 +164,7 @@ def main(argv=None) -> int:
         # stays skipped: worktree registrations may be service-owned.
         from state import load_state
         try:
-            ledger = load_state(_STATE_DIR / "state.json")
+            ledger = load_state(_STATE_DIR / "state.json", warn=journal)
             terminal = {
                 str(iid) for iid, entry in ledger.get("issues", {}).items()
                 if isinstance(entry, dict)
