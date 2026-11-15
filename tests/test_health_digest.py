@@ -46,7 +46,11 @@ ROOT_TOKEN = "root-token-secret-1"
 # --- fixtures -----------------------------------------------------------------
 
 def make_instance(root, name, mode="legacy", agora_home="", issues=None):
-    """Write ~/.config/<name>/config.json (+ optional state ledger) under root."""
+    """Write ~/.config/<name>/config.json (+ optional state ledger) under root.
+
+    issues 值为 (status, agora_task_id) 或 (status, agora_task_id,
+    delivery_commit)——第三元素在案即「修复已就绪等 PR 合并」信号。
+    """
     cfg_dir = root / ".config" / name
     cfg_dir.mkdir(parents=True)
     (cfg_dir / "config.json").write_text(json.dumps(
@@ -54,10 +58,20 @@ def make_instance(root, name, mode="legacy", agora_home="", issues=None):
     if issues is not None:
         state_dir = root / ".local" / "state" / name
         state_dir.mkdir(parents=True)
-        entries = {iid: {"status": st, "agora_task_id": tid}
-                   for iid, (st, tid) in issues.items()}
+        entries = {}
+        for iid, spec in issues.items():
+            st, tid, *rest = spec
+            entry = {"status": st, "agora_task_id": tid}
+            if rest and rest[0]:
+                entry["delivery_commit"] = rest[0]
+            entries[iid] = entry
         (state_dir / "state.json").write_text(
             json.dumps({"issues": entries}), encoding="utf-8")
+
+
+def action_list(text):
+    """行动清单节（标签行区）：「行动清单:」起到首个空行（含计数尾行）。"""
+    return text.split("行动清单:", 1)[1].strip().split("\n\n", 1)[0]
 
 
 def run_digest(root, repos=(), **kw):
@@ -83,6 +97,7 @@ def test_all_green_legacy_rc0(tmp_path):
     rc, text = run_digest(tmp_path, service_state=lambda svc: "active",
                           journal_reader=lambda svc: "ok: nothing to report")
     assert rc == 0
+    assert text.splitlines()[0] == "结论：无需处理"   # 邮件首行＝执行摘要
     assert "全部正常" in text
     assert "demo-issue-agent" in text
     assert "legacy 模式" in text
@@ -103,6 +118,7 @@ def test_all_green_agora_mode_rc0(tmp_path):
     rc, text = run_digest(tmp_path, now=now, service_state=lambda svc: "active",
                           journal_reader=lambda svc: "", agora_probe=ok_probe(tasks))
     assert rc == 0
+    assert text.splitlines()[0] == "结论：无需处理"
     assert "agora 模式" in text
     assert "在飞任务 1" in text          # done 待并＝非终态；merged 不计
     assert "2.0 小时" in text            # 最老 awaiting_external 年龄
@@ -122,28 +138,107 @@ def test_foreign_client_key_not_counted(tmp_path):
     assert "在飞任务 0" in text
 
 
-# --- 四类 rc=1 触发 ------------------------------------------------------------
+# --- 行动分级（ag-0f95bb：三类标签＋执行摘要） ----------------------------------
 
-def test_service_dead_rc1_names_instance(tmp_path):
+def test_service_dead_first_line_names_first_need(tmp_path):
+    """真故障：首行结论点名需要处理数与首项，标签行附具体建议动作。"""
     make_instance(tmp_path, "demo-issue-agent")
     rc, text = run_digest(tmp_path, service_state=lambda svc: "failed",
                           journal_reader=lambda svc: "")
     assert rc == 1
-    assert "共 1 项问题" in text
-    assert "demo-issue-agent" in text          # 摘要点名
+    assert text.splitlines()[0] == ("结论：1 项需要处理"
+                                    "（首项：demo-issue-agent: 服务状态 failed）")
+    assert "【需要处理】demo-issue-agent: 服务状态 failed" in text
+    assert "restart" in text                          # 附建议动作
+    assert "共需要处理 1、知悉 0、无需 0" in text      # 计数尾行
     assert "服务状态 failed" in text
-    assert text.rstrip().endswith("共 1 项问题")  # 末行总结
 
 
-def test_ledger_blocked_rc1(tmp_path):
+def test_ledger_blocked_without_delivery_commit_needs_action(tmp_path):
+    """blocked 无交付在案＝需人工处置的真故障：rc=1，issue 号点名。"""
     make_instance(tmp_path, "demo-issue-agent",
-                  issues={"7": ("blocked", None), "8": ("active", None)})
+                  issues={"7": ("blocked", None), "9": ("blocked", None),
+                          "8": ("active", None)})
     rc, text = run_digest(tmp_path, service_state=lambda svc: "active",
                           journal_reader=lambda svc: "")
     assert rc == 1
-    assert "demo-issue-agent" in text
-    assert "blocked 1" in text
-    assert "blocked" in text.split("问题清单", 1)[-1]  # 摘要点名问题
+    action = action_list(text)
+    assert "【需要处理】" in action
+    assert "无交付在案" in action
+    assert "#7" in action and "#9" in action          # issue 号清单
+    assert "blocked 2" in text                        # 详情区原始计数仍在
+
+
+def test_ledger_blocked_with_delivery_commit_acknowledge_only(tmp_path):
+    """待人工合并＝正常业务态：blocked＋delivery_commit 在案→知悉即可、
+    不计 rc（有意变更 ag-0f95bb：等人工合并不是故障，原语义 rc=1）。"""
+    make_instance(tmp_path, "demo-issue-agent",
+                  issues={"7": ("blocked", None, "a" * 40),
+                          "9": ("blocked", None, "b" * 40)})
+    rc, text = run_digest(tmp_path, service_state=lambda svc: "active",
+                          journal_reader=lambda svc: "")
+    assert rc == 0
+    assert text.splitlines()[0] == "结论：无需处理"
+    action = action_list(text)
+    assert "【知悉即可】" in action
+    assert "修复已就绪等 PR" in action                 # 一句话含义
+    assert "#7" in action and "#9" in action          # issue 号清单
+    assert "共需要处理 0、知悉 1、无需 0" in text
+
+
+def test_journal_echo_is_no_action_rc0(tmp_path):
+    """历史余音：journal 关键词计数而账本/agora 面无现行问题→无需处理，
+    说明自愈时点（有意变更 ag-0f95bb：原语义关键词直接 rc=1）。"""
+    make_instance(tmp_path, "demo-issue-agent",
+                  issues={"7": ("active", None)})
+    journal = ("CRITICAL: boom\nnormal line\n"
+               "Traceback (most recent call last):\n"
+               "issue 7 blocked\nstill blocked\n"
+               "agora_monitor: mail for unknown task ag-9 dropped\n")
+    rc, text = run_digest(tmp_path, service_state=lambda svc: "active",
+                          journal_reader=lambda svc: journal)
+    assert rc == 0
+    assert text.splitlines()[0] == "结论：无需处理"
+    action = action_list(text)
+    assert "【无需处理】" in action
+    assert "历史余音" in action
+    assert "明晨" in action                            # 自愈时点
+    assert "CRITICAL 1" in text and "dropped 1" in text  # 详情区原始计数
+    assert "全部正常" not in text                      # 有清单项但零需要处理
+
+
+def test_journal_echo_corroborates_current_problem_rc1(tmp_path):
+    """账本/agora 面有现行问题时，journal 异常判「需要处理」（同源）。"""
+    make_instance(tmp_path, "demo-issue-agent",
+                  issues={"7": ("blocked", None)})     # 无交付在案＝现行问题
+    rc, text = run_digest(tmp_path, service_state=lambda svc: "active",
+                          journal_reader=lambda svc: "issue 7 blocked\n")
+    assert rc == 1
+    action = action_list(text)
+    assert action.count("【需要处理】") == 2            # blocked 本身＋journal 同源
+    assert "【无需处理】" not in action
+    assert "同源" in action
+
+
+def test_mixed_grades_summary_counts(tmp_path):
+    """混合场景：三类并存，结论行计数正确、只把需要处理计入 rc。"""
+    make_instance(tmp_path, "alpha-issue-agent",
+                  issues={"7": ("blocked", None),            # 无 dc→需要处理
+                          "9": ("blocked", None, "c" * 40)})  # 有 dc→知悉
+    make_instance(tmp_path, "beta-issue-agent",
+                  issues={"5": ("active", None)})
+    rc, text = run_digest(
+        tmp_path,
+        service_state=lambda svc: "failed" if svc.startswith("alpha") else "active",
+        journal_reader=lambda svc: "issue 7 blocked\n" if svc.startswith("alpha") else "")
+    assert rc == 1
+    # 需要＝服务 failed＋blocked 无 dc＋journal 同源＝3；知悉＝待合并 1；无需 0
+    assert text.splitlines()[0] == ("结论：3 项需要处理"
+                                    "（首项：alpha-issue-agent: 服务状态 failed）")
+    assert "共需要处理 3、知悉 1、无需 0" in text
+    action = action_list(text)
+    assert "beta-issue-agent" not in action           # 正常实例不进行动清单
+    assert "beta-issue-agent" in text                 # 详情节照常输出
 
 
 def test_pending_only_is_not_a_problem(tmp_path):
@@ -155,28 +250,6 @@ def test_pending_only_is_not_a_problem(tmp_path):
     assert rc == 0
     assert "pending 1" in text
     assert "全部正常" in text
-
-
-def test_journal_critical_rc1(tmp_path):
-    make_instance(tmp_path, "demo-issue-agent")
-    journal = ("CRITICAL: boom\nnormal line\nTraceback (most recent call last):\n"
-               "issue 7 blocked\nstill blocked\n")
-    rc, text = run_digest(tmp_path, service_state=lambda svc: "active",
-                          journal_reader=lambda svc: journal)
-    assert rc == 1
-    assert "CRITICAL 1" in text
-    assert "Traceback 1" in text
-    assert "blocked 2" in text
-
-
-def test_journal_dropped_rc1(tmp_path):
-    """monitor "mail for unknown task dropped" 类孤儿症状行计入异常。"""
-    make_instance(tmp_path, "demo-issue-agent")
-    journal = "agora_monitor: mail for unknown task ag-9 dropped\nfine\n"
-    rc, text = run_digest(tmp_path, service_state=lambda svc: "active",
-                          journal_reader=lambda svc: journal)
-    assert rc == 1
-    assert "dropped 1" in text
 
 
 def test_agora_blocked_bucketed_and_named(tmp_path):
@@ -210,18 +283,19 @@ def test_agora_blocked_bucketed_and_named(tmp_path):
     assert "长" * 15 not in text                # 标题截断（≤20 字符）
     assert "non_ff" in text                     # delivery.error 点名
     assert "3.0 小时" in text                   # 年龄
-    summary = text.split("问题清单", 1)[1]
-    assert "ag-3" in summary and "non_ff" in summary  # 卡死进问题清单
+    action = action_list(text)
+    assert "【需要处理】" in action and "ag-3" in action and "non_ff" in action
 
 
-def test_agora_unreachable_rc1(tmp_path):
+def test_agora_unreachable_need_with_service_json_hint(tmp_path):
     make_instance(tmp_path, "demo-issue-agent", mode="agora", agora_home="/ah",
                   issues={"7": ("active", "ag-1")})
     rc, text = run_digest(tmp_path, service_state=lambda svc: "active",
                           journal_reader=lambda svc: "", agora_probe=dead_probe)
     assert rc == 1
-    assert "demo-issue-agent" in text
-    assert "agora 不可达" in text
+    action = action_list(text)
+    assert "【需要处理】demo-issue-agent: agora 不可达" in action
+    assert "/ah/.agora/service.json" in action   # 建议动作落到具体排查点
 
 
 # --- 汇总与鲁棒性 ---------------------------------------------------------------
@@ -234,10 +308,10 @@ def test_multi_instance_partial_failure_keeps_other_sections(tmp_path):
         journal_reader=lambda svc: "")
     assert rc == 1
     assert "bad-issue-agent" in text and "good-issue-agent" in text
-    # 只有失败实例进问题清单；正常实例的节照常输出
-    summary = text.split("问题清单", 1)[1]
-    assert "bad-issue-agent" in summary
-    assert "good-issue-agent" not in summary
+    # 只有失败实例进行动清单；正常实例的详情节照常输出
+    action = action_list(text)
+    assert "bad-issue-agent" in action
+    assert "good-issue-agent" not in action
 
 
 def test_no_instances_rc1(tmp_path):
@@ -246,6 +320,7 @@ def test_no_instances_rc1(tmp_path):
                           journal_reader=lambda svc: "")
     assert rc == 1
     assert "未发现" in text
+    assert text.splitlines()[0].startswith("结论：1 项需要处理")
 
 
 def test_config_unreadable_is_problem(tmp_path):
@@ -307,8 +382,9 @@ def test_repo_behind_is_problem(tmp_path):
                           journal_reader=lambda svc: "", repos=(str(clone),))
     assert rc == 1
     assert "本地落后 1 提交" in text
-    summary = text.split("问题清单", 1)[1]
-    assert str(clone) in summary
+    action = action_list(text)
+    assert str(clone) in action                   # 仓路径点名
+    assert "【需要处理】" in action and "pull" in action  # 附同步建议
 
 
 def test_repo_sync_is_green(tmp_path):
