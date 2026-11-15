@@ -53,6 +53,15 @@ _JOURNAL_KEYWORDS = ("CRITICAL", "Traceback", "blocked", "dropped")
 # 行动分级标签（ag-0f95bb）：rc 只认需要处理。
 _NEED, _KNOW, _AUTO = "需要处理", "知悉即可", "无需处理"
 
+
+def _iid_sort_key(iid):
+    """账本 issue 键排序：数字键数值序，异形键（isdigit 真而 int() 抛、
+    超长数字串）殿后按字典序——排序键不得抛异常中断该实例检查。"""
+    try:
+        return (0, int(iid))
+    except ValueError:
+        return (1, str(iid))
+
 # 本地消费仓固定清单（cron/daemon 读本地工作副本；agora 合并只推远端，
 # 本地不拉＝改动静默空转）——加仓只改这里一处。
 _LOCAL_CONSUMER_REPOS = (
@@ -201,13 +210,12 @@ def check_instance(svc, config_root, state_root, now, service_state,
                           if e.get("status") == "pending")
             blocked_ids = [iid for iid, e in entries
                            if e.get("status") == "blocked"]
-            sort_iid = lambda s: (int(s) if s.isdigit() else 1 << 60, s)  # noqa: E731
             blocked_dc = sorted(
                 (iid for iid, e in entries
                  if e.get("status") == "blocked" and e.get("delivery_commit")),
-                key=sort_iid)
+                key=_iid_sort_key)
             blocked_nodc = sorted(set(blocked_ids) - set(blocked_dc),
-                                  key=sort_iid)
+                                  key=_iid_sort_key)
             task_ids = sorted({e["agora_task_id"] for _, e in entries
                                if e.get("agora_task_id")})
             emit(f"账本: blocked {len(blocked_ids)} / pending {pending}")

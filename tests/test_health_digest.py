@@ -220,6 +220,19 @@ def test_journal_echo_corroborates_current_problem_rc1(tmp_path):
     assert "同源" in action
 
 
+def test_weird_ledger_key_does_not_abort_instance(tmp_path):
+    """账本键为数字异形（isdigit 真而 int() 抛 ValueError）不得中断该实例
+    后续检查——agora 探测与分级照常（终闸 B 册 finding 修复锚）。"""
+    make_instance(tmp_path, "demo-issue-agent", mode="agora", agora_home="/ah",
+                  issues={"²": ("blocked", None)})
+    rc, text = run_digest(tmp_path, service_state=lambda svc: "active",
+                          journal_reader=lambda svc: "", agora_probe=ok_probe({}))
+    assert rc == 1
+    assert "巡检异常" not in text
+    assert "#²" in text                        # 异形键照样点名
+    assert "agora: 可达" in text               # 后续检查未被跳过
+
+
 def test_mixed_grades_summary_counts(tmp_path):
     """混合场景：三类并存，结论行计数正确、只把需要处理计入 rc。"""
     make_instance(tmp_path, "alpha-issue-agent",
