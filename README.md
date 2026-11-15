@@ -156,7 +156,7 @@ daemon 不再本地拉起 opencode worker，而是经**持久语义 Router** 分
 - **opencode_timeout 调节**：config.json 的 `opencode_timeout` 字段（默认 1800 秒）是单回合超时。重量级验证回合（如全量构建）若超时，调大该值后 restart 服务即可（评审会话超时用同级的 `review_timeout`，默认 3600 秒）。
 - **长任务心跳评论**：回合运行超过 `heartbeat_interval`（config.json，默认 600 秒，`0`＝关）仍未结束时，daemon 主动在 issue 里发一条「仍在进行：已运行 X 分钟，当前正在：\<最新工具/文本活动\>」，此后每满一个 interval 再发一条（评论唯一出口是心跳线程，频率硬上限＝每 interval 一条/回合；活动摘自 opencode NDJSON 流的最新工具调用/文本，取不到时只报时长）。fix 回合与评审回合均生效；回合结束（完成/defer/blocked/超时）心跳自动停止。
 - **PAT 共命运**：本实例复用与另一个已存实例相同的 Gitea token——在 Gitea 侧吊销该 token 会同时停掉两个实例。
-- **bot 沉淀纪律**（协议步骤 3：修复提交后、删 worktree 前，agent 在 worktree 内做知识 ingest——知识改动以 `docs(issue-agent):` 单独提交随 `issue/<iid>-fix` 分支走评审与人工合并；经验按 agent-experience capture 写草稿入全局库 `~/.dotfiles/.agent-experiences/`，project 字段为 owner/repo，人工审核后 confirmed）：
+- **bot 沉淀纪律**（协议步骤 4：修复提交后、删 worktree 前，agent 在 worktree 内做知识 ingest——知识改动以 `docs(issue-agent):` 单独提交随 `issue/<iid>-fix` 分支走评审与人工合并；经验按 agent-experience capture 写草稿入全局库 `~/.dotfiles/.agent-experiences/`，project 字段为 owner/repo，人工审核后 confirmed）：
   - 轻验证口径：仅 pushed 回合；knowledge 检查为累计口径——基线未前移期间多轮续修任一轮写入即 ok，人工合并后基线前移，以本轮新增为准；经验检查按 issue#<iid> 词边界＋project 双门；缺失仅 journal `capture:` warning 不阻塞；Trivial/豁免回合通常 missing（log-only 例外为 ok），warning 属预期噪音而非违规信号。
 
 ## 常见问题

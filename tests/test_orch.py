@@ -1125,6 +1125,28 @@ def test_out_of_scope_reply_does_not_arm_report_probe(harness):
     assert not harness.entry(11)["report_probe_pending"]
 
 
+def test_goal_gate_exit_replies_do_not_arm_report_probe(harness):
+    """ag-a82a99：goal-gate（协议第 1 步，75faf86）三失败出口前缀回评与
+    「范围外」同为合法无汇报回复 → 不置 report_probe；gate 出口等作者
+    澄清不关单，「范围外」仍关单（豁免扩容不回归）。"""
+    seed_active(harness)
+    for idx, prefix in enumerate(("无法达成", "需明确验收", "建议拆分")):
+        harness.runner.cont_result = turn_result(
+            sid="ses_1", text=prefix + "：缺推码权限，建议转运维仓库。")
+        harness.listener.queue.put(comment_event(iid=11, comment_id=210 + idx))
+        assert wait_until(
+            lambda idx=idx: turn_done(harness, 11, 210 + idx)), (
+            prefix, harness.journal_msgs)
+        assert not harness.entry(11)["report_probe_pending"], prefix
+        assert harness.api.closes == [], "gate 出口等作者澄清，不关单"
+    harness.runner.cont_result = turn_result(
+        sid="ses_1", text=_OUT_OF_SCOPE_REPLY)
+    harness.listener.queue.put(comment_event(iid=11, comment_id=219))
+    assert wait_until(lambda: turn_done(harness, 11, 219)), harness.journal_msgs
+    assert not harness.entry(11)["report_probe_pending"]
+    assert harness.api.closes == [11], "「范围外」关单路径不回归"
+
+
 # --------------------------------------------------------------------------
 # 26b. ag-21ea9f B6: 「范围外」回复上墙后自动关单（fail-open）
 # --------------------------------------------------------------------------
@@ -3165,7 +3187,8 @@ def test_repost_uses_persisted_report_zero_dispatch(tmp_path, monkeypatch):
         monitor.report = report
         h.listener.queue.put(comment_event(iid=7, body="重发汇报",
                                            comment_id=102))
-        assert wait_until(lambda: any(report in b for _, b in h.api.posts)), \
+        assert wait_until(lambda: any(report in b for _, b in h.api.posts)
+                          and h.entry(7)["status"] == "active"), \
             h.journal_msgs
         assert client.create_calls == created_before, "零派工"
         assert h.gitop.push_calls == [], "零推送"

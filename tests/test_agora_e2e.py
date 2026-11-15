@@ -371,7 +371,12 @@ class E2EEnv:
             repo_path=str(self.repo), remote_url=str(self.origin),
             protocol_path=str(PKG_DIR / "PROTOCOL.template.md"),
             ssl_verify=True, default_branch=DEFAULT_BRANCH,
-            service_name=SERVICE, verify_command="true",
+            service_name=SERVICE,
+            # F107（agorad 4d8a1b6）base-red 探针：验收命令须在任务 base
+            # 上红。空转的 "true" 在 base 也绿 → done 被 gate 硬拒重开；
+            # test -f fix.txt 夹具 base 只播种 base.txt、四场景 worker 均
+            # 提交 fix.txt——base 红、worker head 绿，判别力成立。
+            verify_command="test -f fix.txt",
             reconcile_interval=99999,
             agora_client=client, router=self.router, agora_monitor=monitor,
             ledger_lock=threading.RLock())

@@ -794,9 +794,14 @@ class Orchestrator:
                             f"warning: issue#{iid} out-of-scope close failed: {exc!r}")
                 # ag-a9af5e 置位面（唯一）：回复上墙了但不是三段式汇报——
                 # 回合可能收队于汇报产出前，交给 sweep 预算内探测补发。
-                # 「范围外」开头是协议第 0 步的合法无汇报回复，不欠汇报。
+                # 「范围外」开头（协议第 0 步）与 goal-gate 三失败出口
+                # （协议第 1 步，75faf86：无法达成/需明确验收/建议拆分）
+                # 都是合法无汇报回复，不欠汇报；gate 出口不探测补发也
+                # 顺带防住多轮共用 session 把过期汇报重发到等澄清 issue。
+                goal_gate_exit = reply.lstrip().startswith(
+                    ("无法达成", "需明确验收", "建议拆分"))
                 if (result.session_id and not runner.is_report(reply)
-                        and not out_of_scope):
+                        and not out_of_scope and not goal_gate_exit):
                     self._arm_report_probe(iid)
                 # task 8: post-push review phase — ONLY for turns that pushed
                 # bot fix commits; this is the single call site (no review-of-
