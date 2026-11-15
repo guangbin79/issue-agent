@@ -126,6 +126,7 @@ bash tests/e2e_reject.sh
 | Gitea 队列疑似卡死（触发 test-hook 无投递记录） | docker logs 对成功/4xx 均不记 error，易误判 | 查权威源：hook_task 表（sqlite 在 data/gitea.db，查 is_delivered/is_succeed）+ 网页端「Recent Deliveries」；必要时 docker restart gitea 冲队列 |
 | 安装器报「仓库路径不在钉定目录」并退出码 1 | 从其它检出（如 worktree）跑了 install，或 `ISSUE_AGENT_REPO` 指错 | 必须在 `.issue-agent.json` 钉定的 canonical_path 目录上安装；该检查离线执行，先于一切网络/PAT 步骤 |
 | 服务起不来，journal 有 `ConfigError: ... repo_path` | config 的 `repo_path` 非钉定目录（如手工改过 config） | daemon 加载时拒绝非钉定路径；修正 config 或重跑 install |
+| 服务 active 但回合僵死（健康巡检报「回合僵滞/欠账滞留」） | 收口方僵滞：非终态 `claimed_at` >6h 或 `review_push_pending_at` 置位 >1h | 可在 `~/.config/<service>-issue-agent/config.json` 加 `"autorestart": true`：每日巡检在服务 active＋P1/P2 命中＋journal 近 30 分钟静默时自动 `systemctl --user restart`（每实例每 run 至多一次；删键即回纯报告形态） |
 
 ## 7. 签名链自测（排障神器）
 
