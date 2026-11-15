@@ -29,10 +29,10 @@ def test_template_carries_the_four_placeholders():
 
 
 def test_template_keeps_eight_sections():
-    """0 范围审查 / 1 定位 / 2 修复 / 3 沉淀 / 4 推送 / 5 汇报 / 6 硬禁区 / 7 语言."""
+    """0 范围审查 / 1 目标门 / 2 定位 / 3 修复 / 4 沉淀 / 5 推送 / 6 汇报 / 7 硬禁区 / 8 语言."""
     text = _template_text()
-    for needle in ("0. 范围审查", "1. **定位**", "2. **修复", "3. **沉淀",
-                   "4. **推送", "5. **汇报**", "6. **硬禁区**", "7. **语言**"):
+    for needle in ("0. 范围审查", "1. **目标门", "2. **定位**", "3. **修复",
+                   "4. **沉淀", "5. **推送", "6. **汇报**", "7. **硬禁区**", "8. **语言**"):
         assert needle in text, f"template section missing: {needle}"
 
 
