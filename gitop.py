@@ -278,8 +278,16 @@ def ensure_fix_branch(main_repo: PathLike, iid, default_branch: str,
     - remote absent: local branch (when created) starts from the latest
       refs/remotes/agent-remote/<default_branch> — callers run fetch_base
       first, that ref IS the fresh baseline
-    - an existing local branch is NEVER reset (a later round may legitimately
-      lead the remote position)
+    - 已有本地分支只在「可证无损」时对账（ag-f63b80/ag-6d7ab4 判例：
+      远端被外部 force-update 后本地支停在旧位，按旧位建单会让 Router
+      上下文与 gate 集成基重放已交付内容）：落后远端（is-ancestor，
+      零独有提交）→ FF 到远端；与远端真分叉且同树异哈希（外部同树
+      重写，即内容搁浅形态）→ reset 到远端；本地严格领先（含净值
+      零树形态，如 fix+revert——端点树相等≠逐提交无损）或真分叉树
+      不同 → 不动，交交付面 range-diff 护栏裁决（原契约 "NEVER
+      reset"故收窄，保护面保留）。分支被 agent worktree 持有 checkout
+      时 git branch -f 拒绝——对账降级回「不动」绝不抛（对账是优化
+      不是前提，ag-a5472a 评审环 ocr#1/B#2）
 
     Returns the local branch tip sha.
     """
@@ -295,6 +303,30 @@ def ensure_fix_branch(main_repo: PathLike, iid, default_branch: str,
     if not _branch_exists(main_repo, branch):
         source = tracking if remote_tip else agent_tracking_ref(default_branch)
         _git(main_repo, ["branch", branch, source])
+    elif remote_tip:
+        # 可证无损才对账（ag-a5472a 终闸）：
+        # - FF：本地落后零独有（is-ancestor(local, remote)）
+        # - 树等价 reset：真分叉且端点树一致（外部同树重写/搁浅）——
+        #   本地严格领先时排除（is-ancestor(remote, local) 为真即不动：
+        #   净值零树的领先提交历史会被 reset 销毁，端点树相等≠逐提交
+        #   无损，B 册 warning）
+        # point_branch 的无损前提即此处的判定序
+        local_tip = local_branch_tip(main_repo, branch)
+        if local_tip != remote_tip and (
+                is_ancestor(main_repo, local_tip, remote_tip)
+                or (not is_ancestor(main_repo, remote_tip, local_tip)
+                    and trees_identical(main_repo, local_tip, remote_tip))):
+            try:
+                point_branch(main_repo, branch, remote_tip)
+            except GitopError as exc:
+                # 分支被 agent worktree 持有 checkout 时 git branch -f
+                # 确定性拒绝——降级回旧契约「不动本地支」：抛错会让
+                # orchestrator 以「baseline fetch failed」无限 defer 建单
+                # （ag-a5472a 评审环 ocr#1/B#2，monitor 面拨正同款降级）。
+                # 只降级该确定性形态；其他环境病照旧上抛（defer 面可见
+                # 可诊断），绝不静默吞（ocr 轮2 #2）。
+                if "cannot force update the branch" not in str(exc).lower():
+                    raise
     return _git(main_repo,
                 ["rev-parse", "--verify", f"refs/heads/{branch}"]).strip()
 
@@ -523,6 +555,32 @@ def local_branch_tip(repo: PathLike, branch: str) -> str:
         return ""
     return _git(repo, ["rev-parse", "--verify",
                        f"refs/heads/{branch}"]).strip()
+
+
+def trees_identical(repo: PathLike, sha_a: str, sha_b: str) -> bool:
+    """两 commit 的树是否逐字节一致（ag-f63b80/ag-6d7ab4 判例：同内容
+    异哈希的搁浅形态）。`git diff --quiet` 裸 returncode 判定，非零
+    （含差异与坏 sha）即 False——探针不抛，失败语义由调用方按"不等价"
+    处置，绝不因探测病误判交付。"""
+    proc = _run(["git", "-C", str(repo), "diff", "--quiet", sha_a, sha_b],
+                cwd=repo)
+    return proc.returncode == 0
+
+
+def is_ancestor(repo: PathLike, ancestor: str, descendant: str) -> bool:
+    """ancestor 是否为 descendant 的祖先（merge-base --is-ancestor 裸
+    returncode，非零即 False，不抛）。"""
+    proc = _run(["git", "-C", str(repo), "merge-base", "--is-ancestor",
+                 ancestor, descendant], cwd=repo)
+    return proc.returncode == 0
+
+
+def point_branch(repo: PathLike, branch: str, to_sha: str):
+    """把 refs/heads/<branch> 拨到 to_sha（git branch -f）。
+
+    调用方必须已证无损（祖先 FF 或树等价 reset）——本函数不做任何
+    安全判定，只执行移位（ag-f63b80/ag-6d7ab4 判例）。"""
+    _git(repo, ["branch", "-f", branch, to_sha])
 
 
 def fix_branch_pushed(repo: PathLike, iid, remote_url: str,

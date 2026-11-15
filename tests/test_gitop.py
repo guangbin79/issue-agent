@@ -34,6 +34,7 @@ from gitop import (
     fix_branch,
     fix_branch_pushed,
     has_new_commits_vs_ref,
+    is_ancestor,
     local_branch_tip,
     knowledge_changes_present,
     prune_worktrees,
@@ -45,6 +46,7 @@ from gitop import (
     rebase_safe_to_force,
     push_fix_branch_resilient,
     tracked_dirty,
+    trees_identical,
 )
 
 _advance_counter = itertools.count()
@@ -949,19 +951,160 @@ def test_ensure_fix_branch_uses_remote_position_when_local_absent(
     _assert_main_checkout_untouched(repo)
 
 
-def test_ensure_fix_branch_never_resets_existing_local_branch(
+def test_ensure_fix_branch_fastforwards_local_behind_remote(
         repo, remote_url, tmp_path):
-    """已有本地分支不被重置：远端位置只进 tracking ref，本地 tip 原样返回。"""
+    """本地支落后远端（零独有提交）→ FF 到远端有效位（ag-f63b80/
+    ag-6d7ab4 判例：建单基线对账，Router 上下文不再拿旧位）。原契约
+    「已有本地支 NEVER reset」故收窄为「可证无损才对账」——搁浅形态
+    （远端被外部 force-update 到领先位）下按旧位建单会重放已交付内容；
+    真分叉保护由 test_ensure_fix_branch_keeps_genuinely_diverged_local
+    锁定，主检出仍绝不动。"""
     fetch_base(repo, remote_url, "master")
     baseline = git("rev-parse", agent_tracking_ref("master"), cwd=repo)
     git("branch", fix_branch(7), baseline, cwd=repo)
     remote_tip = advance_remote(tmp_path, remote_url, "fix2",
                                 branch="issue/7-fix")
     tip = ensure_fix_branch(repo, 7, "master", remote_url)
-    assert tip == baseline, "本地分支 tip 不得被远端位置重置"
+    assert tip == remote_tip, "落后即 FF 到远端"
+    assert git("rev-parse", "refs/heads/issue/7-fix", cwd=repo) == remote_tip
     assert git("rev-parse", "refs/remotes/agent-remote/issue/7-fix",
                cwd=repo) == remote_tip, "远端有效位置仍须 fetch 进 tracking ref"
     _assert_main_checkout_untouched(repo)
+
+
+def test_ensure_fix_branch_degrades_when_branch_held_by_worktree(
+        repo, remote_url, tmp_path):
+    """分支被 agent worktree 持有 checkout 时 git branch -f 拒绝——
+    对账降级回旧契约（不动本地支、不抛）：对账例行触发于 happy 交付后
+    （本地留回合基线、远端进到 delivered handoff），抛错会让 orchestrator
+    以「baseline fetch failed」无限 defer 整回合（评审环 ocr #1，
+    ag-a5472a）。"""
+    fetch_base(repo, remote_url, "master")
+    advance_remote(tmp_path, remote_url, "fix1", branch="issue/7-fix")
+    first = ensure_fix_branch(repo, 7, "master", remote_url)
+    agent_env = tmp_path / "agent-env"
+    git("worktree", "add", str(agent_env), fix_branch(7), cwd=repo)
+    adv = tmp_path / "adv-top"
+    git("clone", "-b", "issue/7-fix", remote_url, str(adv), cwd=tmp_path)
+    config_user(adv)
+    commit_file(adv, "remote2.txt", "fix3\n", "remote: fix3")
+    git("push", "origin", "HEAD:issue/7-fix", cwd=adv)
+    tip = ensure_fix_branch(repo, 7, "master", remote_url)
+    assert tip == first, "worktree 持有分支时对账降级：本地支不动、不抛"
+    assert current_branch(repo) == "master"
+
+
+def test_ensure_fix_branch_keeps_local_leading_net_zero_tree(
+        repo, remote_url, tmp_path):
+    """本地严格领先且端点树恰与远端相同（fix+revert 净值零树）→ 旧契约
+    保护面：不动本地支——端点树相等≠逐提交无损（中间提交历史会被
+    reset 销毁），树等价 reset 只许用于真分叉的外部同树重写形态
+    （B 册终闸 warning，ag-a5472a）。"""
+    fetch_base(repo, remote_url, "master")
+    advance_remote(tmp_path, remote_url, "fix1", branch="issue/7-fix")
+    ensure_fix_branch(repo, 7, "master", remote_url)
+    git("checkout", fix_branch(7), cwd=repo)
+    commit_file(repo, "probe.txt", "x\n", "add probe")
+    (repo / "probe.txt").unlink()
+    git("add", "-A", cwd=repo)
+    git("commit", "-m", "revert probe", cwd=repo)
+    leading = git("rev-parse", "HEAD", cwd=repo)
+    git("checkout", "master", cwd=repo)
+    tip = ensure_fix_branch(repo, 7, "master", remote_url)
+    assert tip == leading, "本地严格领先（净值零树）不得被 reset"
+    assert git("rev-parse", "refs/heads/issue/7-fix", cwd=repo) == leading
+
+
+def test_ensure_fix_branch_propagates_unexpected_reconcile_failure(
+        repo, remote_url, tmp_path, monkeypatch):
+    """对账降级只认 worktree 持有的确定性拒绝；其他环境病上抛
+    （orchestrator defer 面可见可诊断），绝不静默吞（ocr 轮2 #2，
+    ag-a5472a）。"""
+    fetch_base(repo, remote_url, "master")
+    advance_remote(tmp_path, remote_url, "fix1", branch="issue/7-fix")
+    ensure_fix_branch(repo, 7, "master", remote_url)
+    _rewrite_remote_tip(tmp_path, remote_url, "rewritten: fix1")  # 树等价对账路径
+
+    def boom(repo, branch, to_sha):
+        raise GitopError("git branch -f failed: fatal: some environment broke")
+
+    monkeypatch.setattr(gitop, "point_branch", boom)
+    with pytest.raises(GitopError):
+        ensure_fix_branch(repo, 7, "master", remote_url)
+
+
+def _rewrite_remote_tip(tmp_path, remote_url, msg, extra_change=None,
+                        branch="issue/7-fix"):
+    """改写远端开发支 tip（仿 advance_remote）：缺省同树 amend（树不变、
+    哈希变——外部同树重写/搁浅形态）；extra_change=(文件名, 内容) 时
+    amend 并改树。force push 归位，返回新 tip sha。"""
+    adv = tmp_path / f"adv{next(_advance_counter)}"
+    git("clone", "-b", branch, remote_url, str(adv), cwd=tmp_path)
+    config_user(adv)
+    if extra_change is not None:
+        name, content = extra_change
+        (adv / name).write_text(content)
+        git("add", "-A", cwd=adv)
+    git("commit", "--amend", "-m", msg, cwd=adv)
+    git("push", "-f", "origin", f"HEAD:{branch}", cwd=adv)
+    return git("rev-parse", "HEAD", cwd=adv)
+
+
+def test_ensure_fix_branch_resets_tree_equal_divergence(
+        repo, remote_url, tmp_path):
+    """外部同树重写（搁浅形态，ag-f63b80 判例）：远端 tip 被同树 amend
+    改写（树逐字节一致、仅哈希不同）→ 二次 ensure 把本地支 reset 到新
+    tip——建单基线不再拿旧位。"""
+    fetch_base(repo, remote_url, "master")
+    advance_remote(tmp_path, remote_url, "fix1", branch="issue/7-fix")
+    first = ensure_fix_branch(repo, 7, "master", remote_url)
+    rewritten = _rewrite_remote_tip(tmp_path, remote_url, "rewritten: fix1")
+    assert rewritten != first, "同树 amend 必须产出新哈希"
+    tip = ensure_fix_branch(repo, 7, "master", remote_url)
+    assert tip == rewritten, "树等价分叉 reset 到远端新位"
+    assert git("rev-parse", "refs/heads/issue/7-fix", cwd=repo) == rewritten
+    _assert_main_checkout_untouched(repo)
+
+
+def test_ensure_fix_branch_keeps_genuinely_diverged_local(
+        repo, remote_url, tmp_path):
+    """真分叉（树不同，本地可能合法领先）保护面保留：本地支不动，远端
+    有效位置只进 tracking ref——交交付面 range-diff 护栏裁决，绝不盲 reset。"""
+    fetch_base(repo, remote_url, "master")
+    advance_remote(tmp_path, remote_url, "fix1", branch="issue/7-fix")
+    ensure_fix_branch(repo, 7, "master", remote_url)
+    local_new = _commit_on_fix_branch(repo, "local.txt", "local\n",
+                                      "local work")
+    rewritten = _rewrite_remote_tip(
+        tmp_path, remote_url, "rewritten: fix1",
+        extra_change=("remote.txt", "fix1-rewritten\n"))
+    tip = ensure_fix_branch(repo, 7, "master", remote_url)
+    assert tip == local_new, "真分叉不动本地支"
+    assert git("rev-parse", "refs/heads/issue/7-fix", cwd=repo) == local_new
+    assert git("rev-parse", "refs/remotes/agent-remote/issue/7-fix",
+               cwd=repo) == rewritten, "tracking ref 已更新到远端有效位"
+    _assert_main_checkout_untouched(repo)
+
+
+def test_trees_identical_same_tree_true_different_tree_false(
+        repo, remote_url):
+    """纯函数面：trees_identical 同树异哈希（commit-tree 重挂同树）真、
+    不同树假——裸 returncode 判定，非零即 False 不抛。"""
+    tip = git("rev-parse", "HEAD", cwd=repo)
+    same_tree = git("commit-tree", f"{tip}^{{tree}}", "-m", "same tree",
+                    cwd=repo)
+    diverged_tree = commit_file(repo, "other.txt", "other\n", "other tree")
+    assert trees_identical(repo, tip, same_tree) is True
+    assert trees_identical(repo, tip, diverged_tree) is False
+
+
+def test_is_ancestor_directionality(repo, remote_url):
+    """纯函数面：is_ancestor 祖先方向性——正向真、反向假（裸
+    returncode，非零即 False 不抛）。"""
+    tip = git("rev-parse", "HEAD", cwd=repo)
+    descendant = commit_file(repo, "descendant.txt", "d\n", "descendant")
+    assert is_ancestor(repo, tip, descendant) is True
+    assert is_ancestor(repo, descendant, tip) is False
 
 
 # --- agora external delivery: push_verified_commit / fetch_fix_branch_tip ----

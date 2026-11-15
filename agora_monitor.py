@@ -675,6 +675,41 @@ class AgoraMonitor:
             # 换基重验出新 handoff 再推，不做本地 rebase）
             base = gitop.fetch_fix_branch_tip(
                 self._repo_path, iid, self._remote_url, self._ssl_verify)
+            # 护栏前提拨正（ag-f63b80/ag-6d7ab4 判例）：本地 issue/<iid>-fix
+            # 停在 handoff 的旧祖先位（外部 force-update 搁浅形态）时先
+            # FF 上去——否则 _land_align_rewrite 首闸（local==handoff）
+            # 在 external_branch 流程结构性不可达，护栏永远空转。只在此
+            # （non_ff 路径）拨正：happy path 交付必须保持零裸 git 操作
+            # （tests/test_orch.py 零接触锚例）；拨正失败只 journal 不
+            # 阻断——护栏首闸不过自然落回轮转现状链。置于逃生门之前：
+            # 搁浅形态下 FF 先把 handoff 保留在本地支上，逃生门 ack 的
+            # delivery sha 恒可解析（ocr 轮2 #1，绝不落 gc-eligible 位）。
+            try:
+                branch = gitop.fix_branch(iid)
+                local_tip = gitop.local_branch_tip(self._repo_path, branch)
+                if local_tip and local_tip != handoff and gitop.is_ancestor(
+                        self._repo_path, local_tip, handoff):
+                    gitop.point_branch(self._repo_path, branch, handoff)
+                    self._journal(
+                        f"agora-monitor: issue#{iid} fast-forwarded "
+                        f"{branch} {local_tip[:12]}→{handoff[:12]} "
+                        "(align-rewrite guard precondition)")
+            except gitop.GitopError as exc:
+                self._journal(
+                    f"agora-monitor: issue#{iid} guard precondition "
+                    f"fast-forward failed ({exc}); continuing anyway")
+            # 内容等价逃生门（ag-f63b80/ag-6d7ab4 判例）：远端 tip 与
+            # handoff 树逐字节一致（记账失败搁浅、门体重放出同内容异
+            # 哈希）→ 交付事实成立，免重写/免轮转直接收口
+            if gitop.trees_identical(self._repo_path, handoff, base):
+                self._journal(
+                    f"agora-monitor: issue#{iid} remote tip {base[:12]} "
+                    f"tree identical to handoff {handoff[:12]}——"
+                    "树等价免重写/免轮转，交付事实成立")
+                self._ack(iid, tid, "delivered", handoff,
+                          reason=f"remote tree identical to handoff "
+                                 f"(base {base})")
+                return
             try:
                 landed = self._land_align_rewrite(iid, handoff, base)
             except gitop.ForcePushRejected as exc:

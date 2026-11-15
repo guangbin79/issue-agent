@@ -296,17 +296,23 @@ class FakeGitDelivery:
     （无 lease 的裸 push 同记违约）；变基轮护栏面（ag-6da714）＝
     rebase_safe_to_force/local_branch_tip/force 落地 push_force_classified
     （ag-cad1d6：落地失败分类走 gitop 层词表，此处只注入结果）。
-    缺省 rebase_safe 不安全 → non_ff 维持轮转现状链（既有轮转测试形态）。"""
+    缺省 rebase_safe 不安全 → non_ff 维持轮转现状链（既有轮转测试形态）；
+    逃生门/护栏前提面（ag-f63b80/ag-6d7ab4 判例）＝trees_identical/
+    is_ancestor/point_branch 三替身，缺省 False＝不触发拨正与等价逃生，
+    既有全部测试行为不变。"""
 
     def __init__(self, monkeypatch, push_results=None, push_error=None,
                  fetch_tip=None, rebase_safe=None, branch_tip=None,
-                 force_push_error=None):
+                 force_push_error=None, is_ancestor=False,
+                 trees_identical=False):
         self.push_calls = []
         self.fetch_calls = []
         self.legacy_calls = []
         self.rebase_calls = []
         self.tip_calls = []
         self.force_push_calls = []
+        self.ff_calls = []
+        self.tree_eq_calls = []
         self.push_results = push_results or {}  # commit -> "ok"|"non_ff"|"failed"
         self.push_error = push_error
         self.fetch_tip = fetch_tip or hex40("f")
@@ -314,6 +320,8 @@ class FakeGitDelivery:
                                             "lost in rewrite")
         self.branch_tip = branch_tip  # None -> 分支缺失（漂移形态）
         self.force_push_error = force_push_error
+        self.is_ancestor = is_ancestor
+        self.trees_identical = trees_identical
 
         def legacy(_name):
             def spy(*args, **kwargs):
@@ -331,6 +339,10 @@ class FakeGitDelivery:
         monkeypatch.setattr(gitop, "rebase_safe_to_force",
                             self.fake_rebase_safe)
         monkeypatch.setattr(gitop, "local_branch_tip", self.fake_local_tip)
+        monkeypatch.setattr(gitop, "is_ancestor", self.fake_is_ancestor)
+        monkeypatch.setattr(gitop, "trees_identical",
+                            self.fake_trees_identical)
+        monkeypatch.setattr(gitop, "point_branch", self.fake_point_branch)
 
     def fake_push(self, repo, remote_url, refspec, ssl_verify=True,
                   force_with_lease=""):
@@ -355,6 +367,18 @@ class FakeGitDelivery:
     def fake_local_tip(self, repo, branch):
         self.tip_calls.append({"repo": repo, "branch": branch})
         return self.branch_tip or ""
+
+    def fake_is_ancestor(self, repo, ancestor, descendant):
+        return self.is_ancestor
+
+    def fake_trees_identical(self, repo, sha_a, sha_b):
+        self.tree_eq_calls.append({"repo": repo, "sha_a": sha_a,
+                                   "sha_b": sha_b})
+        return self.trees_identical
+
+    def fake_point_branch(self, repo, branch, to_sha):
+        self.ff_calls.append({"branch": branch, "to": to_sha})
+        self.branch_tip = to_sha  # 拨正即移位：后续 local_branch_tip 读到新位
 
     def fake_push_verified(self, repo, iid, commit, remote_url,
                            ssl_verify=True):
@@ -544,6 +568,99 @@ def test_non_ff_branch_drift_off_handoff_rotates_without_force(
     assert client.deliver_calls[0]["base"] == base
     assert monitor.tasks() == [(7, TID)]
     assert any("drifted" in m for m in journal), journal
+
+
+# --- 内容等价逃生门＋护栏前提拨正（ag-f63b80/ag-6d7ab4 判例三修） ---------------
+
+
+def test_non_ff_tree_identical_remote_escapes_to_delivered(
+        tmp_path, monkeypatch):
+    """内容等价逃生门：远端 tip 已含验证过的 handoff 内容（树逐字节
+    一致、仅哈希不同——记账失败搁浅形态）→ 交付事实成立，直接
+    delivered 收口：不 force、不轮转、不跑 range-diff。"""
+    handoff = hex40("a")
+    base = hex40("b")
+    client = FakeAgoraClient(commit=handoff)
+    fake_git = FakeGitDelivery(
+        monkeypatch, push_results={handoff: "non_ff"}, fetch_tip=base,
+        branch_tip=handoff, trees_identical=True)
+    monitor, state_path, journal = delivery_monitor(
+        tmp_path, monkeypatch, client, fake_git)
+
+    monitor.poll_once()
+
+    assert fake_git.tree_eq_calls[0]["sha_a"] == handoff
+    assert fake_git.tree_eq_calls[0]["sha_b"] == base
+    assert fake_git.force_push_calls == []
+    assert fake_git.rebase_calls == []
+    assert client.deliver_calls[0]["outcome"] == "delivered"
+    assert client.deliver_calls[0]["commit"] == handoff
+    assert entry(state_path)["delivery_commit"] == handoff
+    assert monitor.tasks() == [], "树等价即已交付，释放名额"
+    assert any("树等价免重写/免轮转" in m for m in journal), journal
+    assert fake_git.legacy_calls == []
+
+
+def test_non_ff_tree_identical_with_stale_local_retains_handoff(
+        tmp_path, monkeypatch):
+    """搁浅全形态（ag-f63b80/ag-6d7ab4）：本地落后 handoff＋远端树等价
+    → 拨正 FF 先把 handoff 保留到本地支（delivery_commit/汇报/重派
+    上下文引用的 sha 恒可解析，绝不落 gc-eligible 位），再逃生门
+    delivered 收口（ocr 轮2 #1，ag-a5472a）。"""
+    stale = hex40("s")
+    handoff = hex40("a")
+    base = hex40("b")
+    client = FakeAgoraClient(commit=handoff)
+    fake_git = FakeGitDelivery(
+        monkeypatch, push_results={handoff: "non_ff"}, fetch_tip=base,
+        branch_tip=stale, is_ancestor=True, trees_identical=True)
+    monitor, state_path, journal = delivery_monitor(
+        tmp_path, monkeypatch, client, fake_git)
+
+    monitor.poll_once()
+
+    assert fake_git.ff_calls == [{"branch": "issue/7-fix", "to": handoff}], \
+        "逃生门前先 FF 保留 handoff"
+    assert fake_git.force_push_calls == []
+    assert client.deliver_calls[0]["outcome"] == "delivered"
+    assert client.deliver_calls[0]["commit"] == handoff
+    assert entry(state_path)["delivery_commit"] == handoff
+    assert monitor.tasks() == []
+    assert any("树等价免重写/免轮转" in m for m in journal), journal
+    assert any("fast-forwarded" in m for m in journal), journal
+
+
+def test_awaiting_external_fastforwards_stale_local_to_handoff(
+        tmp_path, monkeypatch):
+    """护栏前提拨正：本地 issue/<iid>-fix 落后在案 handoff 之后（外部
+    force-update 搁浅形态）→ non_ff 路径先 FF 到 handoff，让
+    _land_align_rewrite 首闸（local==handoff）在 external_branch 流程
+    可达（判例实测 range-diff 15/15 配对零孤儿，护栏一旦可达即可安全
+    force-with-lease 落地）；push 照常、delivered 收口。
+    偏差注记：规格原表述为「push_verified_commit 之前」拨正，但 happy
+    path 交付锚例（tests/test_orch.py 零裸 git 操作）要求 ok 路径零
+    本地探测——拨正只服务护栏可达性，故落位 non_ff 分支（ag-a5472a
+    报告注明）。"""
+    stale = hex40("s")
+    handoff = hex40("a")
+    base = hex40("b")
+    client = FakeAgoraClient(commit=handoff)
+    fake_git = FakeGitDelivery(
+        monkeypatch, push_results={handoff: "non_ff"}, fetch_tip=base,
+        rebase_safe=(True, "range-diff: no old-chain commit lost"),
+        branch_tip=stale, is_ancestor=True)
+    monitor, state_path, journal = delivery_monitor(
+        tmp_path, monkeypatch, client, fake_git)
+
+    monitor.poll_once()
+
+    assert fake_git.ff_calls == [{"branch": "issue/7-fix", "to": handoff}]
+    assert fake_git.push_calls[0]["commit"] == handoff, "push 照常不受拨正影响"
+    assert fake_git.force_push_calls, "护栏可达后安全落地"
+    assert client.deliver_calls[0]["outcome"] == "delivered"
+    assert entry(state_path)["delivery_commit"] == handoff
+    assert monitor.tasks() == []
+    assert any("fast-forwarded" in m for m in journal), journal
 
 
 def test_force_push_transport_error_keeps_awaiting_external_for_retry(
