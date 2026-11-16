@@ -867,10 +867,9 @@ class Orchestrator:
                 try:
                     gitop.fetch_base(self.repo_path, self.remote_url,
                                      self.default_branch, self.ssl_verify)
-                    gitop.ensure_fix_branch(self.repo_path, iid,
-                                            self.default_branch,
-                                            self.remote_url,
-                                            self.ssl_verify)
+                    branch_tip = gitop.ensure_fix_branch(
+                        self.repo_path, iid, self.default_branch,
+                        self.remote_url, self.ssl_verify)
                 except gitop.GitopError as exc:
                     self._journal(
                         f"turn: issue#{iid} deferred (baseline fetch failed): {exc}")
@@ -886,7 +885,9 @@ class Orchestrator:
                     goal=decision.goal,
                     project_dir=self.repo_path,
                     target_branch=gitop.fix_branch(iid),
-                    verify_cmd=self.verify_command,
+                    verify_cmd=self._round_verify_cmd(decision, branch_tip),
+                    verify_base_exempt=(True if decision.deliverable_hint
+                                        == "out_of_band" else None),
                     model=decision.model,
                     # ag-da7410 A：三分流——需勘察的验证/解答类建零提交
                     # review-only 任务（done body=结论文本），代码修复类
@@ -1243,6 +1244,23 @@ class Orchestrator:
                 entry["agora_pending"] = True
                 state.save_state(self.state_path, ledger)
             return decision
+
+    def _round_verify_cmd(self, decision, branch_tip):
+        """F107 base-red 探针适配（2026-11-16 判例 ag-1a5335/ag-b04e3f/
+        ag-6bd209/ag-c02f63：实例 verify 在任务起点 base 上必绿，全形态
+        撞探针死循环）。提交产出轮＝冻结起点锚点＋实例门组合——探针在
+        base 上零新提交必红（test 短路不跑门），done 上有提交才跑全量
+        实例门。out_of_band 零提交轮在 repo 上无判别谓词（结论文本即
+        交付物），交豁免旗（payload 侧 verify_base_exempt）。验收命令
+        仍只出自实例可信配置＋起点 sha，Router 七键硬过滤不变。锚点取
+        ensure_fix_branch 对账后的本地 tip；本地与远端真分叉时 env 的
+        远端 tip 可能领先锚点致探针假绿——该形态由 F107 拒信人工处置，
+        不在此自动对齐。
+        """
+        if decision.deliverable_hint == "out_of_band":
+            return self.verify_command
+        return (f'test "$(git rev-list --count {branch_tip}..HEAD)"'
+                f' -ge 1 && {self.verify_command}')
 
     def _agora_create(self, iid, payload):
         """client_key 幂等建单＋超时恢复：create 成功但客户端超时

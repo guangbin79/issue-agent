@@ -194,13 +194,15 @@ class AgoraClient:
 
     def create_task(self, *, goal, project_dir, target_branch, verify_cmd,
                     model, title, client_key, deliverable="external_branch",
-                    after=None) -> str:
+                    after=None, verify_base_exempt=None) -> str:
         body = {"goal": goal, "project_dir": project_dir,
                 "target_branch": target_branch, "verify_cmd": verify_cmd,
                 "model": model, "title": title, "client_key": client_key,
                 "deliverable": deliverable}
         if after is not None:  # 服务端字符串校验拒 null：None 不含键
             body["after"] = after
+        if verify_base_exempt is not None:  # F107：仅显式设置才上送
+            body["verify_base_exempt"] = verify_base_exempt
         payload = self._task_call("/task_create", body)
         tid = payload.get("task")
         if not isinstance(tid, str) or not tid:

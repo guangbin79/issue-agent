@@ -165,6 +165,17 @@ def test_client_uses_service_dispatcher_not_root_for_tasks(tmp_path):
     assert all(r["token"] != ROOT_TOKEN for r in task_reqs)
 
 
+def test_create_task_verify_base_exempt_wire_shape(tmp_path):
+    """F107：verify_base_exempt 仅显式设置才上送（None 不含键）。"""
+    with with_server(default_routes(), tmp_path) as combo:
+        combo.client.create_task(**task_payload())
+        combo.client.create_task(**task_payload(), verify_base_exempt=True)
+    bodies = [r["json"] for r in combo.server.requests
+              if r["path"] == "/task_create"]
+    assert "verify_base_exempt" not in bodies[0]
+    assert bodies[1]["verify_base_exempt"] is True
+
+
 def test_dispatcher_token_signed_exactly_once_across_calls(tmp_path):
     with with_server(default_routes(), tmp_path) as combo:
         client = combo.client

@@ -348,19 +348,21 @@ class FakeAgoraClient:
 
     @staticmethod
     def _execution_payload(kwargs):
-        return {key: kwargs[key] for key in
+        return {key: kwargs.get(key) for key in
                 ("goal", "project_dir", "target_branch", "verify_cmd",
-                 "model", "deliverable")}
+                 "model", "deliverable", "verify_base_exempt")}
 
     def create_task(self, *, goal, project_dir, target_branch, verify_cmd,
                     model, title, client_key, deliverable="external_branch",
-                    after=None):
+                    after=None, verify_base_exempt=None):
         call = dict(goal=goal, project_dir=project_dir,
                     target_branch=target_branch, verify_cmd=verify_cmd,
                     model=model, title=title, client_key=client_key,
                     deliverable=deliverable)
         if after is not None:  # 同真实客户端：None 不含键（wire 形状）
             call["after"] = after
+        if verify_base_exempt is not None:  # 同真实客户端：None 不含键
+            call["verify_base_exempt"] = verify_base_exempt
         self.create_calls.append(call)
         key = client_key
         execution = self._execution_payload(call)
@@ -2646,7 +2648,12 @@ def test_run_turn_returns_after_dispatch_and_releases_issue_lock(
         assert call["client_key"] == "issue-agent:issue-7:note-0"
         assert call["target_branch"] == "issue/7-fix"
         assert call["deliverable"] == "external_branch"
-        assert call["verify_cmd"] == h.orch.verify_command
+        tip = "0" * 40  # fake_ensure_fix_branch 的返回＝起点锚点
+        assert call["verify_cmd"] == (
+            f'test "$(git rev-list --count {tip}..HEAD)" -ge 1'
+            f' && {h.orch.verify_command}'), \
+            "提交产出轮验收＝冻结起点锚点＋实例门（F107 base-red 探针适配）"
+        assert "verify_base_exempt" not in call, "豁免旗只属零提交轮"
         assert call["model"] == "zai/glm-5.3"
         assert call["goal"] == router_.decision.goal
         assert call["project_dir"] == h.repo_path
@@ -2661,6 +2668,27 @@ def test_run_turn_returns_after_dispatch_and_releases_issue_lock(
         assert monitor.attached["state_path"] == h.state_path
         assert monitor.attached["ledger_lock"] is h.orch._ledger_lock
         assert h.gitop.push_calls == [], "agora 回合零 legacy origin push"
+    finally:
+        h.orch.stop()
+
+
+def test_out_of_band_round_gets_base_exempt_and_plain_verify(
+        tmp_path, monkeypatch):
+    """F107 base-red 探针适配：out_of_band 零提交轮在 repo 上无判别
+    谓词（结论文本即交付物）——上送派发方豁免旗，verify 仍是实例门。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter(
+        agora_decision(deliverable_hint="out_of_band"))
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        call = client.create_calls[0]
+        assert call["deliverable"] == "out_of_band"
+        assert call["verify_cmd"] == h.orch.verify_command
+        assert call["verify_base_exempt"] is True
     finally:
         h.orch.stop()
 
