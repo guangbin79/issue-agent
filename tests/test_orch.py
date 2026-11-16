@@ -2189,7 +2189,8 @@ def test_webhook_close_pushes_unpushed_branch(harness):
     close_event["issue"]["state"] = "closed"
     harness.listener.queue.put(close_event)
 
-    assert wait_until(lambda: harness.entry(11)["status"] == "done"), \
+    assert wait_until(lambda: harness.entry(11)["status"] == "done"
+                      and 11 in harness.gitop.push_calls), \
         harness.journal_msgs
     assert 11 in harness.gitop.push_calls
 
@@ -2206,7 +2207,12 @@ def test_webhook_close_cancels_in_flight_agora_task(tmp_path, monkeypatch):
         ev["action"] = "closed"
         ev["issue"]["state"] = "closed"
         h.listener.queue.put(ev)
-        assert wait_until(lambda: h.entry(11)["status"] == "done"), \
+        # close 流 status=done 先落盘、task_cancel/push 是锁外后置动作
+        # （orchestrator.py close handler 502→505/509）——等待谓词必须
+        # 覆盖侧效应本身，全量负载下线程可能尚未执行到 cancel。
+        assert wait_until(lambda: h.entry(11)["status"] == "done"
+                          and client.cancel_calls_full == [
+                              {"task": "ag-123", "force": False}]), \
             h.journal_msgs
         assert client.cancel_calls_full == [{"task": "ag-123",
                                              "force": False}], \
