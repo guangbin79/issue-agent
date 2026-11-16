@@ -21,7 +21,8 @@ Pagination: Gitea paginates with limit/page query params and signals the
 last page by returning fewer items than the requested limit; pages are
 fetched until one comes back short — bounded by a hard page cap
 (MAX_PAGES): a server that keeps returning full pages past the cap
-raises ApiTransientError instead of looping (and allocating) forever;
+raises the ApiPaginationError subclass of ApiTransientError instead of
+looping (and allocating) forever;
 callers already map that to defer/retry-later, and a partial list is
 never returned silently (the reconcile's set-difference close would
 mistake unlisted issues for closed ones).
@@ -63,6 +64,14 @@ class ApiTransientError(RuntimeError):
     """Other 4xx/5xx or network failure that persisted after one retry."""
 
 
+class ApiPaginationError(ApiTransientError):
+    """Pagination hit the MAX_PAGES hard cap (hostile-service guard) — the
+    collection genuinely exceeds MAX_PAGES×PAGE_LIMIT items (ag-1b0e6f: a
+    >2500-comment issue thread). Still transient-shaped for every existing
+    caller, but programmatically distinguishable so callers may degrade
+    (single-item fetch / short since window) instead of deferring."""
+
+
 def _repo_path(project) -> str:
     """'owner/repo' -> URL-encoded path keeping the slash as the separator."""
     return "/".join(urllib.parse.quote(part, safe="")
@@ -92,6 +101,8 @@ class GitLabClient:
           [{"number": N, "title": str, "body": str, "state": "open"}]
       list_issue_comments(project, number) ->
           [{"id": M, "body": str, "user": {"login": str}}]
+      get_issue_comment(project, comment_id) ->
+          {"id": M, "body": str, "user": {"login": str}}
     with *project* an "owner/repo" string.
     """
 
@@ -155,6 +166,20 @@ class GitLabClient:
                 "title": payload.get("title") or "",
                 "body": payload.get("body") or "",
                 "state": payload.get("state") or "open"}
+
+    def get_issue_comment(self, project, comment_id):
+        """One issue comment by id — GET /repos/{o}/{r}/issues/comments/{id}
+        (a long-standing Gitea endpoint): the zero-pagination path for
+        >2500-comment walls where a full list would blow the MAX_PAGES guard
+        (ag-1b0e6f). Same normalized shape as list_issue_comments; a 404
+        (old Gitea without the endpoint / deleted comment) surfaces as
+        ApiTransientError via the transport mapping — callers fall back."""
+        payload, _ = self._request_json(
+            "GET", f"/api/v1/repos/{_repo_path(project)}/issues/comments/{int(comment_id)}")
+        payload = payload or {}
+        return {"id": payload.get("id"),
+                "body": payload.get("body") or "",
+                "user": {"login": (payload.get("user") or {}).get("login") or ""}}
 
     def close_issue(self, project, number):
         """Close issue *number* (B6: 回合判定「范围外」后的自动关单).
@@ -249,7 +274,7 @@ class GitLabClient:
                 # A hostile/compromised Gitea (or a LAN MITM on the accepted
                 # plain-HTTP callback) returning full pages forever must not
                 # hang the worker or grow memory without bound.
-                raise ApiTransientError(
+                raise ApiPaginationError(
                     f"gitea api pagination exceeded {MAX_PAGES} pages: GET {path}")
 
     def _request_json(self, method, path, params=None, body=None):

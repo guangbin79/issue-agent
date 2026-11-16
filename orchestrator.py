@@ -76,6 +76,11 @@ MAX_REPORT_PROBES = 2
 # ag-21ea9f B4: steady-state reconcile pulls since the last success minus
 # this margin; the overlap is deduped by is_note_processed (harmless).
 RECONCILE_SINCE_OVERLAP_S = 660  # 600s reconcile cadence + 60s margin
+# ag-1b0e6f: a wall longer than MAX_PAGES×PAGE_LIMIT (>2500 comments) blows
+# the pagination guard; degrade ONLY on that signal — re-pull a short window
+# through list_issue_comments' since seam (a server that ignores since
+# behaves exactly as before the fallback: empty notes / held budget).
+WALL_FALLBACK_SINCE_S = 7 * 86400
 
 # Global experience-draft store (the agent-experience capture flow the
 # protocol's 沉淀 step writes to): the post-push capture verification
@@ -1902,7 +1907,12 @@ class Orchestrator:
         # 去重判 containment：墙上评论经 build_note_body 带 marker 前后缀，
         # 汇报原文仍内含其中
         try:
-            wall = self.api.list_issue_comments(self.project, iid)
+            try:
+                wall = self.api.list_issue_comments(self.project, iid)
+            except api.ApiPaginationError:
+                # ag-1b0e6f：>cap 墙爆炸才降级——containment 只看近窗；
+                # 回退仍炸（服务端忽略 since）落入通用 budget held 同今日
+                wall = self._wall_recent(iid)
         except Exception as exc:
             # 墙读失败＝未送达且未判命中：只 journal 不烧预算，API 恢复后
             # 下轮再探（issue#65 空烧教训）
@@ -2287,6 +2297,15 @@ class Orchestrator:
             os.fsync(fh.fileno())
         os.replace(tmp, self._since_path)
 
+    def _wall_recent(self, iid):
+        """ag-1b0e6f: degraded >cap-wall pull — last WALL_FALLBACK_SINCE_S
+        only, via list_issue_comments' since seam (a server that ignores
+        since returns the same explosion; callers keep today's behavior)."""
+        since = (datetime.now(timezone.utc)
+                 - timedelta(seconds=WALL_FALLBACK_SINCE_S)).isoformat()
+        return self.api.list_issue_comments(self.project, int(iid),
+                                            since_iso=since)
+
     def _fetch_open_issues_and_notes(self):
         """(issue records, {iid: [api comment, ...]}) for every open issue,
         or None when the API is unavailable right now."""
@@ -2310,8 +2329,20 @@ class Orchestrator:
             if iid is None:
                 continue
             try:
-                open_notes[int(iid)] = self.api.list_issue_comments(
-                    self.project, iid, since_iso=since_iso)
+                try:
+                    open_notes[int(iid)] = self.api.list_issue_comments(
+                        self.project, iid, since_iso=since_iso)
+                except api.ApiPaginationError:
+                    # ag-1b0e6f：>cap 墙爆炸才降级——近窗重拉替代置空
+                    # （webhook 盲区收窄）；首跑快照必须全量，re-raise 走
+                    # 下面的整体 abort（18b 契约不动）；回退仍炸＝服务端
+                    # 忽略 since，落入通用置空分支同今日。
+                    if not baselined:
+                        raise
+                    self._journal(f"reconcile: issue#{iid} wall over "
+                                  "pagination cap — retrying with a short "
+                                  "since window")
+                    open_notes[int(iid)] = self._wall_recent(iid)
             except api.ApiAuthError as exc:
                 self._journal(f"CRITICAL: reconcile cannot read the API: {exc}")
                 return None
@@ -2388,7 +2419,16 @@ class Orchestrator:
 
     def _note_body(self, iid, note_id):
         """按 note id 取回评论正文（agora 重试的直通保真）；失败返回
-        None 交调用方降级 RETRY_MESSAGE（best-effort，绝不抛）。"""
+        None 交调用方降级 RETRY_MESSAGE（best-effort，绝不抛）。
+
+        ag-1b0e6f：优先单条端点直取（>2500 条墙零分页请求）；端点
+        404/失败回退全量扫描路径（老 Gitea 兼容）。"""
+        try:
+            return self.api.get_issue_comment(
+                self.project, int(note_id)).get("body")
+        except Exception as exc:
+            self._journal(f"requeue: issue#{iid} single note fetch failed: "
+                          f"{exc!r} — falling back to full scan")
         try:
             comments = self.api.list_issue_comments(self.project, int(iid))
         except Exception as exc:

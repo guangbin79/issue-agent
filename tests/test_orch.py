@@ -120,6 +120,14 @@ class FakeApi:
         self.since_seen.append((int(iid), since_iso))
         return self.issues.get(int(iid), [])
 
+    def get_issue_comment(self, project, comment_id):
+        for comments in self.issues.values():
+            for comment in comments:
+                if comment.get("id") == int(comment_id):
+                    return dict(comment)
+        raise api.ApiTransientError(
+            f"gitea api comment {comment_id} not found (404)")
+
     def get_issue(self, project, number):
         record = {"number": int(number), "title": f"issue {number}",
                   "body": "", "state": "open"}
@@ -1394,6 +1402,90 @@ def test_fetch_notes_single_issue_transient_does_not_abort(harness, monkeypatch)
     state.save_state(harness.state_path, st)
     assert harness.orch._fetch_open_issues_and_notes() is None, (
         "首跑（未 baselined）快照必须全量：维持整体 abort 不动")
+    assert harness.journal("reconcile: aborted, API transient failure")
+
+
+# --------------------------------------------------------------------------
+# 18b-2. ag-1b0e6f: >2500-comment walls (>50 pages) degrade instead of
+#        breaking all three wall-reading paths — explosion-only, zero
+#        contract change for ≤2500-comment issues
+# --------------------------------------------------------------------------
+
+def test_note_body_prefers_single_endpoint_zero_pagination(harness, monkeypatch):
+    """>cap 墙的 requeue 直取：单条端点取回正文，零分页请求。"""
+    harness.api.issues = {51: [api_comment(201, "late reply")]}
+
+    def no_pagination(project, iid, since_iso=None):
+        raise AssertionError("must not paginate a >cap wall for one note")
+
+    monkeypatch.setattr(harness.api, "list_issue_comments", no_pagination)
+    assert harness.orch._note_body(51, 201) == "late reply"
+
+
+def test_note_body_falls_back_to_scan_when_endpoint_missing(harness, monkeypatch):
+    """老 Gitea（端点 404）回退全量扫描路径仍工作。"""
+    harness.api.issues = {51: [api_comment(201, "late reply")]}
+
+    def no_endpoint(project, comment_id):
+        raise api.ApiTransientError(
+            "gitea api unreachable after retry: GET .../issues/comments/201")
+
+    monkeypatch.setattr(harness.api, "get_issue_comment", no_endpoint)
+    assert harness.orch._note_body(51, 201) == "late reply"
+
+
+def test_reconcile_overcap_wall_degrades_to_recent_window(harness, monkeypatch):
+    """稳态 >cap 墙：pagination 爆炸→近窗（≈7 天）重拉，笔记非空、好 issue
+    零变化、游标照常前移；服务端忽略 since（回退仍炸）→置空同今日；首跑
+    （未 baselined）整体 abort 契约不动。"""
+    real_comments = harness.api.list_issue_comments
+    harness.api.issues = {7: [api_comment(101, "hello")],
+                          51: [api_comment(201, "late reply")]}
+    st = harness.ledger()
+    st["baselined"] = True
+    state.save_state(harness.state_path, st)
+    harness.orch._since_store_save(
+        datetime.now(timezone.utc) - timedelta(seconds=600))
+    calls = []
+
+    def overcap_comments(project, iid, since_iso=None):
+        calls.append((int(iid), since_iso))
+        day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+        narrow = (since_iso is None
+                  or datetime.fromisoformat(since_iso) > day_ago)
+        if int(iid) == 51 and narrow:
+            raise api.ApiPaginationError(
+                "gitea api pagination exceeded 50 pages: "
+                "GET .../issues/51/comments")
+        return real_comments(project, iid, since_iso)
+
+    monkeypatch.setattr(harness.api, "list_issue_comments", overcap_comments)
+    issues, notes = harness.orch._fetch_open_issues_and_notes()
+    assert [c["id"] for c in notes[7]] == [101], "好 issue 笔记零变化"
+    assert [c["id"] for c in notes[51]] == [201], ">cap 墙经回退非空"
+    assert harness.journal("reconcile: issue#51 wall over pagination cap")
+    fallback_since = [s for iid, s in calls if iid == 51][1]
+    assert datetime.fromisoformat(fallback_since) < (
+        datetime.now(timezone.utc) - timedelta(days=6)), "回退携 ≈7 天近窗"
+    with open(harness.orch._since_path, encoding="utf-8") as fh:
+        assert datetime.fromisoformat(json.load(fh)) > (
+            datetime.now(timezone.utc) - timedelta(minutes=1)), (
+            "回退成功游标照常前移（fetch_ok 语义保持）")
+
+    def hopeless_comments(project, iid, since_iso=None):  # server ignores since
+        if int(iid) == 51:
+            raise api.ApiPaginationError("gitea api pagination exceeded 50 pages")
+        return real_comments(project, iid, since_iso)
+
+    monkeypatch.setattr(harness.api, "list_issue_comments", hopeless_comments)
+    issues, notes = harness.orch._fetch_open_issues_and_notes()
+    assert notes[51] == [], "回退仍炸 → 置空列表继续（同今日，无回归）"
+    assert harness.journal("reconcile: issue#51 comments unavailable")
+
+    st["baselined"] = False
+    state.save_state(harness.state_path, st)
+    assert harness.orch._fetch_open_issues_and_notes() is None, (
+        "首跑全量契约：pagination 爆炸同样整体 abort")
     assert harness.journal("reconcile: aborted, API transient failure")
 
 

@@ -259,6 +259,35 @@ def test_pagination_stops_at_hard_page_cap():
     assert len(server.requests) == api.MAX_PAGES
 
 
+def test_pagination_cap_signal_is_api_pagination_error():
+    """ag-1b0e6f：超页上限爆炸＝可编程判别面 ApiPaginationError（仍系
+    ApiTransientError 子类——既有 defer 映射不动，禁字符串匹配）。"""
+    comments_path = f"{ISSUES_PATH}/42/comments"
+    full_page = [{"id": i, "body": "x", "user": {"login": "u"}}
+                 for i in range(api.PAGE_LIMIT)]
+
+    with fake_gitea({("GET", comments_path): lambda rec: (200, [], full_page)}) as server:
+        with pytest.raises(api.ApiPaginationError) as excinfo:
+            make_client(server).list_issue_comments(PROJ, 42)
+    assert isinstance(excinfo.value, ApiTransientError)
+    assert len(server.requests) == api.MAX_PAGES
+
+
+def test_get_issue_comment_fetches_single_normalized():
+    """ag-1b0e6f：单条评论端点 GET /issues/comments/{id}（>2500 条墙的
+    零分页直取）；归一化形状与 list_issue_comments 同构；404 走既有
+    ApiTransientError 传输映射（调用方回退）。"""
+    comment_path = f"/api/v1/repos/{PROJ}/issues/comments/201"
+    payload = {"id": 201, "body": "note body", "user": {"login": "alice"}}
+
+    with fake_gitea({("GET", comment_path): lambda rec: (200, [], payload)}) as server:
+        note = make_client(server).get_issue_comment(PROJ, 201)
+    assert note == {"id": 201, "body": "note body", "user": {"login": "alice"}}
+    with fake_gitea({}) as server:  # unscripted path -> 404 -> transient
+        with pytest.raises(ApiTransientError):
+            make_client(server).get_issue_comment(PROJ, 999)
+
+
 # --- post note -----------------------------------------------------------
 
 

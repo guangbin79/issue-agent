@@ -53,7 +53,7 @@ class FakeApi:
             raise api.ApiTransientError("gitea api unreachable after retry")
         return state_ or "open"
 
-    def list_issue_comments(self, project, iid):
+    def list_issue_comments(self, project, iid, since_iso=None):
         return self.comments.get(int(iid), [])
 
     def post_note(self, project, iid, body):
@@ -765,6 +765,41 @@ class TestReportProbe:
         entry = state.load_state(h.state_path)["issues"]["7"]
         assert not entry["report_probe_pending"]
         assert entry["report_probe_count"] == 1
+
+    def test_overcap_wall_degrades_to_recent_window_probe(self, tmp_path, monkeypatch):
+        """ag-1b0e6f：>cap 墙（>50 页）探针不再永久 budget held——pagination
+        爆炸→近窗重拉照常判 containment；服务端忽略 since（回退仍炸）→
+        budget held 同今日。"""
+        h = Harness(tmp_path, monkeypatch)
+        _probe_ready(h)
+        h.export_result = REPORT
+        wall_note = {"id": 9, "body": f"\U0001f916 {REPORT}\n{api.NOTE_MARKER}"}
+
+        def overcap_wall(project, iid, since_iso=None):
+            if since_iso is None:  # 全量拉撞 50 页上限
+                raise api.ApiPaginationError(
+                    "gitea api pagination exceeded 50 pages")
+            return [wall_note]
+
+        monkeypatch.setattr(h.api, "list_issue_comments", overcap_wall)
+        _seed_probe(h)
+        h.sweep()
+        entry = state.load_state(h.state_path)["issues"]["7"]
+        assert not entry["report_probe_pending"], (
+            "近窗回退后照常判 containment（dup-skip 清旗，不再永久 held）")
+        assert h.journal("dup-skip")
+
+        def hopeless_wall(project, iid, since_iso=None):  # server ignores since
+            raise api.ApiPaginationError(
+                "gitea api pagination exceeded 50 pages")
+
+        monkeypatch.setattr(h.api, "list_issue_comments", hopeless_wall)
+        _seed_probe(h)
+        h.sweep()
+        entry = state.load_state(h.state_path)["issues"]["7"]
+        assert entry["report_probe_pending"], "回退仍炸 → budget held 同今日"
+        assert entry["report_probe_count"] == 0
+        assert h.journal("comment wall read failed")
 
 
 # --------------------------------------------------------------------------
