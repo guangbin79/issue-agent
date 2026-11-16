@@ -938,9 +938,10 @@ class Orchestrator:
 
     def _agora_disposal_command(self, iid, action, event):
         """面板评论指令处置 blocked（ag-1c7315，用户裁定：处置面搬到
-        issue 面板）：「重试／解决冲突／重派」→ 以 dispatcher 凭据对同
-        任务 task_dispatch（重派＝新凭据新 worker、fail_streak 清零、
-        env 按当前远端 tip 重建）→ 回评确认；「取消任务／取消」→
+        issue 面板）：「重试／解决冲突／重派」→ 基线刷新（fetch_base＋
+        ensure_fix_branch，ag-92fc36：读父分支前必刷）→ 以 dispatcher
+        凭据对同任务 task_dispatch（重派＝新凭据新 worker、fail_streak
+        清零、env 按刷新后基线重建）→ 回评确认；「取消任务／取消」→
         task_cancel → 回评取消事实（与 result-mail 收口回评同 mark 幂等）。
         仅当任务实时处于 blocked 才执行：账本 agora_status 是缓存口径，
         常停在 done（「done/failed」后缀的书写/读取两侧不齐，ag-ac5771
@@ -998,6 +999,27 @@ class Orchestrator:
                 self._post_note(iid, "活动名额已满，本次「重试」未执行；"
                                       "稍后重新评论「重试」即可。")
                 return
+            if action == "redispatch":
+                # ag-92fc36 三轮判例：重派路径曾零 fetch——env 按陈旧
+                # 父分支引用重建，worker 对旧视图解冲突、交付时再撞真
+                # tip。用户裁定（规则②）：读父分支的每个时机，读之前
+                # 先 fetch；重派即新一轮「建立」起点，ensure_fix_branch
+                # 同回合流语义刷新交付分支 tip＋无损对账。失败绝不带病重派。
+                try:
+                    gitop.fetch_base(self.repo_path, self.remote_url,
+                                     self.default_branch, self.ssl_verify)
+                    gitop.ensure_fix_branch(
+                        self.repo_path, iid, self.default_branch,
+                        self.remote_url, self.ssl_verify)
+                except gitop.GitopError as exc:
+                    if self.agora_monitor is not None:
+                        self.agora_monitor.release(iid)  # 归还 reserve 占位
+                    self._journal(
+                        f"disposal: issue#{iid} 「重试」 aborted "
+                        f"(baseline sync failed): {exc}")
+                    self._post_note(iid, "基线同步失败，本次「重试」未执行；"
+                                          "稍后重新评论「重试」即可。")
+                    return
             try:
                 if action == "redispatch":
                     self.agora_client.dispatch(tid)

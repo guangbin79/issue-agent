@@ -298,6 +298,8 @@ class FakeGitop:
     def fake_ensure_fix_branch(self, repo, iid, default_branch="master",
                                remote_url=None, ssl_verify=True):
         self.ensure_calls.append((repo, iid, default_branch))
+        if self.order is not None:
+            self.order.append("ensure")
         if self.ensure_error is not None:
             raise self.ensure_error
         return "0" * 40
@@ -4222,6 +4224,80 @@ def test_redispatch_respects_capacity_gate(tmp_path, monkeypatch):
             "满员不得重新登记"
         assert h.entry(7)["agora_status"] == "blocked", \
             "门未过，账本状态不动（重发「重试」即重试通道）"
+    finally:
+        h.orch.stop()
+
+
+def test_redispatch_refreshes_baseline_before_dispatch(tmp_path, monkeypatch):
+    """ag-92fc36：重派路径曾零 fetch——env 按陈旧父分支引用重建，worker
+    对旧视图解冲突、交付时再撞真 tip。用户裁定（规则②）：读父分支的
+    每个时机读之前先 fetch——dispatch 前必须 fetch_base →
+    ensure_fix_branch（刷新交付分支 tip＋无损对账）。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    real_dispatch = client.dispatch
+
+    def order_dispatch(tid):
+        h.order.append("dispatch")
+        return real_dispatch(tid)
+
+    client.dispatch = order_dispatch
+    try:
+        seed_blocked_agora_task(h)
+        client.board_task = {"state": "blocked"}
+        h.listener.queue.put(
+            comment_event(iid=7, body="重试", comment_id=102))
+        assert wait_until(lambda: client.dispatch_calls == ["ag-123"]), \
+            h.journal_msgs
+        assert h.order.index("fetch") < h.order.index("ensure") \
+            < h.order.index("dispatch"), \
+            f"dispatch 前必须先 fetch 再 ensure：{h.order}"
+        assert len(h.gitop.fetch_calls) == 1 \
+            and len(h.gitop.ensure_calls) == 1, "基线刷新恰一次"
+    finally:
+        h.orch.stop()
+
+
+def test_redispatch_baseline_sync_failure_aborts_without_dispatch(
+        tmp_path, monkeypatch):
+    """ag-92fc36：基线同步失败绝不 dispatch（绝不在陈旧基线上重派）——
+    回评失败事实、归还 reserve 占位；重发「重试」即重试通道。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    h.gitop.fetch_error = gitop.GitopError("fetch boom (fake)")
+    try:
+        seed_blocked_agora_task(h)
+        client.board_task = {"state": "blocked"}
+        h.listener.queue.put(
+            comment_event(iid=7, body="重试", comment_id=102))
+        assert wait_until(
+            lambda: any("基线同步失败" in text for _, text in h.api.posts)), \
+            h.journal_msgs
+        assert client.dispatch_calls == [], "陈旧基线上绝不 dispatch"
+        assert monitor.released == [7], "reserve 占位必须归还"
+        assert monitor.redispatches == [] \
+            and monitor.handoff_injections == []
+    finally:
+        h.orch.stop()
+
+
+def test_cancel_command_skips_baseline_sync(tmp_path, monkeypatch):
+    """ag-92fc36 边界：基线刷新只属于重派支路——「取消任务」不新增
+    fetch/ensure。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor)
+    try:
+        seed_blocked_agora_task(h)
+        client.board_task = {"state": "blocked"}
+        h.listener.queue.put(
+            comment_event(iid=7, body="取消任务", comment_id=102))
+        assert wait_until(lambda: client.cancel_calls == ["ag-123"]), \
+            h.journal_msgs
+        assert h.gitop.fetch_calls == [] \
+            and h.gitop.ensure_calls == [], "取消支路零基线刷新"
     finally:
         h.orch.stop()
 
