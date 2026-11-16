@@ -1007,26 +1007,6 @@ def test_malformed_handoff_is_terminal_local_release(
     assert any("malformed" in m for m in journal), journal
 
 
-def test_vacuous_done_without_handoff_is_terminal_local_release(
-        tmp_path, monkeypatch):
-    """2026-11-16 #214 判例（ag-fe6e55）：done＋delivery.pending——worker
-    零提交 done，从未进入 awaiting_external、无 handoff；stall 阶梯反复
-    重派刷心跳 3 小时。与 malformed handoff 同类协议违约：终局释放、零
-    推送、不重派。"""
-    client = FakeAgoraClient()
-    client.tasks[TID]["delivery"]["status"] = "pending"
-    client.tasks[TID]["delivery"]["commit"] = None
-    fake_git = FakeGitDelivery(monkeypatch)
-    monitor, _, journal = delivery_monitor(tmp_path, monkeypatch, client,
-                                           fake_git)
-
-    monitor.poll_once()
-
-    assert fake_git.push_calls == [] and client.deliver_calls == []
-    assert monitor.tasks() == [], "空转 done 必须终局释放名额"
-    assert any("vacuous" in m for m in journal), journal
-
-
 # --- Task 5: 终态汇报 / 持续评论 / mailbox 管线 / 重启恢复 / 心跳 -----------------
 
 

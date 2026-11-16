@@ -330,15 +330,6 @@ class AgoraMonitor:
                     self.release(iid, tid)
                     return
                 self._deliver_handoff(iid, tid, handoff, delivery)
-            elif delivery.get("status") == "pending":
-                # 空转 done（2026-11-16 #214 判例 ag-fe6e55：worker 零提交
-                # done，从未进入 awaiting_external、无 handoff；stall 阶梯
-                # 反复重派刷心跳 3 小时）——与 malformed handoff 同类协议
-                # 违约：无可交付物，终局释放（不重派、不占名额）。
-                self._journal(
-                    f"agora-monitor: issue#{iid} task {tid} vacuous done "
-                    "(no handoff; delivery never armed); terminal release")
-                self.release(iid, tid)
             elif delivery.get("status") == "delivered":
                 # delivered ack 后收口读竞态/瞬断的恢复面（评审环 ocr #4）：
                 # 本次 board 读即确认——补记 delivery_commit、回评汇报并释放
