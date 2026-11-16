@@ -147,7 +147,7 @@ def load_config(path: "str | Path | None" = None) -> Config:
         opencode_timeout=_bounded_int(
             raw.get("opencode_timeout", 1800), "opencode_timeout", 1800, 1),
         max_parallel=_bounded_int(
-            raw.get("max_parallel", 1), "max_parallel", 1, 1, 4),
+            raw.get("max_parallel", 1), "max_parallel", 1, 1, 16),
         project=str(raw.get("project", "")),
         gitea_user=str(raw.get("gitea_user", "")),
         service_name=str(raw.get("service_name", "") or "issue-agent"),

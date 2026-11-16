@@ -230,7 +230,14 @@ def test_max_parallel_valid_value_parses(tmp_path):
     assert cfg.max_parallel == 2
 
 
-@pytest.mark.parametrize("bad", [0, 5, "two"])
+def test_max_parallel_above_old_cap_parses(tmp_path):
+    """ag-57495c: cap 4→16 (sanity bound; the old 4 was an arbitrary F13
+    pick — real concurrency is bounded by monitor slots/server quotas)."""
+    cfg = config.load_config(write_config(tmp_path, max_parallel=6))
+    assert cfg.max_parallel == 6
+
+
+@pytest.mark.parametrize("bad", [0, 17, "two"])
 def test_max_parallel_out_of_domain_rejected(tmp_path, bad):
     with pytest.raises(config.ConfigError):
         config.load_config(write_config(tmp_path, max_parallel=bad))
