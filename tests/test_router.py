@@ -512,3 +512,15 @@ def test_template_carries_three_way_routing_criteria():
     assert "out_of_band" in text, "需勘察类 hint 唯一合法值必须点名"
     assert "纯解答" in text, "纯解答类判据（action=answer）"
     assert "external_branch" in text, "代码修复类缺省交付面"
+
+
+def test_template_carries_goal_gate_before_routing():
+    """goal-gate 路由层前置闸：门节必须位于 action 分流判据之前；
+    任一查不过 → action=question，reason 前缀三锚（无法达成/需明确
+    验收/建议拆分）——orchestrator 的 question 评论正文携带 reason。"""
+    text = _template_text()
+    assert "目标门" in text
+    for prefix in ("无法达成", "需明确验收", "建议拆分"):
+        assert prefix in text, f"goal-gate 前缀缺失: {prefix}"
+    assert text.index("目标门") < text.index("action 分流"), \
+        "门必须在 action 分流判据之前"
