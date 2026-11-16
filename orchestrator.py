@@ -502,6 +502,7 @@ class Orchestrator:
             state.save_state(self.state_path, ledger)
         self._journal(f"ledger: issue#{iid} -> {entry['status']} ({decision['reason']})")
         if action == "close":
+            self._agora_cancel_on_close(iid, entry.get("agora_task_id"))
             # the PRIMARY close channel (webhook delivered): a fix branch that
             # only gained commits after the last turn (TUI takeover, manual
             # work) would otherwise never reach the remote (issue#139)
@@ -1037,6 +1038,13 @@ class Orchestrator:
         通道（评论被旧 goal 顶替），注册表失联窗口的重试必须重跑 preflight。"""
         body = (f"issue#{iid} 新评论（note {note_id or 0}）需要你处理："
                 f"\n\n{message}")
+        # 取消传播窗口（2026-11-16 #360 判例：任务已 cancelled 而注册表/
+        # poll 未及释放，post 给死任务 200 吞评论）：发帖前 board 实判
+        # 终态，终态直接回落 Router 新回合（读失败按存活处置＝旧行为）。
+        if self._agora_task_terminal(tid):
+            self._journal(f"turn: issue#{iid} relay to {tid} skipped; "
+                          "task terminal, falling back to router")
+            return False
         try:
             self.agora_client.post(tid, "question", body)
         except AgoraRejected as exc:
@@ -1085,6 +1093,38 @@ class Orchestrator:
         task = board.get("task") if isinstance(board, dict) else None
         return isinstance(task, dict) \
             and task.get("state") in ("merged", "closed", "cancelled")
+
+    def _agora_cancel_on_close(self, iid, tid):
+        """issue 关闭回收在飞任务（2026-11-16 #203 判例：issue 已关、
+        问答任务空跑心跳 3 小时无人取消）。board 实时态属 worker 活跃面
+        （todo/dispatched/running/reopened/blocked）才取消——done＝交付
+        窗口（awaiting_external）放行已验证交付；终态 noop。F28 忙碌闸
+        直透应答（cancelled=0+worker_busy）→ close 是人的显式意图，按
+        hint 携 force 重试一次；一切失败只留痕，绝不破关单流程。
+        """
+        if self.agora_client is None or not tid:
+            return
+        try:
+            board = self.agora_client.board(tid)
+            task = board.get("task") if isinstance(board, dict) else None
+        except Exception as exc:
+            self._journal(f"close: issue#{iid} task {tid} board read "
+                          f"failed, in-flight cancel skipped: {exc!r}")
+            return
+        task_state = (task or {}).get("state")
+        if task_state not in ("todo", "dispatched", "running",
+                              "reopened", "blocked"):
+            return
+        try:
+            resp = self.agora_client.task_cancel(tid)
+            if isinstance(resp, dict) and resp.get("cancelled") == 0 \
+                    and resp.get("reason") == "worker_busy":
+                resp = self.agora_client.task_cancel(tid, force=True)
+            self._journal(f"close: issue#{iid} in-flight task {tid} "
+                          f"(state={task_state}) cancelled: {resp}")
+        except Exception as exc:
+            self._journal(f"close: issue#{iid} in-flight task {tid} "
+                          f"cancel failed (state={task_state}): {exc!r}")
 
     def _agora_lane_preflight(self, iid, message, note_id) -> bool:
         """建单前实时校验（ag-ee0c29 缺口 1）：monitor 登记簿易失（重启即
@@ -2177,6 +2217,7 @@ class Orchestrator:
         #    no longer in the open set -> done
         open_keys = {str(iid) for iid in open_notes}
         closed = []
+        closed_tids = {}
         with self._ledger_lock:
             ledger = state.load_state(self.state_path, warn=self._journal)
             for iid, entry in ledger["issues"].items():
@@ -2190,10 +2231,13 @@ class Orchestrator:
                     entry.pop("report_probe_pending", None)
                     entry.pop("report_probe_count", None)
                     closed.append(iid)
+                    if entry.get("agora_task_id"):
+                        closed_tids[int(iid)] = entry["agora_task_id"]
             if closed:
                 state.save_state(self.state_path, ledger)
         for iid in closed:
             self._journal(f"reconcile: issue#{iid} left the open set -> done")
+            self._agora_cancel_on_close(int(iid), closed_tids.get(int(iid)))
             self._push_on_close(int(iid))
 
         # 5.5 gt-9f24 delayed review re-push: one grace-bounded attempt per

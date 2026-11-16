@@ -333,6 +333,8 @@ class FakeAgoraClient:
         self.board_task = {"state": "running"}  # relay 回落前的 board 重读面
         self.board_failures = []  # board 读抛出的异常队列（4xx 模拟）
         self.cancel_calls = []   # task_cancel 调用记账（关单语义必须为零）
+        self.cancel_calls_full = []  # {"task","force"} 全量记账（close 回收）
+        self.cancel_responses = []   # 可脚本化应答队列（缺省 cancelled=1）
 
     def post(self, tid, kind, body):
         if self.post_failures:
@@ -345,8 +347,12 @@ class FakeAgoraClient:
             raise self.board_failures.pop(0)
         return {"task": dict(self.board_task), "events": []}
 
-    def task_cancel(self, tid):
+    def task_cancel(self, tid, force=False):
         self.cancel_calls.append(tid)
+        self.cancel_calls_full.append({"task": tid, "force": force})
+        if self.cancel_responses:
+            return self.cancel_responses.pop(0)
+        return {"cancelled": 1}
 
     def doctor(self):
         self.doctor_calls += 1
@@ -2148,6 +2154,15 @@ def _seed_active_issue(h, iid=11):
     state.save_state(h.state_path, st)
 
 
+def _seed_active_agora_issue(h, iid=11, tid="ag-123"):
+    st = {"issues": {}, "baselined": True}
+    state.adopt_existing(st, {iid: [101]})
+    st["issues"][str(iid)].update(status="active", agora_task_id=tid,
+                                  agora_status="running/pending",
+                                  branch=f"issue/{iid}-fix")
+    state.save_state(h.state_path, st)
+
+
 def test_close_pushes_unpushed_branch(harness):
     """Commits can land on issue/<iid>-fix outside any turn (TUI takeover,
     manual branch work); when the issue then closes, reconcile must push the
@@ -2175,6 +2190,69 @@ def test_webhook_close_pushes_unpushed_branch(harness):
     assert wait_until(lambda: harness.entry(11)["status"] == "done"), \
         harness.journal_msgs
     assert 11 in harness.gitop.push_calls
+
+
+def test_webhook_close_cancels_in_flight_agora_task(tmp_path, monkeypatch):
+    """close 回收在飞任务（2026-11-16 #203 判例：issue 已关、问答任务
+    空跑心跳 3 小时无人取消）——board 活跃态即取消，取消失败不破关单。"""
+    client = FakeAgoraClient()
+    h = agora_harness(tmp_path, monkeypatch, client=client)
+    try:
+        _seed_active_agora_issue(h)
+        client.board_task = {"state": "running"}
+        ev = issue_open_event(iid=11)
+        ev["action"] = "closed"
+        ev["issue"]["state"] = "closed"
+        h.listener.queue.put(ev)
+        assert wait_until(lambda: h.entry(11)["status"] == "done"), \
+            h.journal_msgs
+        assert client.cancel_calls_full == [{"task": "ag-123",
+                                             "force": False}], \
+            h.journal_msgs
+    finally:
+        h.orch.stop()
+
+
+def test_close_spares_terminal_and_delivery_window_tasks(tmp_path,
+                                                         monkeypatch):
+    """done＝交付窗口（awaiting_external）放行已验证交付；终态本就无需
+    取消——两者都不得触发 task_cancel。"""
+    client = FakeAgoraClient()
+    h = agora_harness(tmp_path, monkeypatch, client=client)
+    try:
+        for state_name in ("done", "closed"):
+            _seed_active_agora_issue(h)
+            client.board_task = {"state": state_name}
+            ev = issue_open_event(iid=11)
+            ev["action"] = "closed"
+            ev["issue"]["state"] = "closed"
+            h.listener.queue.put(ev)
+        assert wait_until(
+            lambda: h.entry(11)["status"] == "done"
+            and len(client.cancel_calls) == 0), h.journal_msgs
+    finally:
+        h.orch.stop()
+
+
+def test_close_cancel_forces_busy_worker(tmp_path, monkeypatch):
+    """F28 忙碌闸直透应答（cancelled=0+reason=worker_busy）→ close 是人的
+    显式意图，按 hint 携 force 重试一次。"""
+    client = FakeAgoraClient()
+    client.board_task = {"state": "running"}
+    client.cancel_responses = [
+        {"cancelled": 0, "reason": "worker_busy", "hint": "force:true"}]
+    h = agora_harness(tmp_path, monkeypatch, client=client)
+    try:
+        _seed_active_agora_issue(h)
+        ev = issue_open_event(iid=11)
+        ev["action"] = "closed"
+        ev["issue"]["state"] = "closed"
+        h.listener.queue.put(ev)
+        assert wait_until(lambda: client.cancel_calls_full == [
+            {"task": "ag-123", "force": False},
+            {"task": "ag-123", "force": True}]), h.journal_msgs
+    finally:
+        h.orch.stop()
 
 
 def test_close_without_new_commits_skips_push(harness):
@@ -3267,6 +3345,31 @@ def test_active_comment_relay_unavailable_keeps_pending(tmp_path, monkeypatch):
         h.orch.stop()
 
 
+def test_relay_precheck_terminal_falls_back_without_posting(
+        tmp_path, monkeypatch):
+    """取消传播窗口（2026-11-16 #360 判例：任务已 cancelled、注册表未
+    释放，post 给死任务 200 吞评论）：发帖前 board 预检终态——零 post、
+    评论不丢，直接回落 Router 新回合。"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter()
+    monitor = FakeMonitor(max_active=2)
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_,
+                      monitor=monitor)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        monitor.release(7, "ag-123")   # board 侧已终态
+        monitor.register(7, "ag-123")  # 注册表陈旧（cancel 传播未收敛）
+        client.board_task = {"state": "cancelled"}
+
+        h.listener.queue.put(
+            comment_event(iid=7, body="还有问题", comment_id=102))
+        assert wait_until(lambda: len(client.created_ids) == 2), h.journal_msgs
+        assert client.posts == [], "终态任务零 post——评论不得被吞"
+    finally:
+        h.orch.stop()
+
+
 def test_stale_registry_rejected_relay_falls_back_to_router(
         tmp_path, monkeypatch):
     """注册表陈旧竞态（board 已终态、poll 未及释放）→ 直通被服务端拒
@@ -3385,9 +3488,10 @@ def test_pause_blocks_new_dispatch_but_monitor_continues(
 
 def test_close_keeps_inflight_and_reopen_restores_routing(
         tmp_path, monkeypatch):
-    """关单＝终态暂停（2026-11-13 裁定）：不调 task_cancel、在飞任务由
-    monitor 走完、close-push 照旧；close 后新评论不建任务；重开恢复正常
-    路由（新回合 after 链上轮 tid）。"""
+    """关单回收在飞任务（2026-11-16 修正，反转 2026-11-13 裁定：#203
+    判例——issue 已关、任务空跑心跳 3 小时无人取消；done＝交付窗口仍放
+    行）：board 活跃态即 task_cancel，close-push 照旧；close 后新评论
+    不建任务；重开恢复正常路由（新回合 after 链上轮 tid）。"""
     client = FakeAgoraClient()
     router_ = FakeRouter()
     monitor = FakeMonitor(max_active=2)
@@ -3403,7 +3507,8 @@ def test_close_keeps_inflight_and_reopen_restores_routing(
         h.listener.queue.put(close)
         assert wait_until(lambda: h.entry(7)["status"] == "done"), \
             h.journal_msgs
-        assert client.cancel_calls == [], "关单绝不调 task_cancel"
+        assert client.cancel_calls == ["ag-123"], \
+            "close 回收在飞任务（2026-11-16 #203 判例，board running）"
         assert h.orch.agora_monitor._active.get(7) == "ag-123", \
             "在飞任务由 monitor 继续走完（登记不动）"
 

@@ -176,6 +176,17 @@ def test_create_task_verify_base_exempt_wire_shape(tmp_path):
     assert bodies[1]["verify_base_exempt"] is True
 
 
+def test_task_cancel_force_wire_shape(tmp_path):
+    """F28 忙碌闸应答直透：force 仅 True 时上送（缺省不含键）。"""
+    with with_server(default_routes(), tmp_path) as combo:
+        combo.client.task_cancel("ag-123")
+        combo.client.task_cancel("ag-123", force=True)
+    bodies = [r["json"] for r in combo.server.requests
+              if r["path"] == "/task_cancel"]
+    assert "force" not in bodies[0]
+    assert bodies[1]["force"] is True
+
+
 def test_dispatcher_token_signed_exactly_once_across_calls(tmp_path):
     with with_server(default_routes(), tmp_path) as combo:
         client = combo.client
@@ -240,9 +251,10 @@ def test_check_mail_unwraps_messages_and_post_returns_none(tmp_path):
 
 
 def test_task_cancel_carries_dispatcher_plane_and_task_body(tmp_path):
-    """ag-1c7315：task_cancel 走任务面（dispatcher 牌）＋最小 body。"""
+    """ag-1c7315：task_cancel 走任务面（dispatcher 牌）＋最小 body；
+    F28 忙碌闸应答直透（2026-11-16：返回 payload 供调用方判 busy）。"""
     with with_server(default_routes(), tmp_path) as combo:
-        assert combo.client.task_cancel("ag-123") is None
+        assert combo.client.task_cancel("ag-123") == {"ok": True}
     reqs = [r for r in combo.server.requests if r["path"] == "/task_cancel"]
     assert len(reqs) == 1
     assert reqs[0]["json"] == {"task": "ag-123"}

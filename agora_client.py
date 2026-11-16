@@ -218,9 +218,14 @@ class AgoraClient:
         返回 {"nudged": bool, "reason": ...}；body ≤2000 字符服务端校验）。"""
         return self._task_call("/task_nudge", {"task": tid, "body": body})
 
-    def task_cancel(self, tid) -> None:
-        """task_cancel（dispatcher 身份可取消自己名下任务；叶子任务级联 0）。"""
-        self._task_call("/task_cancel", {"task": tid})
+    def task_cancel(self, tid, force=False) -> dict:
+        """task_cancel（dispatcher 身份可取消自己名下任务；叶子任务级联 0）。
+        F28 忙碌闸应答直透（200+cancelled=0+reason=worker_busy——由调用方
+        决定是否携 force 重试）；force 仅 True 时上送。"""
+        body = {"task": tid}
+        if force:
+            body["force"] = True
+        return self._task_call("/task_cancel", body)
 
     def board(self, tid=None) -> dict:
         return self._task_call("/board", {"task": tid} if tid is not None else {})
