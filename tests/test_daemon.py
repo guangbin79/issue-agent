@@ -395,9 +395,9 @@ def test_daemon_legacy_mode_passes_none_and_never_builds_client(
 
 
 def test_daemon_agora_mode_builds_router_and_threads_it(tmp_path, monkeypatch):
-    """agora 模式：daemon 构造 SemanticRouter（模板/自身模型/账本根路径/
-    共享账本锁/journal warn）并以 router= 注入 orchestrator（消费归
-    Task 3，此处仅惰性接线）。"""
+    """agora 模式：daemon 构造 SemanticRouter（模板/自身模型/超时/journal
+    warn——P1-5 每次新会话，零账本零共享锁接线）并以 router= 注入
+    orchestrator（消费归 Task 3，此处仅惰性接线）。"""
     import threading
 
     built = []
@@ -412,33 +412,32 @@ def test_daemon_agora_mode_builds_router_and_threads_it(tmp_path, monkeypatch):
     assert daemon.main() == 0
     assert len(built) == 1
     kwargs = dict(built[0].kwargs)
-    shared_lock = kwargs.pop("ledger_lock")
     warn = kwargs.pop("warn")
-    assert isinstance(shared_lock, type(threading.RLock())), \
-        "可重入锁：Task 3 持账本锁调 decide 时 persist 嵌套获取不自锁"
     assert callable(warn)
+    assert "state_path" not in kwargs and "ledger_lock" not in kwargs, \
+        "P1-5：Router 每次新会话，不再接账本与共享锁"
     assert kwargs == {
         "template_path": daemon._PKG_DIR / "ROUTER.template.md",
         "cwd": str(tmp_path),
         "router_model": "zai-coding-plan/glm-5.3",
-        "state_path": tmp_path / "state" / "state.json",
         "timeout_s": 1800,
     }
     assert captured["router"] is built[0]
-    assert captured["ledger_lock"] is shared_lock, \
-        "Router 与 orchestrator 必须共用同一把账本锁"
+    assert isinstance(captured["ledger_lock"], type(threading.RLock())), \
+        "共享账本锁仍注入 orchestrator（monitor 交付落账与回合侧互斥）"
 
 
-def test_daemon_router_reads_the_same_ledger_as_orchestrator(
-        tmp_path, monkeypatch):
-    """Router 的 session id 持久化与 orchestrator 共用同一份账本文件。"""
+def test_daemon_router_has_no_ledger_dependency(tmp_path, monkeypatch):
+    """P1-5：Router 每次新会话——不接账本路径与共享锁（会话账本/persist
+    接线整面移除）。"""
     import types
 
     captured = _wiring_scaffold(tmp_path, monkeypatch, _agora_cfg(tmp_path))
     monkeypatch.setattr(daemon, "SemanticRouter",
                         lambda **kwargs: types.SimpleNamespace(kwargs=kwargs))
     assert daemon.main() == 0
-    assert captured["router"].kwargs["state_path"] == captured["state_path"]
+    kwargs = captured["router"].kwargs
+    assert "state_path" not in kwargs and "ledger_lock" not in kwargs
 
 
 # --- agora monitor wiring (plan Task 3) ----------------------------------------

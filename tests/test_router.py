@@ -1,4 +1,4 @@
-"""router.py tests — the persistent semantic Router (plan Task 2).
+"""router.py tests — the semantic Router, new session per call (P1-5).
 
 opencode is never invoked: a FakeRouterRunner stands in for
 runner.new_session/continue_session, records every call (kwargs-shape,
@@ -24,7 +24,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import router as router_mod  # noqa: E402  (path setup must precede the import)
-import state as state_mod  # noqa: E402
 from runner import SessionInvalid, TurnResult  # noqa: E402
 
 PKG_DIR = Path(__file__).resolve().parent.parent
@@ -94,15 +93,15 @@ class FakeRouterRunner:
         return self._run()
 
 
-def make_router(tmp_path, fake, state_path=None, router_model=ROUTER_MODEL):
+def make_router(tmp_path, fake, router_model=ROUTER_MODEL,
+                max_consecutive_failures=3):
     return router_mod.SemanticRouter(
         template_path=TEMPLATE,
         cwd=str(tmp_path / "repo"),
         router_model=router_model,
-        state_path=state_path or (tmp_path / "state.json"),
         timeout_s=77,
         new_session=fake.new_session,
-        continue_session=fake.continue_session)
+        max_consecutive_failures=max_consecutive_failures)
 
 
 # --- 结构化决策（计划 Step 1 用例名照用） ------------------------------------
@@ -136,10 +135,12 @@ def test_router_never_controls_verify_command(tmp_path):
     assert "verify_cmd" not in decision.title
 
 
-def test_router_session_is_reused_and_calls_are_serialized(tmp_path):
+def test_router_new_session_per_decide_and_calls_serialized(tmp_path):
+    """P1-5：每次 decide 独立新会话（互不共享上下文）——无续用无账本；
+    router_lock 仍把 runner 调用串行化（限流）。"""
     fake = FakeRouterRunner([
         turn("ses_r1", decision_json()),
-        turn("ses_r1", decision_json(goal="第二回合：补监控\nIssue: #7")),
+        turn("ses_r2", decision_json(goal="第二回合：补监控\nIssue: #7")),
     ])
     router = make_router(tmp_path, fake)
     results = [None, None]
@@ -154,9 +155,9 @@ def test_router_session_is_reused_and_calls_are_serialized(tmp_path):
         t.start()
     for t in threads:
         t.join()
-    assert len(fake.new_calls) == 1, "并发两个 decide 只许建一次 session"
-    assert len(fake.cont_calls) == 1, "第二个 decide 必须续用同一 session"
-    assert fake.cont_calls[0]["session_id"] == "ses_r1"
+    assert len(fake.new_calls) == 2, "每次 decide 各建独立新会话"
+    assert fake.cont_calls == [], "续用路径已删：零 continue_session"
+    assert all("issue#7" in c["title"] for c in fake.new_calls)
     assert fake.max_active == 1, "router_lock 必须把 runner 调用串行化"
     assert all(d is not None and d.action == "dispatch" for d in results)
 
@@ -290,103 +291,87 @@ def test_router_rejects_unknown_deliverable_hint(tmp_path, hint):
 
 
 
-# --- 持久 session：失效重建恰一次＋账本根持久化 -------------------------------
+# --- P1-5：断路器与每次新会话 -----------------------------------------------
 
 
-def test_router_rebuilds_session_once_on_session_invalid(tmp_path):
+def test_router_answer_uses_new_session(tmp_path):
+    """answer 同样每次新会话、独立锁（可与 decide 并发），答复不做 schema 校验。"""
+    fake = FakeRouterRunner([turn("ses_a1", "直接重启网关即可")])
+    router = make_router(tmp_path, fake)
+    text = router.answer(iid=7, task="ag-x1", question="重启网关安全吗？")
+    assert text == "直接重启网关即可"
+    assert len(fake.new_calls) == 1
+    assert "answer" in fake.new_calls[0]["title"]
+    assert fake.cont_calls == []
+
+
+def test_router_circuit_breaker_opens_after_max_failures(tmp_path):
+    """连续失败达上限（缺省 3）即开路：第 4 次调用不再打模型，直接
+    RouterCircuitOpen——由 orchestrator 映射 blocked，不再无限重试。"""
     fake = FakeRouterRunner([
-        turn("ses_r1", decision_json()),
-        SessionInvalid("session target rejected by opencode: gone"),
-        turn("ses_r2", decision_json(goal="续用新 session 重试\nIssue: #7")),
+        router_mod.RouterDecisionError("bad json"),
+        router_mod.RouterDecisionError("bad json"),
+        router_mod.RouterDecisionError("bad json"),
+        turn("ses_r4", decision_json()),  # 开路后不得被消费
     ])
     router = make_router(tmp_path, fake)
-    router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
-                  available_models=MODELS)
-    decision = router.decide(iid=7, event={"kind": "note"},
-                             issue_context=CONTEXT, available_models=MODELS)
-    assert decision.action == "dispatch"
-    assert len(fake.new_calls) == 2, "失效后恰重建一次"
-    assert len(fake.cont_calls) == 1
-    assert fake.results == [], "重建后同一 decide 内不得再尝试续用"
+    for _ in range(3):
+        with pytest.raises(router_mod.RouterDecisionError):
+            router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                          available_models=MODELS)
+    with pytest.raises(router_mod.RouterCircuitOpen):
+        router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                      available_models=MODELS)
+    assert len(fake.new_calls) == 3, "开路后不再发起新会话"
+    assert len(fake.results) == 1, "脚本化结果未被断路消耗"
 
 
-def test_router_persists_session_id_to_ledger_root(tmp_path):
-    state_path = tmp_path / "state.json"
-    fake = FakeRouterRunner([turn("ses_r1", decision_json())])
-    make_router(tmp_path, fake, state_path=state_path).decide(
-        iid=7, event=EVENT, issue_context=CONTEXT, available_models=MODELS)
-    ledger = state_mod.load_state(state_path)
-    assert state_mod.router_session_id(ledger) == "ses_r1"
-    assert ledger["issues"] == {}, "Router sid 在账本根，不进任何 issue 条目"
-
-    # 重启恢复：新 Router 实例读同一账本 → 续用而非重建
-    fake2 = FakeRouterRunner([turn("ses_r1", decision_json())])
-    make_router(tmp_path, fake2, state_path=state_path).decide(
-        iid=7, event=EVENT, issue_context=CONTEXT, available_models=MODELS)
-    assert fake2.new_calls == []
-    assert len(fake2.cont_calls) == 1
-
-
-def test_router_rejects_reply_without_session_id(tmp_path):
-    fake = FakeRouterRunner([turn(None, decision_json())])
+def test_router_circuit_breaker_resets_on_success(tmp_path):
+    """任一次完整成功（会话往返＋校验通过）复位连败计数——断路是连续失败
+    熔断，不是永久封禁。"""
+    fake = FakeRouterRunner([
+        router_mod.RouterDecisionError("bad json"),
+        router_mod.RouterDecisionError("bad json"),
+        turn("ses_r3", decision_json()),
+        router_mod.RouterDecisionError("bad json"),
+        router_mod.RouterDecisionError("bad json"),
+        router_mod.RouterDecisionError("bad json"),
+        turn("ses_r7", decision_json()),
+    ])
     router = make_router(tmp_path, fake)
-    with pytest.raises(router_mod.RouterDecisionError):
+    for _ in range(2):
+        with pytest.raises(router_mod.RouterDecisionError):
+            router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                          available_models=MODELS)
+    decision = router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                             available_models=MODELS)
+    assert decision.action == "dispatch"  # 成功复位
+    for _ in range(3):
+        with pytest.raises(router_mod.RouterDecisionError):
+            router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                          available_models=MODELS)
+    with pytest.raises(router_mod.RouterCircuitOpen):
         router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
                       available_models=MODELS)
 
 
-def test_router_persist_surfaces_unreadable_ledger(tmp_path):
-    """主备账本双双不可读时，持久化路径的 load_state 也要经 warn 报出来
-    （与 __init__ 一致）——静默清零不该零痕迹。"""
-    state_path = tmp_path / "state.json"
-    state_mod.save_state(state_path, {"issues": {}})
-    warns = []
-    fake = FakeRouterRunner([turn("ses_r1", decision_json())])
-    router = router_mod.SemanticRouter(
-        template_path=TEMPLATE, cwd=str(tmp_path), router_model=ROUTER_MODEL,
-        state_path=state_path, timeout_s=77, warn=warns.append,
-        new_session=fake.new_session, continue_session=fake.continue_session)
-    assert warns == [], "构造时账本可读，不得告警"
-    state_path.write_text("not json{", encoding="utf-8")
-    (tmp_path / "state.json.bak").write_text("also not json{", encoding="utf-8")
-    router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
-                  available_models=MODELS)
-    assert any("unreadable" in w for w in warns)
-
-
-def test_router_persist_holds_injected_ledger_lock(tmp_path):
-    """persist 的 load→mutate→save 必须在注入的账本锁内——Router 与
-    orchestrator 写同一份账本（OCR medium：无锁丢更新窗口）。续用路径
-    不落盘，不进锁。"""
-    class RecordingLock:
-        def __init__(self):
-            self._lock = threading.RLock()
-            self.entries = 0
-
-        def __enter__(self):
-            self._lock.acquire()
-            self.entries += 1
-            return self
-
-        def __exit__(self, *exc):
-            self._lock.release()
-            return False
-
-    gate = RecordingLock()
-    state_path = tmp_path / "state.json"
+def test_router_runner_failure_counts_toward_circuit(tmp_path):
+    """会话级故障（超时/崩溃）与坏决策同计连败——都打不通链路。"""
+    from runner import TurnTimeout
     fake = FakeRouterRunner([
-        turn("ses_r1", decision_json()),
-        turn("ses_r1", decision_json()),
+        TurnTimeout("turn timeout"),
+        TurnTimeout("turn timeout"),
+        TurnTimeout("turn timeout"),
+        turn("ses_r4", decision_json()),
     ])
-    router = router_mod.SemanticRouter(
-        template_path=TEMPLATE, cwd=str(tmp_path), router_model=ROUTER_MODEL,
-        state_path=state_path, timeout_s=77, ledger_lock=gate,
-        new_session=fake.new_session, continue_session=fake.continue_session)
-    router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
-                  available_models=MODELS)
-    router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
-                  available_models=MODELS)
-    assert gate.entries == 1, "恰一次新建会话持久化在锁内；续用不落盘"
+    router = make_router(tmp_path, fake)
+    for _ in range(3):
+        with pytest.raises(TurnTimeout):
+            router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                          available_models=MODELS)
+    with pytest.raises(router_mod.RouterCircuitOpen):
+        router.decide(iid=7, event=EVENT, issue_context=CONTEXT,
+                      available_models=MODELS)
 
 
 # --- 发牌隔离与 Router 自身模型 ----------------------------------------------

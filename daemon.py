@@ -218,20 +218,17 @@ def main(argv=None) -> int:
                                 home=config.agora_home,
                                 poll_interval=config.agora_poll_interval)
                     if config.execution_mode == "agora" else None)
-    # 持久语义 Router（计划 Task 2）：agora 模式才构造（构造只读模板与
-    # 账本，零网络；session 建立在首次 decide）；orchestrator 消费归
-    # Task 3，此处仅惰性接线。legacy 恒 None、不读模板。ledger_lock 与
-    # orchestrator 共用（可重入：Router persist 与 orchestrator 写账本
-    # 互斥），warn 接 journal——会话重建与账本降级可诊断。
+    # 语义 Router（P1-5：每次新会话）：agora 模式才构造（构造只读模板，
+    # 零网络零会话——会话随每次 decide/answer 现场建立）；orchestrator
+    # 消费归 Task 3，此处仅惰性接线。legacy 恒 None、不读模板。shared
+    # ledger_lock 仍与 orchestrator/monitor 共用（Router 不再写账本）。
     shared_ledger_lock = threading.RLock()
     semantic_router = (SemanticRouter(
         template_path=_PKG_DIR / "ROUTER.template.md",
         cwd=config.repo_path,
         router_model=config.router_model,
-        state_path=_STATE_DIR / "state.json",
         timeout_s=config.opencode_timeout,
-        warn=journal,
-        ledger_lock=shared_ledger_lock)
+        warn=journal)
         if config.execution_mode == "agora" else None)
     # agora 任务监视器（计划 Task 3）：登记派发后的活动任务并轮询，活动
     # 名额与 config.max_parallel 双重限制口径；start/stop 随 orchestrator

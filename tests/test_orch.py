@@ -3220,6 +3220,23 @@ def test_default_ledger_lock_is_reentrant_across_agora_defer(tmp_path,
         h.orch.stop()
 
 
+def test_router_circuit_open_blocks_with_help_note(tmp_path, monkeypatch):
+    """P1-5：Router 断路器开路（连续失败达上限）→ blocked＋求助评论，
+    不再走 defer 无限重试。"""
+    router_ = FakeRouter()
+    router_.error = router_mod.RouterCircuitOpen("circuit open (fake)")
+    h = agora_harness(tmp_path, monkeypatch, router_=router_)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: h.entry(7)["status"] == "blocked",
+                          timeout=30), h.journal_msgs
+        assert wait_until(
+            lambda: any("断路" in b and "人工" in b
+                        for _, b in h.api.posts), timeout=30), h.journal_msgs
+    finally:
+        h.orch.stop()
+
+
 def test_doctor_rejected_blocks_with_help_note(tmp_path, monkeypatch):
     """评审环 F2：doctor 的确定性 4xx（如牌轮换）→ blocked＋求助评论，
     不静默无限重试。"""
