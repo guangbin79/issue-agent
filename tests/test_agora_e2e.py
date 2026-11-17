@@ -16,7 +16,8 @@ Router LLM 决策由 tests/test_router.py 证明，此处分别以测试替身 w
      保留）；评审恰一次（worker done 前的锚×1）、legacy _run_review_phase
      零调用；默认分支 SHA 全程不动；worker 零 push（远端引用快照）、零嵌套
      worktree。
-  2. non_ff：远端前推→issue-agent 携 base 换基→门体重排重验出新 handoff→
+  2. non_ff 真分叉（F110）：远端前推→issue-agent 携 base 确认→agora 祖先
+     预判直接 diverged/blocked（不进门队列不烧集成 verify）→面板求助人工；
      二次推送交付。
   3. daemon 重启恢复：awaiting_external 中重启不重复建单，恢复轮询完成交付。
   4. create 后崩溃（dispatch 前中断）：client_key 幂等取回原任务，恢复后
@@ -425,6 +426,9 @@ class E2EEnv:
         env_dir = Path(self.agorad.row(tid)["env_dir"])
         git(["config", "user.email", "worker@e2e"], env_dir)
         git(["config", "user.name", "worker"], env_dir)
+        # F111 评审链根：首个 worker 提交前的 env HEAD＝任务起点（链根语义
+        # 与生产 review-loop 一致——已存在沿旧值，不存在写本轮起点）
+        env_base = git(["rev-parse", "HEAD"], env_dir).stdout.strip()
         for name, content in files.items():
             path = env_dir / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -435,6 +439,9 @@ class E2EEnv:
         anchor = env_dir / ".review-loop" / ".last-reviewed"
         anchor.parent.mkdir(exist_ok=True)
         anchor.write_text(sha, encoding="utf-8")
+        base_file = env_dir / ".review-loop" / ".review-base"  # F111 双件锚
+        if not base_file.exists():
+            base_file.write_text(env_base, encoding="utf-8")
         self.worker_anchor_writes.append(sha)  # 评审锚恰一次的证据面
         # worker 零嵌套 worktree 的证据面：env 在交付收口后即被服务回收，
         # 快照须在存活期采集。
@@ -531,7 +538,11 @@ def test_full_chain_delivers_and_comments(env):
 # --- 场景 2：non_ff 换基重排 ------------------------------------------------------
 
 
-def test_non_ff_rotates_base_and_redelivers(env):
+def test_non_ff_diverged_terminal_blocks_for_human(env):
+    """F110：外部真分叉（远端 tip 与 handoff 互为兄弟提交）时，agora 在
+    task_deliver 确认点经祖先预判直接 diverged 终局——不再换基重排重验
+    （旧 F105 链路结构性不可达，白烧一次全量 verify）；issue-agent 释放
+    名额并回评面板求助，远端分支保持外部 tip 不被改写。"""
     env.start_orchestrator()
     env.open_issue(7)
     wait_until(lambda: env.turn_done(7), what="建单派发", timeout=env.turn_wait_s)
@@ -556,26 +567,26 @@ def test_non_ff_rotates_base_and_redelivers(env):
         tid, lambda r: r["state"] == "done"
         and r["delivery"]["status"] == "awaiting_external",
         what="首个 handoff")
-    # monitor：首推 non_ff → 携实际远端 tip 换基 → 门体重排重验出新 handoff
-    # → 二次推送 → delivered 收口。
-    wait_until(lambda: env.entry(7).get("delivery_commit")
-               not in (None, handoff), what="non_ff 换基后新 handoff 交付")
+    # monitor：首推 non_ff → 护栏不过（外部提交无 range-diff 对应）→
+    # task_deliver(non_ff, base=外部 tip) → agora F110 祖先预判直接
+    # diverged 终局（不进门队列、不重排、attempt 不轮转）。
+    env.agorad.wait_board(
+        tid, lambda r: r["state"] == "blocked"
+        and r["delivery"]["status"] == "failed",
+        what="F110 diverged 终局")
     row = env.agorad.row(tid)
-    assert row["state"] == "closed"
-    assert row["delivery"]["status"] == "delivered"
-    assert row["delivery"]["attempt"] == 2, f"恰一次换基重试：{row['delivery']}"
-    new_commit = row["delivery"]["commit"]
-    assert new_commit != handoff
-    assert git(["merge-base", "--is-ancestor", external_base, new_commit],
-               env.repo, check=False).returncode == 0, \
-        "新 handoff 必须落在外部推进基之上"
+    d = row["delivery"]
+    assert d["error"] == "diverged", f"F110 终局错误面：{d}"
+    assert d["attempt"] == 1, f"attempt 不轮转（零重排）：{d}"
+    assert d["commit"] == handoff, f"handoff commit 留投影：{d}"
+    assert env.entry(7).get("delivery_commit") is None, "未交付不落账"
     assert remote_refs(env.origin, env.repo)[
-        f"refs/heads/issue/7-fix"] == new_commit
-    assert branch_sha(env.origin, DEFAULT_BRANCH) == env.base_sha
-    wait_until(lambda: any("根因" in body for _, body in env.gitea.posts),
-               what="non_ff 交付后报告回评")  # 回评在落账后异步发生
-    assert any("坑位：" in body for _, body in env.gitea.posts), \
-        "报告照常回评（含坑位行）"
+        f"refs/heads/issue/7-fix"] == external_base, \
+        "远端保持外部 tip——diverged 绝不改写"
+    wait_until(
+        lambda: any("人工" in body and tid in body
+                    for _, body in env.gitea.posts),
+        what="blocked 面板求助（含处置指引）", timeout=env.turn_wait_s)
 
 
 # --- 场景 3：daemon 重启恢复（awaiting_external 中重启）--------------------------
