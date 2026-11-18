@@ -138,6 +138,31 @@ def test_foreign_client_key_not_counted(tmp_path):
     assert "在飞任务 0" in text
 
 
+def test_clarify_aging_listed_as_know(tmp_path):
+    """P2-12：goal-gate 待澄清超 2 天进「知悉即可」清单（不抬 rc）；
+    未超龄不列。"""
+    from datetime import datetime, timezone
+    now = 1_000_000.0
+    old_iso = datetime.fromtimestamp(now - 3 * 86400,
+                                     tz=timezone.utc).isoformat()
+    fresh_iso = datetime.fromtimestamp(now - 3600,
+                                       tz=timezone.utc).isoformat()
+    make_instance(tmp_path, "demo-issue-agent", mode="agora", agora_home="/ah",
+                  issues={"7": ("active", "ag-1"), "8": ("active", "ag-2")})
+    state_file = tmp_path / ".local/state/demo-issue-agent/state.json"
+    ledger = json.loads(state_file.read_text(encoding="utf-8"))
+    ledger["issues"]["7"]["clarify_pending_at"] = old_iso
+    ledger["issues"]["8"]["clarify_pending_at"] = fresh_iso
+    state_file.write_text(json.dumps(ledger), encoding="utf-8")
+    rc, text = run_digest(tmp_path, now=now,
+                          service_state=lambda svc: "active",
+                          journal_reader=lambda svc: "", agora_probe=ok_probe({}))
+    assert rc == 0  # 知悉级不抬退出码
+    assert "待澄清超龄 issue #7" in text
+    assert "3.0 天" in text
+    assert "待澄清超龄 issue #8" not in text  # 未超龄不列
+
+
 # --- 行动分级（ag-0f95bb：三类标签＋执行摘要） ----------------------------------
 
 def test_service_dead_first_line_names_first_need(tmp_path):

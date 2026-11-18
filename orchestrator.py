@@ -180,6 +180,8 @@ def _empty_entry() -> dict:
         "review_push_pending_at": None,
         "report_probe_pending": False,
         "report_probe_count": 0,
+        # P2-12：goal-gate 待澄清挂起时间戳（健康摘要超龄清单；新回合清除）
+        "clarify_pending_at": None,
         # agora 七字段（设计 §9.6，与 state._new_issue 同步）
         "agora_task_id": None,
         "agora_status": None,
@@ -296,7 +298,8 @@ class Orchestrator:
             self.agora_monitor.attach_delivery(
                 repo_path=self.repo_path, remote_url=self.remote_url,
                 ssl_verify=self.ssl_verify, state_path=self.state_path,
-                ledger_lock=self._ledger_lock)
+                ledger_lock=self._ledger_lock,
+                branch_lock=self._branch_lock)  # P2-10 分支 ref 单写者锁
             # 会话面接线（Task 5）：issue 评论通道（终态汇报/worker 答复
             # 回评）、worker 提问答复回调（锁序见 _answer_worker_question）
             # 与心跳间隔。daemon 构造面依旧不变。
@@ -310,6 +313,11 @@ class Orchestrator:
         self._turn_slots = threading.BoundedSemaphore(self.max_parallel)
         self._iid_locks = {}
         self._iid_locks_guard = threading.Lock()
+        # P2-10：分支 ref 单写者锁——issue/<iid>-fix 本地 ref 的全部写路径
+        # （monitor 拨正/close-push/sweep 补推/legacy 回合推送）过同一把
+        # per-branch 锁，消「同时刻两写者」竞态（a2153c2 yield 的残余面）
+        self._branch_locks = {}
+        self._branch_locks_guard = threading.Lock()
         self._stop = threading.Event()
         self._workers = []
         # queue-wait budget invariant: a same-issue event claimed and queued
@@ -624,6 +632,19 @@ class Orchestrator:
             state.save_state(self.state_path, ledger)
         self._journal(f"probe: issue#{iid} armed (fix reply was not a report)")
 
+    def _mark_clarify_pending(self, iid):
+        """P2-12：goal-gate/澄清类回复上墙后置位挂起时间戳——健康摘要
+        超龄清单读它；新评论（_claim）清除。幂等：已有标记不刷新（挂起
+        时长自首次求助起算）。"""
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            entry = ledger["issues"].get(str(int(iid)))
+            if entry is None or entry.get("clarify_pending_at"):
+                return
+            entry["clarify_pending_at"] = _now_iso()
+            state.save_state(self.state_path, ledger)
+        self._journal(f"clarify: issue#{iid} marked pending-clarification")
+
     def _claim(self, iid, note_ids, ledger):
         """Claim-before-run: pending + claimed_at + this turn's note ids in
         ONE in-memory mutation and ONE save_state (same-transaction feel)."""
@@ -648,6 +669,8 @@ class Orchestrator:
         # clear the probe flag and its consumed budget (ownership transfer)
         entry.pop("report_probe_pending", None)
         entry.pop("report_probe_count", None)
+        # P2-12：新评论即作者回应——待澄清挂起出账
+        entry.pop("clarify_pending_at", None)
         state.save_state(self.state_path, ledger)
         self._journal(f"claim: issue#{iid} -> pending ({len(note_ids)} note id(s) consumed)")
 
@@ -660,15 +683,16 @@ class Orchestrator:
         (a raised error here would abort the reconcile close loop and skip
         the remaining issues' pushes)."""
         try:
-            gitop.fetch_base(self.repo_path, self.remote_url,
-                             self.default_branch, self.ssl_verify)
-            if gitop.has_new_commits_vs_ref(
-                    self.repo_path, iid,
-                    gitop.agent_tracking_ref(self.default_branch)):
-                gitop.push_fix_branch_resilient(self.repo_path, iid, self.remote_url,
-                                                self.ssl_verify)
-                self._journal(f"reconcile: issue#{iid} close-push "
-                              f"{gitop.fix_branch(iid)}")
+            with self._branch_lock(iid):  # P2-10 单写者
+                gitop.fetch_base(self.repo_path, self.remote_url,
+                                 self.default_branch, self.ssl_verify)
+                if gitop.has_new_commits_vs_ref(
+                        self.repo_path, iid,
+                        gitop.agent_tracking_ref(self.default_branch)):
+                    gitop.push_fix_branch_resilient(self.repo_path, iid, self.remote_url,
+                                                    self.ssl_verify)
+                    self._journal(f"reconcile: issue#{iid} close-push "
+                                  f"{gitop.fix_branch(iid)}")
         except gitop.GitopError as exc:
             self._journal(f"warning: issue#{iid} close-push failed: {exc}")
             self._close_push_note(iid, exc)
@@ -688,6 +712,12 @@ class Orchestrator:
         the SAME issue holds it)."""
         with self._iid_locks_guard:
             return self._iid_locks.setdefault(str(int(iid)), threading.Lock())
+
+    def _branch_lock(self, iid):
+        """issue/<iid>-fix 本地 ref 写锁（P2-10 单写者面；与 monitor 共享）。"""
+        with self._branch_locks_guard:
+            return self._branch_locks.setdefault(str(int(iid)),
+                                                 threading.Lock())
 
     def _run_turn(self, iid, *, message, title, session_id, action,
                   event=None, note_id=None):
@@ -745,16 +775,17 @@ class Orchestrator:
                 # still checked out in the agent's own worktree.
                 pushed = False
                 try:
-                    pushed = gitop.has_new_commits_vs_ref(
-                        self.repo_path, iid,
-                        gitop.agent_tracking_ref(self.default_branch))
-                    if pushed:
-                        gitop.push_fix_branch_resilient(self.repo_path, iid, self.remote_url,
-                                                        self.ssl_verify)
-                    else:
-                        self._journal(
-                            f"turn: issue#{iid} no new commits on "
-                            f"{gitop.fix_branch(iid)}; push skipped")
+                    with self._branch_lock(iid):  # P2-10 单写者
+                        pushed = gitop.has_new_commits_vs_ref(
+                            self.repo_path, iid,
+                            gitop.agent_tracking_ref(self.default_branch))
+                        if pushed:
+                            gitop.push_fix_branch_resilient(self.repo_path, iid, self.remote_url,
+                                                            self.ssl_verify)
+                        else:
+                            self._journal(
+                                f"turn: issue#{iid} no new commits on "
+                                f"{gitop.fix_branch(iid)}; push skipped")
                 except gitop.PushFailed as exc:
                     # 缺陷A: the blocked exit would drop the turn's reply —
                     # store it for the sweep's deferred delivery first (a
@@ -806,6 +837,8 @@ class Orchestrator:
                 # 顺带防住多轮共用 session 把过期汇报重发到等澄清 issue。
                 goal_gate_exit = reply.lstrip().startswith(
                     ("无法达成", "需明确验收", "建议拆分"))
+                if goal_gate_exit:  # P2-12：待澄清挂起记账
+                    self._mark_clarify_pending(iid)
                 if (result.session_id and not runner.is_report(reply)
                         and not out_of_scope and not goal_gate_exit):
                     self._arm_report_probe(iid)
@@ -1395,6 +1428,8 @@ class Orchestrator:
         if not self._post_note(iid, text):
             self._defer(iid, None)
             return
+        if decision.action == "question":  # P2-12：待澄清挂起记账
+            self._mark_clarify_pending(iid)
         if decision.action == "ignore":
             try:
                 self.api.close_issue(self.project, iid)
@@ -1497,8 +1532,9 @@ class Orchestrator:
             if gitop.has_new_commits_vs_ref(
                     self.repo_path, iid,
                     gitop.agent_tracking_ref(self.default_branch)):
-                gitop.push_fix_branch_resilient(self.repo_path, iid, self.remote_url,
-                                                self.ssl_verify)
+                with self._branch_lock(iid):  # P2-10 单写者
+                    gitop.push_fix_branch_resilient(self.repo_path, iid, self.remote_url,
+                                                    self.ssl_verify)
             else:
                 self._journal(
                     f"review: issue#{iid} no new commits after review; push skipped")
@@ -1829,8 +1865,9 @@ class Orchestrator:
                 remote_tip = gitop.remote_branch_tip(
                     self.repo_path, self.remote_url, gitop.fix_branch(iid),
                     self.ssl_verify)
-                gitop.push_fix_branch_resilient(self.repo_path, iid,
-                                                self.remote_url, self.ssl_verify)
+                with self._branch_lock(iid):  # P2-10 单写者
+                    gitop.push_fix_branch_resilient(self.repo_path, iid,
+                                                    self.remote_url, self.ssl_verify)
                 changed_origin = remote_tip != sha
                 self._journal(f"sweep: issue#{iid} push {gitop.fix_branch(iid)} "
                               f"({count} ahead, origin "
@@ -2324,17 +2361,18 @@ class Orchestrator:
             state.save_state(self.state_path, ledger)
         pushed = False
         try:
-            gitop.fetch_base(self.repo_path, self.remote_url,
-                             self.default_branch, self.ssl_verify)
-            if gitop.has_new_commits_vs_ref(
-                    self.repo_path, iid,
-                    gitop.agent_tracking_ref(self.default_branch)):
-                gitop.push_fix_branch_resilient(self.repo_path, iid, self.remote_url,
-                                                self.ssl_verify)
-                pushed = True
-            else:
-                self._journal(f"reconcile: issue#{iid} delayed re-push found "
-                              "no new commits; mark cleared")
+            with self._branch_lock(iid):  # P2-10 单写者
+                gitop.fetch_base(self.repo_path, self.remote_url,
+                                 self.default_branch, self.ssl_verify)
+                if gitop.has_new_commits_vs_ref(
+                        self.repo_path, iid,
+                        gitop.agent_tracking_ref(self.default_branch)):
+                    gitop.push_fix_branch_resilient(self.repo_path, iid, self.remote_url,
+                                                    self.ssl_verify)
+                    pushed = True
+                else:
+                    self._journal(f"reconcile: issue#{iid} delayed re-push found "
+                                  "no new commits; mark cleared")
         except gitop.PushFailed as exc:
             self._blocked(iid, None, f"评审异常后延迟补推 issue/{iid}-fix 失败，"
                                      f"需要人工处理：{exc}")

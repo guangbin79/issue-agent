@@ -95,6 +95,7 @@ def _new_issue(status: str) -> dict:
         "review_push_pending_at": None,
         "report_probe_pending": False,
         "report_probe_count": 0,
+        "clarify_pending_at": None,  # P2-12 待澄清挂起时间戳
         "agora_task_id": None,
         "agora_status": None,
         "delivery_commit": None,

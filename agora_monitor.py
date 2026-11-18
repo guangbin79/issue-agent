@@ -150,15 +150,18 @@ class AgoraMonitor:
     # ---- 登记簿 ----
 
     def attach_delivery(self, *, repo_path, remote_url, ssl_verify=True,
-                        state_path, ledger_lock):
+                        state_path, ledger_lock, branch_lock=None):
         """交付上下文接线（orchestrator __init__ 调用）：git 交付原语与
         issue 账本。ledger_lock 与回合侧共用——delivery_commit 落账与
-        orchestrator/router 的账本写互斥。"""
+        orchestrator/router 的账本写互斥。branch_lock（P2-10）＝
+        orchestrator 的 per-branch 单写者锁工厂——拨正/交付推送等本地
+        ref 写与 close-push/sweep 互斥；None＝不加锁（测试/单写者场景）。"""
         self._repo_path = repo_path
         self._remote_url = remote_url
         self._ssl_verify = ssl_verify
         self._state_path = state_path
         self._ledger_lock = ledger_lock
+        self._branch_lock = branch_lock
 
     def attach_conversation(self, *, post_note, answer_question,
                             heartbeat_interval=0):
@@ -686,14 +689,22 @@ class AgoraMonitor:
             # delivery sha 恒可解析（ocr 轮2 #1，绝不落 gc-eligible 位）。
             try:
                 branch = gitop.fix_branch(iid)
-                local_tip = gitop.local_branch_tip(self._repo_path, branch)
-                if local_tip and local_tip != handoff and gitop.is_ancestor(
-                        self._repo_path, local_tip, handoff):
-                    gitop.point_branch(self._repo_path, branch, handoff)
-                    self._journal(
-                        f"agora-monitor: issue#{iid} fast-forwarded "
-                        f"{branch} {local_tip[:12]}→{handoff[:12]} "
-                        "(align-rewrite guard precondition)")
+                # P2-10：本地 ref 写与 close-push/sweep 互斥（单写者锁）
+                lock = self._branch_lock(iid) if self._branch_lock else None
+                if lock:
+                    lock.acquire()
+                try:
+                    local_tip = gitop.local_branch_tip(self._repo_path, branch)
+                    if local_tip and local_tip != handoff and gitop.is_ancestor(
+                            self._repo_path, local_tip, handoff):
+                        gitop.point_branch(self._repo_path, branch, handoff)
+                        self._journal(
+                            f"agora-monitor: issue#{iid} fast-forwarded "
+                            f"{branch} {local_tip[:12]}→{handoff[:12]} "
+                            "(align-rewrite guard precondition)")
+                finally:
+                    if lock:
+                        lock.release()
             except gitop.GitopError as exc:
                 self._journal(
                     f"agora-monitor: issue#{iid} guard precondition "

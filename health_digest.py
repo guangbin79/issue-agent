@@ -65,6 +65,7 @@ _NEED, _KNOW, _AUTO = "需要处理", "知悉即可", "无需处理"
 _LEDGER_TERMINAL = frozenset({"done", "paused", "blocked", "defer"})
 _STALL_CLAIM_S = 6 * 3600     # P1：非终态 claimed_at 年龄阈值
 _REVIEW_DEBT_S = 2 * 1800     # P2：review_push_pending_at＝2×缺省宽限
+_CLARIFY_AGE_S = 2 * 86400    # P2-12：goal-gate 待澄清超龄阈值（知悉级）
 _RESTART_SILENCE_S = 30 * 60  # P3：journal 静默窗口（还在说话不许杀）
 # journalctl short 格式行首固定英文月缩写（_journal_text 钉 LC_ALL=C）
 _EN_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -323,6 +324,19 @@ def check_instance(svc, config_root, state_root, now, service_state,
                 stalled |= stale(e.get("review_push_pending_at"), _REVIEW_DEBT_S,
                                  f"{svc}: 欠账滞留 issue {iid} review_push"
                                  " 置位", " 未推——查 daemon reconcile 是否停摆")
+                # P2-12：待澄清超龄（知悉级，不计 stalled——不是健康故障，
+                # 是「等作者回复」被遗忘的可见化）
+                clarify = e.get("clarify_pending_at")
+                if clarify:
+                    ts = _parse_iso(clarify)
+                    age_s = now - ts if ts is not None else _CLARIFY_AGE_S + 1
+                    if age_s > _CLARIFY_AGE_S:
+                        age = (f"{age_s / 86400:.1f} 天" if ts is not None
+                               else "年龄未知")
+                        msg = (f"{svc}: 待澄清超龄 issue #{iid}（{age}）——"
+                               "goal-gate 待作者确认，建议催办或关闭")
+                        emit(f"  - {msg}")
+                        tail_items.append((_KNOW, msg))
     if ledger_unreadable:
         tail_items.append((_NEED, f"{svc}: 账本不可读——检查 {ledger_path}"
                           " 是否损坏，必要时以 .bak 恢复"))
