@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# F114 门审-证据审计（agora-review-audit）：验证 worker 自审档案的真实性
+# 指纹——不重审代码，只审「审过的证据」。零 LLM、零 token。
+#
+# 由 agora 门在任务 env 内执行（AGORA_REVIEW_BASE＝任务起点 base，门注入）。
+# 退出码契约（与 verify/review_cmd 同构）：
+#   0   审计通过——证据存在、晚于被审代码、覆盖全部改动文件
+#   1   审计未过——弹回 worker（附未覆盖清单，重跑评审环自愈）
+#   125 工具自身失败（git 病/参数缺失）——门判「评审器病」路由派发方
+#
+# 三重检查：
+#   ① 证据存在：.review-loop/ 下非锚件、非隐藏的过程文件 ≥1
+#   ② 证据晚于代码：最新证据 mtime ≥ base commit 时间（先有代码才有评审）
+#   ③ 覆盖核对：git diff 的每个改动文件，其文件名（或去扩展名词干，≥5 字符）
+#      必须在某份证据文件里被提到——没看过的文件不会出现在评审笔记里
+set -uo pipefail
+
+base="${AGORA_REVIEW_BASE:-}"
+rl=".review-loop"
+
+fail() { echo "门审-证据审计未过：$*" >&2; exit 1; }
+tool_fail() { echo "门审-证据审计工具失败：$*" >&2; exit 125; }
+
+[ -n "$base" ] || tool_fail "AGORA_REVIEW_BASE 未注入——须经 agora 门审执行"
+git rev-parse --verify -q "$base^{commit}" >/dev/null 2>&1 \
+  || tool_fail "base=$base 本地不可解析（对象缺失）"
+
+# ① 证据存在（锚件与隐藏工具标记不算过程证据）
+evidence=$(find "$rl" -maxdepth 1 -type f ! -name '.*' \
+  ! -name '.last-reviewed' ! -name '.review-base' 2>/dev/null)
+[ -n "$evidence" ] \
+  || fail "评审证据缺失（$rl/ 下无过程文件）——跑评审环后重新 post(done, commit)"
+
+# ② 证据晚于被审代码
+base_ts=$(git show -s --format=%ct "$base" 2>/dev/null) \
+  || tool_fail "git show $base 失败"
+newest=$(stat -c %Y $evidence 2>/dev/null | sort -n | tail -1)
+[ -n "$newest" ] || tool_fail "证据文件 stat 失败"
+[ "$newest" -ge "$base_ts" ] \
+  || fail "评审证据早于代码（mtime $newest < base commit $base_ts）——证据不可能是评审这批代码产出的，重跑评审环"
+
+# ③ 覆盖核对：每个改动文件名须在证据里被提到
+changed=$(git diff --name-only "$base"..HEAD 2>/dev/null) \
+  || tool_fail "git diff $base..HEAD 失败"
+[ -z "$changed" ] && exit 0  # 零 diff＝零需覆盖
+
+missing=()
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  bf=$(basename "$f")
+  if grep -qF -- "$bf" $evidence 2>/dev/null; then
+    continue
+  fi
+  # 容差：证据常以去扩展名词干指涉（「test_mfcfiletransfer 10 场景」）——
+  # 词干 ≥5 字符才接受（防「main」这类短名全匹配）
+  stem="${bf%.*}"
+  if [ "${#stem}" -ge 5 ] && grep -qF -- "$stem" $evidence 2>/dev/null; then
+    continue
+  fi
+  missing+=("$f")
+done <<< "$changed"
+
+if [ "${#missing[@]}" -gt 0 ]; then
+  fail "评审证据未提及改动文件：${missing[*]}——未看过的文件不会出现在评审笔记里；评审证据须逐文件引用（文件名或词干），重跑评审环覆盖全量 diff"
+fi
+
+n_ev=$(echo "$evidence" | wc -l)
+n_ch=$(echo "$changed" | wc -l)
+echo "门审-证据审计（机械层）通过：${n_ev} 份证据覆盖 ${n_ch} 个改动文件"
+
+# ④ LLM 元评审（用户裁定加上）：机械指纹之外，由 LLM 读「diff＋证据」
+# 判自审是否真实与本 diff 交战——拦「提到了文件名但结论注水/答非所问」。
+# 成本＝读几 KB 证据＋截断 diff（对比全量重审 ~1.4M token 低两个量级）。
+# 评审器不可达＝125（门判评审器病路由派发方，不谎报不 fail-open）。
+prompt=$(cat <<PG
+你是评审质量审计员（元评审）。下面是一次代码交付的 diff 与开发者的自审证据。
+判断这份自审是否【真实、认真地与本次 diff 交战】：
+- 敷衍/注水（结论与 diff 内容无关、可套用到任何 diff 的泛泛而谈）→ FAIL
+- 答非所问（证据讨论的是别的改动、别的文件）→ FAIL
+- 与 diff 实质对应（提到具体改动点、具体风险、具体验证）→ PASS
+不要重新审代码本身——只审「这份自审像不像真做过」。
+最后一行必须是：VERDICT: PASS 或 VERDICT: FAIL <一句原因>
+
+---- DIFF（截断）----
+$(git diff "$base"..HEAD | head -c 8000)
+
+---- 自审证据（截断）----
+$(head -c 12000 $evidence)
+PG
+)
+reply=$(cd "$(pwd)" && timeout 300 opencode run   --model "${AGORA_REVIEW_MODEL:-zai-coding-plan/glm-5.3}"   "$prompt" 2>&1) || tool_fail "元评审 opencode run 失败（rc=$?）：$(echo "$reply" | tail -3)"
+verdict=$(echo "$reply" | grep -oE 'VERDICT: (PASS|FAIL)[^"]*' | tail -1)
+case "$verdict" in
+  VERDICT:\ PASS*)
+    echo "门审-证据审计通过：机械指纹＋元评审双绿（$n_ev 份证据，$n_ch 文件，base ${base:0:12}）"
+    exit 0 ;;
+  VERDICT:\ FAIL*)
+    fail "元评审判定自审不实：${verdict#VERDICT: FAIL }——重跑评审环，证据须与本 diff 实质对应" ;;
+  *)
+    tool_fail "元评审无 VERDICT 行（输出异常）：$(echo "$reply" | tail -5)" ;;
+esac

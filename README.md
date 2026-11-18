@@ -80,7 +80,7 @@ cd <project-path> && opencode
 ```
 
 
-- **门审（F114）**：`config.json` 加 `"review_cmd": "<命令>"`（如 `agora-review-gate`）后 restart 生效——每个 agora 任务携 review_cmd 派发，agora 门在 verify 绿后亲自执行（`AGORA_REVIEW_BASE`＝任务起点注入）；退出码非 0 弹回 worker（独立连败，3 次分歧转 blocked 人工判读）；在案时 worker 锚申报面全免。空/缺省＝协议锚路径不变。
+- **门审（F114）**：`config.json` 加 `"review_cmd": "agora-review-audit"` 后 restart 生效——每个 agora 任务携 review_cmd 派发，agora 门在 verify 绿后亲自执行（`AGORA_REVIEW_BASE`＝任务起点注入）。缺省的 `agora-review-audit` 为双层证据审计：①机械层（零 token）——证据存在/晚于代码/diff 文件全覆盖核对；②LLM 元评审（少量 token）——读 diff＋证据判自审真实性（注水/答非所问弹回）。退出码非 0 弹回 worker（独立连败，3 次分歧转 blocked）；125＝评审器病路由派发方。`agora-review-gate`（全量 OCR 重审，~1.4M token/单）保留为高风险抽查。空/缺省＝协议锚路径不变。
 - **有界并行**：`config.json` 加 `"max_parallel": N`（默认 1＝串行；合法域 1..4）后 restart 生效——N 个 worker 消费同一队列，任意时刻 in-flight 回合 ≤N，同一 issue 的多事件仍严格串行（按 issue 锁）。机器负载与模型并发随 N 线性放大，N=2 起步够解排队痛点。
 
 ## agora 模式
