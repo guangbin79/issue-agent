@@ -216,6 +216,13 @@ class AgoraClient:
     def dispatch(self, tid) -> None:
         self._task_call("/task_dispatch", {"task": tid})
 
+    def task_update(self, tid, verify_cmd) -> None:
+        """ag-fb9e5a：verify 命令登记/改写（dispatcher 牌＝建单身份，服务端
+        F2 语义：登记即锁定；worker 角色全局永拒——daemon 代执行正是
+        verify 提案执行回路的授权面）。"""
+        self._task_call("/task_update",
+                        {"task": tid, "verify_cmd": verify_cmd})
+
     def task_nudge(self, tid, body) -> dict:
         """ag-da7410 C：既有 /task_nudge HTTP 面 dispenser 提示注入（服务
         返回 {"nudged": bool, "reason": ...}；body ≤2000 字符服务端校验）。"""

@@ -110,6 +110,7 @@ def default_routes(task="ag-123"):
         ("POST", "/check_mail"): lambda rec: (200, {"messages": [{"id": 1}]}),
         ("POST", "/doctor"): lambda rec: (200, {"models": ["m"]}),
         ("POST", "/task_deliver"): lambda rec: (200, {"task": task, "delivery": {}}),
+        ("POST", "/task_update"): lambda rec: (200, {"ok": True}),
         ("POST", "/task_cancel"): lambda rec: (200, {"ok": True}),
     }
 
@@ -185,6 +186,21 @@ def test_task_cancel_force_wire_shape(tmp_path):
               if r["path"] == "/task_cancel"]
     assert "force" not in bodies[0]
     assert bodies[1]["force"] is True
+
+
+def test_task_update_wire_shape(tmp_path):
+    """ag-fb9e5a：verify 提案执行回路——/task_update 携 dispatcher 牌，
+    body 恰为 {task, verify_cmd}。"""
+    with with_server(default_routes(), tmp_path) as combo:
+        combo.client.task_update("ag-123",
+                                 verify_cmd="HX_TIDY_BASE=0f7b145e "
+                                            "./container/build.sh check")
+    reqs = [r for r in combo.server.requests if r["path"] == "/task_update"]
+    assert len(reqs) == 1
+    assert reqs[0]["token"] == DISPATCHER_TOKEN
+    assert reqs[0]["json"] == {
+        "task": "ag-123",
+        "verify_cmd": "HX_TIDY_BASE=0f7b145e ./container/build.sh check"}
 
 
 def test_dispatcher_token_signed_exactly_once_across_calls(tmp_path):

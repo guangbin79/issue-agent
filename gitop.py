@@ -609,6 +609,12 @@ def is_ancestor(repo: PathLike, ancestor: str, descendant: str) -> bool:
     return proc.returncode == 0
 
 
+def merge_base(repo: PathLike, a: str, b: str) -> str:
+    """两提交（rev 语法皆可）的最近公共祖先 sha（ag-fb9e5a 基线领先
+    判别用；git 失败抛 GitopError 由调用方降级）。"""
+    return _git(repo, ["merge-base", str(a), str(b)]).strip()
+
+
 def point_branch(repo: PathLike, branch: str, to_sha: str):
     """把 refs/heads/<branch> 拨到 to_sha（git branch -f）。
 

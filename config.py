@@ -66,6 +66,11 @@ class Config:
     # F114 门审命令：非空则每个 agora 任务携 review_cmd 派发——门在 verify
     # 绿后亲自执行（AGORA_REVIEW_BASE 注入任务起点）；空＝协议锚路径
     review_cmd: str = ""
+    # ag-fb9e5a 缺陷2：基线领先防护模板——非空且建单基线（target_branch
+    # tip）领先/分叉于 origin/master 时，{BASE} 展开为基线 commit 后作
+    # verify_cmd 前缀（如 "HX_TIDY_BASE={BASE}"），把 check 型门的改动域
+    # 基点钉在基线上，免被基线存量提交污染；空＝不动
+    verify_base_prefix: str = ""
 
     @property
     def note_marker(self) -> str:
@@ -178,6 +183,7 @@ def load_config(path: "str | Path | None" = None) -> Config:
             raw.get("agora_stall_timeout", 1800), "agora_stall_timeout",
             1800, 0),
         review_cmd=str(raw.get("review_cmd", "") or ""),
+        verify_base_prefix=str(raw.get("verify_base_prefix", "") or ""),
     )
     # Canonical-path pin: after all parsing so every pre-existing error
     # contract (missing fields, bad numerics) fires unchanged. Both sides

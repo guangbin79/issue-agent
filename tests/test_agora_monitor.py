@@ -211,6 +211,8 @@ class FakeAgoraClient:
         self.board_task = {"state": "running"}  # relay 回落前的 board 重读面
         self.create_calls = []   # create_task 记账（恢复面断言零建单）
         self.cancel_calls = []   # task_cancel 记账
+        self.task_updates = []   # task_update 记账（ag-fb9e5a 提案执行回路）
+        self.task_update_error = None
         self.check_mail_calls = 0
         # ag-da7410 C：僵态阶梯面——task_nudge/dispatch 记账
         self.nudges = []
@@ -239,6 +241,11 @@ class FakeAgoraClient:
 
     def task_cancel(self, tid):
         self.cancel_calls.append(tid)
+
+    def task_update(self, tid, verify_cmd):
+        self.task_updates.append({"task": tid, "verify_cmd": verify_cmd})
+        if self.task_update_error is not None:
+            raise self.task_update_error
 
     def task_nudge(self, tid, body):
         self.nudges.append({"task": tid, "body": body})
@@ -1161,6 +1168,166 @@ def test_answer_relay_fallback_also_carries_continue_contract(
     body = client.posts[0]["body"]
     assert "自动化答复暂不可用" in body
     assert "不得以回应答案作为回合终局" in body
+
+
+PROPOSAL_CMD = "HX_TIDY_BASE=0f7b145e ./container/build.sh check"
+PROPOSAL_BODY = (
+    "【verify 失败根因＋处置请求】改动域基点取错被基线存量提交污染。\n"
+    f"修法（已验证）：verify_cmd 改为 `{PROPOSAL_CMD}`。\n"
+    "注意：勿改用 --tidy-full。")
+
+
+def test_verify_proposal_question_registers_cmd_and_answers(
+        tmp_path, monkeypatch):
+    """ag-fb9e5a 缺陷1 断言1：含「verify_cmd 改为 X」诉求的 worker
+    question → 以 daemon 建单身份 task_update(tid, verify_cmd=X) ≥1 次，
+    回复 answer 含登记成功结果（不经 Router 文字答复）。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["verify"] = {"cmd": "./container/build.sh check",
+                                   "state": "registered"}
+    client.mail = [mail_msg(5, kind="question", body=PROPOSAL_BODY)]
+    monitor, state_path, _, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    assert client.task_updates == [{"task": TID, "verify_cmd": PROPOSAL_CMD}]
+    assert face.answers == [], "提案走执行回路，不交 Router"
+    assert len(client.posts) == 1
+    posted = client.posts[0]
+    assert posted["kind"] == "answer"
+    assert PROPOSAL_CMD in posted["body"]
+    assert "已按提案登记" in posted["body"]
+    assert "答案送达后必须继续任务直至 post(done) 或 post(kind=question)" \
+        in posted["body"], "提案回执同样携带续作契约行"
+
+
+def test_plain_question_never_calls_task_update(tmp_path, monkeypatch):
+    """ag-fb9e5a 缺陷1 断言2：普通技术提问（无修改诉求）→ task_update
+    零调用，照旧 Router 文字答复。"""
+    client = FakeAgoraClient()
+    client.mail = [mail_msg(3, kind="question", body="测试 X 可以删吗？")]
+    monitor, state_path, _, face = conversation_monitor(
+        tmp_path, monkeypatch, client,
+        face=ConversationFace(answer_text="可以删，它是替身"))
+
+    monitor.poll_once()
+
+    assert client.task_updates == []
+    assert face.answers == [(7, TID, "测试 X 可以删吗？")]
+    assert client.posts[0]["body"].startswith("可以删，它是替身")
+
+
+def test_verify_proposal_idempotent_when_cmd_already_registered(
+        tmp_path, monkeypatch):
+    """ag-fb9e5a 缺陷1 幂等：任务页 verify.cmd 已等于提案命令 → 不重复
+    登记（task_update 零调用），answer 回执现状。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["verify"] = {"cmd": PROPOSAL_CMD,
+                                   "state": "registered"}
+    client.mail = [mail_msg(6, kind="question", body=PROPOSAL_BODY)]
+    monitor, state_path, _, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    assert client.task_updates == []
+    assert len(client.posts) == 1
+    assert "已是提案命令" in client.posts[0]["body"]
+    assert "无需重复登记" in client.posts[0]["body"]
+
+
+def test_verify_proposal_rejected_reports_reason(tmp_path, monkeypatch):
+    """ag-fb9e5a 缺陷1 回执：task_update 被确定性拒（AgoraRejected）→
+    不重放不吞，answer 携失败原因与现状转人工。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["verify"] = {"cmd": "./container/build.sh check",
+                                   "state": "registered"}
+    client.task_update_error = AgoraRejected(
+        "/task_update -> HTTP 403: dispatcher 不得登记（fake）")
+    client.mail = [mail_msg(7, kind="question", body=PROPOSAL_BODY)]
+    monitor, state_path, _, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    assert len(client.task_updates) == 1, "拒绝也要有执行尝试在案"
+    assert len(client.posts) == 1
+    body = client.posts[0]["body"]
+    assert "登记被拒" in body and "403" in body
+    assert "./container/build.sh check" in body, "回执必须带未生效的现状命令"
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] == [], "确定性拒绝不重放"
+
+
+def test_verify_proposal_adoption_gate_only_allows_prefix_pin(
+        tmp_path, monkeypatch):
+    """ag-fb9e5a 缺陷1 采纳门（评审环收紧）：worker 提 `true` 自绿门或
+    非「现状＋NAME=<sha> 前缀」形态 → 不登记（task_update 零调用），
+    answer 事实型回执未采纳原因＋现状保留。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["verify"] = {"cmd": "./container/build.sh check",
+                                   "state": "registered"}
+    client.mail = [
+        mail_msg(8, kind="question", body="verify_cmd 改为 `true` 好了"),
+        mail_msg(9, kind="question",
+                 body="verify_cmd 里可以写 = 号吗？例如 `HX_TIDY_BASE=x "
+                      "./check.sh`"),
+        mail_msg(10, kind="question", body=PROPOSAL_BODY),
+    ]
+    monitor, state_path, _, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()  # 每轮至多答复一个 question（终闸 B-4）
+
+    assert client.task_updates == [], "非判例形态一律不得登记"
+    assert len(client.posts) == 1
+    body = client.posts[0]["body"]
+    assert "未采纳" in body and "./container/build.sh check" in body
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] != [], "其余 question 留 pending 下一轮"
+
+
+def test_verify_proposal_non_dict_verify_field_answers_not_swallows(
+        tmp_path, monkeypatch):
+    """ag-fb9e5a 缺陷1（B 册 warning＋Round2 high）：board verify 载荷
+    契约外形态（非 dict／dict 内 cmd 非 str）不得让异常逃逸成静默吞问
+    ——零答复不重放正是本缺陷要修的僵死形态；必须照常给事实型 answer。"""
+    for bad in ("registered-string", {"cmd": 1234567, "state": "registered"}):
+        client = FakeAgoraClient()
+        client.tasks[TID]["verify"] = bad
+        client.mail = [mail_msg(11, kind="question", body=PROPOSAL_BODY)]
+        monitor, state_path, _, face = conversation_monitor(
+            tmp_path, monkeypatch, client)
+
+        monitor.poll_once()
+
+        assert client.task_updates == []
+        assert len(client.posts) == 1, "必须答复，不得静默消费"
+        assert "未采纳" in client.posts[0]["body"]
+        assert json.loads(
+            Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+        )["pending"] == []
+
+
+def test_verify_proposal_terminal_task_not_executed(tmp_path, monkeypatch):
+    """ag-fb9e5a 缺陷1（C 册 suggestion）：终态任务的提案不执行——
+    僵尸 worker 对已终态任务的改写诉求只回事实型回执，零 task_update。"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "closed"
+    client.tasks[TID]["verify"] = {"cmd": "./container/build.sh check",
+                                   "state": "registered"}
+    client.mail = [mail_msg(12, kind="question", body=PROPOSAL_BODY)]
+    monitor, state_path, _, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    assert client.task_updates == []
+    assert len(client.posts) == 1
+    assert "已终态" in client.posts[0]["body"]
 
 
 def test_worker_answer_relayed_to_issue_thread(tmp_path, monkeypatch):

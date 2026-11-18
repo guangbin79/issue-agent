@@ -266,6 +266,7 @@ def main(argv=None) -> int:
         sweep_interval=config.sweep_interval,
         max_parallel=config.max_parallel,
         review_cmd=config.review_cmd,  # F114 门审全量接线
+        verify_base_prefix=config.verify_base_prefix,  # ag-fb9e5a 基线领先防护
         callback_url=config.callback_url,
         worktree_path=config.worktree_path,
         agora_client=agora_client,

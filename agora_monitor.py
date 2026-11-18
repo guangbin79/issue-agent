@@ -52,6 +52,37 @@ from agora_client import AgoraProtocolError, AgoraRejected, AgoraUnavailable
 
 _HEX40_OK = re.compile(r"[0-9a-f]{40}")
 
+# ag-fb9e5a 缺陷1：worker verify 提案保守识别——消息须同时含「verify_cmd」
+# 字样＋修改诉求（改为/更新为等诉求词，或紧邻的等号）＋一条反引号包裹
+# 的命令原文（判例形态：「verify_cmd 改为 `CMD`」与「verify_cmd=`CMD`」）。
+# 宁可漏判走 Router 文字答复，禁过度智能。
+_VERIFY_PROPOSAL_RE = re.compile(
+    r"verify_cmd[^\n`]{0,60}?"
+    r"(?:改为|改成|换为|换成|更新为|设为|登记为|调整为|=|＝)"
+    r"[^\n`]{0,12}?`([^`\n]{3,})`")
+
+
+def _parse_verify_proposal(body):
+    """worker 提问正文 -> 提案命令原文；识别不了返回 None（照旧 Router）。"""
+    if not isinstance(body, str):
+        return None
+    match = _VERIFY_PROPOSAL_RE.search(body)
+    if match is None:
+        return None
+    cmd = match.group(1).strip()
+    return cmd or None
+
+
+# 采纳门（评审环收紧）：自动登记只放行「一个或多个 NAME=<sha>（7-40 位
+# hex，git 短/长 sha）环境变量前缀＋与面板现状完全一致的命令原文」——即
+# ag-fb9e5a 判例形态（HX_TIDY_BASE=<sha> <现状命令>）；现状为空＝不放行。
+def _verify_adoptable(cmd, current):
+    if not current:
+        return False
+    return re.fullmatch(
+        rf"(?:[A-Za-z_][A-Za-z0-9_]*=[0-9a-f]{{7,40}} )+{re.escape(current)}",
+        cmd) is not None
+
 # ag-da7410 B：daemon relay 答案（post answer）下行正文固定追加的续作
 # 契约行——答案送达≠回合终局（ag-895c11 旧2 实证：worker「回应即收工」
 # 7 小时考古）。对真实答复与事实型兜底答复一体生效。
@@ -1079,20 +1110,29 @@ class AgoraMonitor:
     def _handle_worker_question(self, iid, tid, body):
         """worker 提问 → 答复回调（orchestrator 在 ledger_lock 内交
         Router，T3 锁序）→ post(answer)。回调故障给事实型兜底答复，不
-        虚构、不静默吞问题（worker 不能无限等待）。"""
-        if self._answer_question is None:
-            self._journal(f"agora-monitor: worker question for {tid} "
-                          "dropped (no conversation face)")
-            return
-        answer = None
-        try:
-            answer = self._answer_question(iid, tid, body)
-        except Exception as exc:
-            self._journal(f"agora-monitor: answer callback failed for "
-                          f"{tid}: {exc!r}")
-        if not answer:
-            answer = (f"自动化答复暂不可用，需要人工在 Gitea issue#{iid} "
-                      f"跟进。worker 原问题（任务 {tid}）：{body}")
+        虚构、不静默吞问题（worker 不能无限等待）。
+
+        ag-fb9e5a 缺陷1：先走 verify 提案执行回路——保守识别出
+        「verify_cmd 改为 X」诉求时以 daemon 建单身份直接 task_update
+        登记，登记结果作为 answer 闭环（此前 daemon 只会文字答复，全库
+        无 task_update 执行面，任务僵死 4.5h）；识别不了照旧 Router。"""
+        proposal = _parse_verify_proposal(body)
+        if proposal is not None:
+            answer = self._execute_verify_proposal(tid, proposal)
+        else:
+            if self._answer_question is None:
+                self._journal(f"agora-monitor: worker question for {tid} "
+                              "dropped (no conversation face)")
+                return
+            answer = None
+            try:
+                answer = self._answer_question(iid, tid, body)
+            except Exception as exc:
+                self._journal(f"agora-monitor: answer callback failed for "
+                              f"{tid}: {exc!r}")
+            if not answer:
+                answer = (f"自动化答复暂不可用，需要人工在 Gitea issue#{iid} "
+                          f"跟进。worker 原问题（任务 {tid}）：{body}")
         answer = f"{answer}\n\n{ANSWER_CONTINUE_CONTRACT}"
         try:
             self._client.post(tid, "answer", answer)
@@ -1104,6 +1144,61 @@ class AgoraMonitor:
         except AgoraRejected as exc:
             self._journal(f"agora-monitor: answer post rejected for {tid}, "
                           f"dropped (deterministic): {exc}")
+
+    def _execute_verify_proposal(self, tid, cmd):
+        """ag-fb9e5a 缺陷1：verify 提案执行——board 幂等对账（任务页
+        verify.cmd 已等于提案命令则不重复登记，直接回执现状）→
+        采纳门（只放行「现状命令＋NAME=hex 基线前缀」形态，见
+        _VERIFY_ADOPT_RE）→ task_update(task, verify_cmd=cmd) → 结果文本
+        （成功/失败原因/未采纳原因）交调用方作为 answer 回 worker 闭环。
+        board/task_update 瞬断抛 _MailDeferred 留 pending 重放（重放先过
+        幂等对账，不双登记）。
+
+        采纳口径（评审环收紧，ocr/B 册判例）：仓库恒界＝验收命令只出自
+        实例可信配置（Router 七键硬过滤同理）——worker 提案仅在「给现
+        状命令加基线钉前缀」这一判例形态（HX_TIDY_BASE=<sha> …，ag-
+        fb9e5a）时自动采纳，防 worker 提 `true` 自绿门/提问误判改写；
+        其余形态不采纳、事实型回执转人工。"""
+        try:
+            task = self._board_task(tid)
+        except AgoraRejected as exc:
+            # 确定性 4xx：不再执行，事实型回执转人工
+            return (f"verify 提案未登记：任务面板读取被拒（{exc}），"
+                    "请人工在 issue 跟进。")
+        except (AgoraUnavailable, AgoraProtocolError) as exc:
+            raise _MailDeferred(f"proposal board read transient for "
+                                f"{tid}: {exc}") from exc
+        if task.get("state") in _TERMINAL_STATES:
+            return (f"verify 提案未登记：任务已终态"
+                    f"（{task.get('state')}），提案不再执行——请人工在 "
+                    "issue 跟进。")
+        verify = task.get("verify")
+        # B 册＋Round2：verify 载荷契约外形态（非 dict／cmd 非 str）不得让
+        # 异常逃逸——那是静默吞问题（零答复不重放），恰是本缺陷要修的僵死
+        # 形态；契约外一律按现状为空走未采纳回执
+        value = verify.get("cmd") if isinstance(verify, dict) else None
+        current = value.strip() if isinstance(value, str) else ""
+        if current == cmd:
+            return (f"verify_cmd 已是提案命令，无需重复登记（幂等现状）：\n"
+                    f"{cmd}")
+        if not _verify_adoptable(cmd, current):
+            return (f"verify 提案未采纳：自动登记只放行「现状命令＋"
+                    f"NAME=<sha> 基线前缀」形态（如 HX_TIDY_BASE=<sha> "
+                    f"命令原文），提案不满足。现状命令保留不变："
+                    f"{current or '（无）'}——需要其他改写请人工在 issue "
+                    "确认。")
+        try:
+            self._client.task_update(tid, verify_cmd=cmd)
+        except AgoraRejected as exc:
+            return (f"verify 提案登记被拒：{exc}\n命令未生效，现状仍为："
+                    f"{current or '（无）'}——请人工在 issue 跟进。")
+        except (AgoraUnavailable, AgoraProtocolError) as exc:
+            raise _MailDeferred(f"proposal task_update transient for "
+                                f"{tid}: {exc}") from exc
+        self._journal(f"agora-monitor: verify proposal registered for "
+                      f"{tid}: {cmd}")
+        return (f"verify_cmd 已按提案登记：\n{cmd}\n"
+                "请按新命令重新走验收（post(done)）。")
 
     def _handle_result_mail(self, iid, tid, body):
         """生命周期迁移回传（agorad notify_transition：终态与 blocked 实时

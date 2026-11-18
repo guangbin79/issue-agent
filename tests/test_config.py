@@ -315,6 +315,16 @@ def test_agora_mode_full_config_loads(tmp_path):
     assert cfg.agora_poll_interval == 5
 
 
+def test_verify_base_prefix_default_empty_and_parses(tmp_path):
+    """ag-fb9e5a 缺陷2：verify_base_prefix 可选键——缺省 ""（不动），
+    配置后原样透传（模板展开归 orchestrator）。"""
+    cfg = config.load_config(write_config(tmp_path))
+    assert cfg.verify_base_prefix == ""
+    cfg = config.load_config(
+        write_config(tmp_path, verify_base_prefix="HX_TIDY_BASE={BASE}"))
+    assert cfg.verify_base_prefix == "HX_TIDY_BASE={BASE}"
+
+
 def test_agora_home_falls_back_to_env_then_file_wins(tmp_path, monkeypatch):
     """缺省回落 $AGORA_HOME 再 ""；文件值非空时压过环境变量。"""
     monkeypatch.setenv("AGORA_HOME", "/tmp/opencode/plaza-env")

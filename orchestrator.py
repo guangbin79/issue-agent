@@ -215,6 +215,7 @@ class Orchestrator:
                  sweep_interval: int = DEFAULT_SWEEP_INTERVAL_S,
                  max_parallel: int = 1,
                  review_cmd: str = "",
+                 verify_base_prefix: str = "",
                  callback_url: str = "",
                  worktree_path: str = "",
                  teardown: Optional[Callable[[], None]] = None,
@@ -249,6 +250,9 @@ class Orchestrator:
         self.reconcile_interval = reconcile_interval
         # F114 门审命令（config.review_cmd 透传；空＝协议锚路径）
         self.review_cmd = review_cmd
+        # ag-fb9e5a 缺陷2：基线领先防护模板（config.verify_base_prefix
+        # 透传；空＝不动，_verify_base_guard 消费）
+        self.verify_base_prefix = verify_base_prefix
         self.opencode_timeout = opencode_timeout
         self.review_enabled = review_enabled
         self.review_timeout = review_timeout
@@ -928,7 +932,9 @@ class Orchestrator:
                     goal=decision.goal,
                     project_dir=self.repo_path,
                     target_branch=gitop.fix_branch(iid),
-                    verify_cmd=self._round_verify_cmd(decision, branch_tip),
+                    verify_cmd=self._verify_base_guard(
+                        self._round_verify_cmd(decision, branch_tip),
+                        branch_tip),
                     verify_base_exempt=(True if decision.deliverable_hint
                                         == "out_of_band" else None),
                     model=decision.model,
@@ -1373,6 +1379,37 @@ class Orchestrator:
             return self.verify_command
         return (f'test "$(git rev-list --count {branch_tip}..HEAD)"'
                 f' -ge 1 && {self.verify_command}')
+
+    def _verify_base_guard(self, verify_cmd, branch_tip):
+        """ag-fb9e5a 缺陷2：建单基线领先防护——env 基线（target_branch
+        tip）含 origin/master 之外的存量提交（上轮交付/他人提交落在 fix
+        分支）时，check 型门的改动域基点 merge-base(HEAD, origin/master)
+        低于基线，diff 被基线存量提交污染而必红。已配置 verify_base_prefix
+        模板且基线领先/分叉（merge-base(基线, agent-remote/<default>) !=
+        基线——基线有 master 之外的提交）→ {BASE}=基线 commit 展开后作
+        前缀建单；未配置/不领先/已带前缀/git 失败 → 原样（降级＋日志，
+        不阻塞建单）。
+
+        shortcut: 判别取 daemon 侧 agent-remote/<default>（fetch_base 刚
+        刷的 master 权威位）而非 env 内 origin/master 快照——env 侧 ref
+        更旧的残余偏差由此兜住；要彻底消除需 env 建后 ref 对账，另案。
+        """
+        if not self.verify_base_prefix:
+            return verify_cmd
+        prefix = self.verify_base_prefix.replace("{BASE}", branch_tip)
+        if prefix in verify_cmd:
+            return verify_cmd
+        try:
+            mb = gitop.merge_base(
+                self.repo_path, branch_tip,
+                gitop.agent_tracking_ref(self.default_branch))
+        except gitop.GitopError as exc:
+            self._journal(f"turn: verify base guard git failed, "
+                          f"verify_cmd unchanged: {exc}")
+            return verify_cmd
+        if mb != branch_tip:
+            return f"{prefix} {verify_cmd}"
+        return verify_cmd
 
     def _agora_create(self, iid, payload):
         """client_key 幂等建单＋超时恢复：create 成功但客户端超时

@@ -1167,6 +1167,16 @@ def test_is_ancestor_directionality(repo, remote_url):
     assert is_ancestor(repo, descendant, tip) is False
 
 
+def test_merge_base_identity_and_ancestor(repo, remote_url):
+    """ag-fb9e5a 基线领先判别原语：merge_base 公共祖先——相等提交返回
+    自身（不领先），祖先对的公共祖先＝祖先位（领先/分叉时 != 基线）。"""
+    tip = git("rev-parse", "HEAD", cwd=repo)
+    assert gitop.merge_base(repo, tip, tip) == tip
+    descendant = commit_file(repo, "mb-descendant.txt", "d\n", "descendant")
+    assert gitop.merge_base(repo, descendant, tip) == tip
+    assert gitop.merge_base(repo, descendant, tip) != descendant
+
+
 # --- agora external delivery: push_verified_commit / fetch_fix_branch_tip ----
 
 

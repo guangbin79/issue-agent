@@ -258,6 +258,10 @@ class FakeGitop:
         # agora 开发分支准备 seam（Task 3）
         self.ensure_calls = []      # (repo, iid, default_branch)
         self.ensure_error = None
+        # ag-fb9e5a 基线领先防护 seam：merge_base 结果（None＝真 git）
+        self.merge_base_calls = []  # (repo, tip, tracking_ref)
+        self.merge_base_result = None
+        self.merge_base_error = None
 
     def fake_fetch(self, repo, remote_url, default_branch="master", ssl_verify=True):
         self.fetch_calls.append((repo, remote_url, default_branch))
@@ -303,6 +307,12 @@ class FakeGitop:
         if self.ensure_error is not None:
             raise self.ensure_error
         return "0" * 40
+
+    def fake_merge_base(self, repo, tip, tracking_ref):
+        self.merge_base_calls.append((repo, tip, tracking_ref))
+        if self.merge_base_error is not None:
+            raise self.merge_base_error
+        return self.merge_base_result
 
 
 def agora_decision(action="dispatch", **overrides):
@@ -535,6 +545,7 @@ class Harness:
         monkeypatch.setattr(gitop, "knowledge_changes_present", self.gitop.fake_knowledge_changes)
         monkeypatch.setattr(gitop, "fix_branch_pushed", self.gitop.fake_fix_branch_pushed)
         monkeypatch.setattr(gitop, "ensure_fix_branch", self.gitop.fake_ensure_fix_branch)
+        monkeypatch.setattr(gitop, "merge_base", self.gitop.fake_merge_base)
         monkeypatch.setattr(runner, "export_last_report", self.runner.fake_export)
         # spy on the REAL git runner: with all five turn seams faked above,
         # anything still reaching _run is a git op the turn must not do
@@ -2870,6 +2881,79 @@ def test_out_of_band_round_gets_base_exempt_and_plain_verify(
         assert call["deliverable"] == "out_of_band"
         assert call["verify_cmd"] == h.orch.verify_command
         assert call["verify_base_exempt"] is True
+    finally:
+        h.orch.stop()
+
+
+def test_verify_base_prefix_prepended_when_baseline_ahead(
+        tmp_path, monkeypatch):
+    """ag-fb9e5a 缺陷2 断言3a：配置 verify_base_prefix 且基线领先/分叉
+    （merge-base(基线, agent-remote/<default>) != 基线）→ {BASE}=基线
+    commit 展开后作 verify_cmd 前缀建单。"""
+    client = FakeAgoraClient()
+    monitor = FakeMonitor()
+    h = agora_harness(tmp_path, monkeypatch, client=client, monitor=monitor,
+                      verify_base_prefix="HX_TIDY_BASE={BASE}")
+    h.gitop.merge_base_result = "f" * 40  # != 基线 tip → 领先/分叉
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        tip = "0" * 40
+        assert h.gitop.merge_base_calls == [
+            (h.repo_path, tip, "refs/remotes/agent-remote/master")]
+        assert client.create_calls[0]["verify_cmd"] == (
+            f"HX_TIDY_BASE={tip} "
+            f'test "$(git rev-list --count {tip}..HEAD)" -ge 1'
+            f" && {h.orch.verify_command}")
+    finally:
+        h.orch.stop()
+
+
+def test_verify_base_prefix_omitted_when_not_ahead_or_unset(
+        tmp_path, monkeypatch):
+    """ag-fb9e5a 缺陷2 断言3b/3c：基线不领先（merge-base==基线）或未配置
+    verify_base_prefix → verify_cmd 原样；未配置时连 git 判别都不做。"""
+    # 3b：配置了但不领先 → 原样（判别照跑）
+    client = FakeAgoraClient()
+    h = agora_harness(tmp_path, monkeypatch, client=client,
+                      verify_base_prefix="HX_TIDY_BASE={BASE}")
+    h.gitop.merge_base_result = "0" * 40  # == 基线 tip → 不领先
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        tip = "0" * 40
+        assert h.gitop.merge_base_calls, "已配置时判别必须执行"
+        assert client.create_calls[0]["verify_cmd"] == (
+            f'test "$(git rev-list --count {tip}..HEAD)" -ge 1'
+            f" && {h.orch.verify_command}")
+    finally:
+        h.orch.stop()
+    # 3c：未配置 → 原样且零 git 判别
+    client2 = FakeAgoraClient()
+    h2 = agora_harness(tmp_path, monkeypatch, client=client2)
+    try:
+        h2.listener.queue.put(issue_open_event(iid=8))
+        assert wait_until(lambda: turn_finalized(h2, 8)), h2.journal_msgs
+        assert h2.gitop.merge_base_calls == []
+        assert "HX_TIDY_BASE" not in client2.create_calls[0]["verify_cmd"]
+    finally:
+        h2.orch.stop()
+
+
+def test_verify_base_prefix_git_failure_degrades_to_plain(
+        tmp_path, monkeypatch):
+    """ag-fb9e5a 缺陷2 降级：git 判别失败 → verify_cmd 原样＋journal，
+    不阻塞建单。"""
+    client = FakeAgoraClient()
+    h = agora_harness(tmp_path, monkeypatch, client=client,
+                      verify_base_prefix="HX_TIDY_BASE={BASE}")
+    h.gitop.merge_base_error = gitop.GitopError("merge-base failed (fake)")
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+        assert client.create_calls, "降级不得阻塞建单"
+        assert "HX_TIDY_BASE" not in client.create_calls[0]["verify_cmd"]
+        assert h.journal("verify base guard git failed"), h.journal_msgs
     finally:
         h.orch.stop()
 
