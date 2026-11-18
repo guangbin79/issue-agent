@@ -458,6 +458,9 @@ class FakeMonitor:
     def attach_conversation(self, **kwargs):
         self.conversation = kwargs
 
+    def attach_slot_callback(self, callback):
+        self.slot_callback = callback
+
     def active_task(self, iid):
         return self._active.get(int(iid))
 

@@ -287,3 +287,39 @@ def claim_timeout_recycle(path: PathLike, now, timeout_s: int = DEFAULT_CLAIM_TI
     if recycled:
         save_state(path, state)
     return recycled
+
+
+def recycle_parked_dispatch(path: PathLike, limit=1, min_age_s=120, now=None,
+                            exclude=None) -> list:
+    """Slot-freed 补位（ag-6f53fa）：回收 parked 单（pending＋agora_pending＋无
+    agora_task_id 且 claim 年龄超 *min_age_s* 宽限窗；claimed_at 缺失/坏按已过期，
+    镜像 claim_timeout_recycle），最老优先取 *limit* 个迁 defer/claimed_at=None
+    （defer_count 不动——停靠非失败）。*exclude*＝在案活回合（持 reserve）。"""
+    path = os.fspath(path)
+    state = load_state(path)
+    now_dt = _parse_ts(_to_iso(
+        now if now is not None else datetime.now(timezone.utc)))
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    skip = {int(i) for i in (exclude or ())}
+    candidates = []
+    for iid, entry in state["issues"].items():
+        if (entry["status"] != "pending" or not entry.get("agora_pending")
+                or entry.get("agora_task_id")
+                or int(iid) in skip):
+            continue
+        try:
+            claimed = _parse_ts(entry["claimed_at"])
+            stale = (now_dt - claimed).total_seconds() > min_age_s
+        except (TypeError, ValueError, AttributeError):
+            claimed, stale = epoch, True  # 缺失/坏 claim 时间按已过期
+        if stale:
+            candidates.append((claimed, iid))
+    candidates.sort()
+    recycled = [iid for _, iid in candidates[:max(0, int(limit))]]
+    for iid in recycled:
+        entry = state["issues"][iid]
+        entry["status"] = "defer"
+        entry["claimed_at"] = None  # defer_count 不动：停靠不是失败
+    if recycled:
+        save_state(path, state)
+    return recycled

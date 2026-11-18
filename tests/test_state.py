@@ -16,6 +16,7 @@ from state import (
     is_note_processed,
     load_state,
     mark_processed,
+    recycle_parked_dispatch,
     save_state,
 )
 
@@ -164,6 +165,58 @@ def test_claim_timeout_recycle_moves_stale_claims_to_defer(tmp_path):
     assert final["issues"]["31"]["defer_count"] == 1
     assert final["issues"]["32"]["status"] == "pending"
     assert final["issues"]["33"]["status"] == "active"
+
+
+def test_recycle_parked_dispatch_picks_oldest_parked_only(tmp_path):
+    path = tmp_path / "state.json"
+    state = {"issues": {}}
+    adopt_existing(state, {41: [1], 42: [1], 43: [1], 44: [1], 45: [1]})
+    save_state(path, state)
+    t0 = datetime.fromisoformat(T0)
+    claim(path, 41, T0)  # parked 最老 → 本次回收
+    claim(path, 42, (t0 + timedelta(seconds=60)).isoformat())  # parked 次之
+    claim(path, 43, (t0 + timedelta(seconds=240)).isoformat())  # 宽限窗内
+    claim(path, 44, (t0 + timedelta(seconds=60)).isoformat())  # 在派发，非 parked
+    state = load_state(path)
+    for iid in (41, 42, 43):
+        state["issues"][str(iid)]["agora_pending"] = True
+    state["issues"]["44"]["agora_pending"] = True  # 已在派发：不属 parked
+    state["issues"]["44"]["agora_task_id"] = "ag-run"
+    state["issues"]["45"]["status"] = "defer"
+    save_state(path, state)
+    now = (t0 + timedelta(seconds=300)).isoformat()  # 41/42 超 120s 宽限
+
+    recycled = recycle_parked_dispatch(path, limit=1, now=now)
+
+    assert recycled == ["41"]
+    final = load_state(path)
+    assert final["issues"]["41"]["status"] == "defer"
+    assert final["issues"]["41"]["claimed_at"] is None
+    assert final["issues"]["41"]["defer_count"] == 0  # 停靠不是失败
+    assert final["issues"]["42"]["status"] == "pending"
+    assert final["issues"]["43"]["status"] == "pending"  # 宽限窗内跳过
+    assert final["issues"]["44"]["status"] == "pending"  # 有 task_id 跳过
+    assert final["issues"]["45"]["status"] == "defer"
+
+
+def test_recycle_parked_dispatch_skips_live_reserved(tmp_path):
+    path = tmp_path / "state.json"
+    state = {"issues": {}}
+    adopt_existing(state, {46: [1], 47: [1]})
+    save_state(path, state)
+    t0 = datetime.fromisoformat(T0)
+    claim(path, 46, T0)
+    claim(path, 47, T0)
+    state = load_state(path)
+    for iid in (46, 47):
+        state["issues"][str(iid)]["agora_pending"] = True
+    save_state(path, state)
+
+    recycled = recycle_parked_dispatch(
+        path, exclude={46}, now=(t0 + timedelta(seconds=300)).isoformat())
+
+    assert recycled == ["47"]
+    assert load_state(path)["issues"]["46"]["status"] == "pending"
 
 
 def test_load_normalizes_derived_fields(tmp_path):

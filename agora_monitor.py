@@ -171,6 +171,8 @@ class AgoraMonitor:
         self._hb_interval = 0
         self._hb = {}  # iid -> {"start","last","status"}（_guard 保护）
         self._questions_this_drain = 0  # 每轮 drain 的 LLM 答复预算（B-4）
+        self._released = 0  # ag-6f53fa：release 归还计数（_guard 保护）
+        self._on_release = None
         # ag-1c7315（评审 R1）：处置路径（worker 线程）与轮询（poll 线程）
         # 首次出现跨线程并发面——reports sidecar 写者互斥＋per-issue 对账串行
         self._store_lock = threading.Lock()
@@ -204,6 +206,10 @@ class AgoraMonitor:
         self._post_note = post_note
         self._answer_question = answer_question
         self._hb_interval = max(0, int(heartbeat_interval))
+
+    def attach_slot_callback(self, callback):
+        """名额释放接线（ag-6f53fa，orchestrator __init__ 调用）：轮末交归还数。"""
+        self._on_release = callback
 
     def active_task(self, iid):
         """持续对话门控（计划 Task 5，T4-B1 根修）：登记在案且未释放的
@@ -263,6 +269,7 @@ class AgoraMonitor:
                 return  # 登记已让位给更新任务
             del self._active[key]
             self._hb.pop(key, None)  # 心跳随名额 lifecycle 收口
+            self._released += 1  # ag-6f53fa：轮末触发 slot-freed 补位
 
     def tasks(self) -> list:
         """[(iid, tid|None)] 快照（升序）；tid=None 是 reserve 占位（回合
@@ -312,6 +319,14 @@ class AgoraMonitor:
                 self._journal(f"agora-monitor: issue#{iid} task {tid} poll "
                               f"failed: {exc!r}")
         self._heartbeat_tick()
+        with self._guard:  # ag-6f53fa：轮末原子读清本轮释放数
+            released = self._released
+            self._released = 0
+        if released and self._on_release is not None:
+            try:
+                self._on_release(released)
+            except Exception as exc:  # 回调病不得拖垮监视线程
+                self._journal(f"agora-monitor: on_release failed: {exc!r}")
 
     def _reconcile_task(self, iid, tid):
         """ag-1c7315：整段对账持 per-issue 串行锁（见 _iid_reconcile_lock）

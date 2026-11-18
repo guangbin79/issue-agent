@@ -314,6 +314,7 @@ class Orchestrator:
                 post_note=self._post_note,
                 answer_question=self._answer_worker_question,
                 heartbeat_interval=self.heartbeat_interval)
+            self.agora_monitor.attach_slot_callback(self._on_slots_freed)
         # bounded turn slots + per-issue locks replace the historical process-
         # wide turn lock: at most max_parallel turns in flight, and a given
         # issue's turns never overlap (same-issue events queue behind the lock).
@@ -1454,6 +1455,19 @@ class Orchestrator:
             issues[key]["agora_pending"] = True
             state.save_state(self.state_path, ledger)
         self._journal(f"turn: issue#{iid} kept pending for dispatch ({why})")
+
+    def _on_slots_freed(self, count):
+        """slot-freed 补位（ag-6f53fa）：monitor 轮末释放回调——回收等量
+        parked 单 requeue。exclude＝在案活回合（宽限窗盖不住慢 git/create）。"""
+        if self.agora_monitor is None:
+            return
+        live = {iid for iid, _tid in self.agora_monitor.tasks()}
+        with self._ledger_lock:  # recycle 自带 load→mutate→save：不得绕锁
+            recycled = state.recycle_parked_dispatch(
+                self.state_path, count, exclude=live)
+        for iid in recycled:
+            self._journal(f"slot-freed: requeue parked issue#{iid}")
+            self.queue.put({_REQUEUE: int(iid), "reason": "slot-freed"})
 
     def _agora_out_of_band(self, iid, decision):
         """Router 不建单处置（ag-da7410 A 起 action=answer 同归）：answer＝

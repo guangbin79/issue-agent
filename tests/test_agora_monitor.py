@@ -123,6 +123,33 @@ def test_poll_once_skips_reserved_placeholder_without_tid():
     assert monitor._client.calls == []
 
 
+def test_release_fires_on_release_callback_once_per_poll():
+    """ag-6f53fa：release 后 poll 轮末一次性触发回调（携归还数）并清零。"""
+    monitor = make_monitor()
+    monitor.reserve(7)
+    monitor.register(7, "ag-1")
+    monitor.release(7, "ag-1")
+    calls = []
+    monitor.attach_slot_callback(calls.append)
+    monitor.poll_once()
+    assert calls == [1]
+    monitor.poll_once()
+    assert calls == [1], "释放计数已清零，不得重复触发"
+
+
+def test_on_release_callback_exception_does_not_kill_poll():
+    """ag-6f53fa：on_release 回调病只 journal，poll_once 不外抛。"""
+    journal = []
+    monitor = make_monitor(journal=journal.append)
+    monitor.reserve(7)
+    monitor.register(7, "ag-1")
+    monitor.release(7, "ag-1")
+    monitor.attach_slot_callback(lambda count: 1 / 0)  # 病回调
+
+    monitor.poll_once()  # 不得抛出
+    assert any("on_release failed" in m for m in journal)
+
+
 # --- start/stop 生命周期 --------------------------------------------------------
 
 
