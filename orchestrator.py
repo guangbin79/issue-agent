@@ -214,6 +214,7 @@ class Orchestrator:
                  heartbeat_interval: int = DEFAULT_HEARTBEAT_INTERVAL_S,
                  sweep_interval: int = DEFAULT_SWEEP_INTERVAL_S,
                  max_parallel: int = 1,
+                 review_cmd: str = "",
                  callback_url: str = "",
                  worktree_path: str = "",
                  teardown: Optional[Callable[[], None]] = None,
@@ -246,6 +247,8 @@ class Orchestrator:
         self.service_name = service_name
         self.verify_command = verify_command or DEFAULT_VERIFY_COMMAND
         self.reconcile_interval = reconcile_interval
+        # F114 门审命令（config.review_cmd 透传；空＝协议锚路径）
+        self.review_cmd = review_cmd
         self.opencode_timeout = opencode_timeout
         self.review_enabled = review_enabled
         self.review_timeout = review_timeout
@@ -933,6 +936,7 @@ class Orchestrator:
                     # review-only 任务（done body=结论文本），代码修复类
                     # external_branch 缺省不动。
                     deliverable=decision.deliverable_hint or "external_branch",
+                    review_cmd=(self.review_cmd or None),  # F114 门审全量接线
                     # 看板可辨 issue：确定性拼前缀，不依赖 Router LLM 自觉
                     title=f"issue#{iid}: {decision.title}"[:40],
                     client_key=f"{self.service_name}:issue-{iid}:note-{note_id or 0}",

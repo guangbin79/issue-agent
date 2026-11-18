@@ -366,17 +366,20 @@ class FakeAgoraClient:
     def _execution_payload(kwargs):
         return {key: kwargs.get(key) for key in
                 ("goal", "project_dir", "target_branch", "verify_cmd",
-                 "model", "deliverable", "verify_base_exempt")}
+                 "model", "deliverable", "verify_base_exempt",
+                 "review_cmd")}  # F114 幂等载荷比对键
 
     def create_task(self, *, goal, project_dir, target_branch, verify_cmd,
                     model, title, client_key, deliverable="external_branch",
-                    after=None, verify_base_exempt=None):
+                    after=None, verify_base_exempt=None, review_cmd=None):
         call = dict(goal=goal, project_dir=project_dir,
                     target_branch=target_branch, verify_cmd=verify_cmd,
                     model=model, title=title, client_key=client_key,
                     deliverable=deliverable)
         if after is not None:  # 同真实客户端：None 不含键（wire 形状）
             call["after"] = after
+        if review_cmd:  # F114 门审：非空才入 wire（同真实客户端）
+            call["review_cmd"] = review_cmd
         if verify_base_exempt is not None:  # 同真实客户端：None 不含键
             call["verify_base_exempt"] = verify_base_exempt
         self.create_calls.append(call)

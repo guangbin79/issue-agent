@@ -265,6 +265,7 @@ def main(argv=None) -> int:
         heartbeat_interval=config.heartbeat_interval,
         sweep_interval=config.sweep_interval,
         max_parallel=config.max_parallel,
+        review_cmd=config.review_cmd,  # F114 门审全量接线
         callback_url=config.callback_url,
         worktree_path=config.worktree_path,
         agora_client=agora_client,

@@ -63,6 +63,9 @@ class Config:
     # ag-da7410 C：僵态升级阶梯阈值（秒）——running 任务板面零活动超此值
     # 触发 nudge×2→自动重派一次→blocked；0＝关闸
     agora_stall_timeout: int = 1800
+    # F114 门审命令：非空则每个 agora 任务携 review_cmd 派发——门在 verify
+    # 绿后亲自执行（AGORA_REVIEW_BASE 注入任务起点）；空＝协议锚路径
+    review_cmd: str = ""
 
     @property
     def note_marker(self) -> str:
@@ -174,6 +177,7 @@ def load_config(path: "str | Path | None" = None) -> Config:
         agora_stall_timeout=_bounded_int(
             raw.get("agora_stall_timeout", 1800), "agora_stall_timeout",
             1800, 0),
+        review_cmd=str(raw.get("review_cmd", "") or ""),
     )
     # Canonical-path pin: after all parsing so every pre-existing error
     # contract (missing fields, bad numerics) fires unchanged. Both sides
