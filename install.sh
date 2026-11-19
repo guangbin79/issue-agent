@@ -227,6 +227,24 @@ env_over_json() { # env_over_json <env_var> <json_value> <field>
   fi
 }
 
+# GUI 虚拟屏依赖（worker 协议 GUI 验证：Xvfb 虚拟屏 + xdotool 输入注入 +
+# import 截图 + llvmpipe GL / EGL 软渲染）。apt 安装幂等；dpkg 报五包齐装时
+# 零副作用跳过（离线测试沙箱同 PATH 复用系统包面，不触发 sudo）。
+ensure_gui_deps() {
+  local pkgs="xvfb xdotool imagemagick libgl1-mesa-dri libegl-mesa0" pkg ok=1
+  for pkg in $pkgs; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' || ok=0
+  done
+  [ "$ok" = "1" ] && return 0
+  note "安装 GUI 虚拟屏测试依赖：${pkgs}"
+  if command -v sudo >/dev/null 2>&1 && sudo apt-get install -y $pkgs; then
+    return 0
+  fi
+  die "GUI 依赖安装失败。请先执行:  sudo apt-get install -y ${pkgs}，然后重新运行 install.sh"
+}
+
+ensure_gui_deps
+
 for cmd in curl python3 git systemctl loginctl; do
   command -v "$cmd" >/dev/null 2>&1 || die "缺少命令：$cmd"
 done
