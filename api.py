@@ -122,6 +122,17 @@ class GitLabClient:
         self-identification marker (fsm filters notes carrying it)."""
         return f"🤖 {text}\n{self.note_marker}"
 
+    def build_claim_body(self, machine_id: str) -> str:
+        """双机认领评论（协议 v2）：嵌 machine 标记＋既有 note marker＋🤖
+        前缀——本方与他方的 fsm 过滤都不打环。"""
+        return (f"🤖 认领本 issue（machine={machine_id}）\n"
+                f"<!--claim:machine={machine_id}-->\n{self.note_marker}")
+
+    def post_claim(self, project, number, machine_id):
+        """发认领评论；返回 {"id": <评论 id>, ...}（裁决窗后按 id 比高低）。"""
+        return self.post_note(project, number,
+                              self.build_claim_body(machine_id))
+
     # --- endpoints -------------------------------------------------------
 
     def list_open_issues(self, project):

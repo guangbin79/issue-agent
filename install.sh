@@ -3,8 +3,9 @@
 # updates in place. Identity is per-project: read from
 # <project>/.issue-agent.json (canonical_path / default_branch / identity /
 # out_of_scope / port / service_name / verify_command).
-# Deploys: snapshot ~/.local/lib/<service>/, config (0600), systemd user
-# unit, Gitea repository webhook (upsert, issues+issue_comment).
+# Deploys: snapshot ~/.local/lib/<service>/, config (0600, incl. machine_id),
+# systemd user unit. 协议 v2 纯轮询：不注册 webhook，安装时全量删除本项目
+# 既有 hooks（事件面＝daemon 扫描循环）。
 # Non-interactive overrides (env wins over .issue-agent.json):
 #   ISSUE_AGENT_API_BASE / ISSUE_AGENT_PAT / ISSUE_AGENT_CALLBACK_URL /
 #   ISSUE_AGENT_REPO / ISSUE_AGENT_SSL_VERIFY /
@@ -93,8 +94,8 @@
 #   ——daemon 启动期读取的全部模板资产）；
 #   config ~/.config/<service>/config.json（0600，含 PAT、gitea_user、
 #   project=owner/repo、service_name/canonical_path/identity/out_of_scope/
-#   verify_command）；systemd user unit；Gitea 仓库 webhook
-#   （type=gitea，仅 issues + issue_comment 事件，按 URL 幂等 upsert）。
+#   verify_command、machine_id＝双机认领身份）；systemd user unit。
+#   协议 v2 纯轮询：不注册 webhook，安装时全量删除本项目既有 hooks。
 #
 # ---- 退出码 ------------------------------------------------------------------
 #   0 成功（幂等：重跑=就地更新）
@@ -663,21 +664,18 @@ detect_lan_ip() {
   fi
   echo "${ip:-127.0.0.1}"
 }
+# 协议 v2：callback_url 已退役（纯轮询）——不再交互询问；env 显式提供或
+# 复用既有 config 则照抄（保留忽略，幂等兼容），否则写探测默认值占位。
 DEFAULT_CALLBACK="http://$(detect_lan_ip):${PORT}"
 if [ -n "${ISSUE_AGENT_CALLBACK_URL:-}" ]; then
   CALLBACK_URL="${ISSUE_AGENT_CALLBACK_URL}"
 elif [ -n "$OLD_CB" ]; then
   CALLBACK_URL="$OLD_CB"
-  echo "install: 复用既有 config 的 callback_url（env 未提供）" >&2
+  echo "install: 复用既有 config 的 callback_url（字段已退役，仅保留兼容）" >&2
 else
-  read -rp "webhook 回调 URL [${DEFAULT_CALLBACK}]（回车确认默认值）: " CALLBACK_URL
-  CALLBACK_URL="${CALLBACK_URL:-$DEFAULT_CALLBACK}"
+  CALLBACK_URL="$DEFAULT_CALLBACK"
 fi
 [ -n "$CALLBACK_URL" ] || die "回调 URL 为空"
-case "$CALLBACK_URL" in
-  http://*)
-    note "注意：回调为明文 HTTP——webhook 密钥在局域网内可被嗅探伪造；生产环境建议配置 HTTPS 反向代理后使用 https:// 回调（当前为按设计接受的局域网方案）" ;;
-esac
 
 # --- 2. preflight: port bind + linger (before any write) -------------------
 
@@ -744,6 +742,25 @@ if [ -z "$SECRET" ]; then
 fi
 [ -n "$SECRET" ] || die "无法生成 secret_token"
 
+# 双机认领协议 v2：machine_id 生成一次并持久化（重装幂等复用；禁用
+# hostname——会漂移）。8 位随机 hex 足以区分局域网内机器；复用值必须
+# 通过 8-hex 格式门（手改坏值会让认领评论对他机失明——B 册终闸）。
+MACHINE_ID="$(service_name="$SERVICE_NAME" python3 - 2>/dev/null <<'EOF' || true
+import json, os, re
+from pathlib import Path
+p = Path.home() / ".config" / os.environ["service_name"] / "config.json"
+try:
+    v = json.loads(p.read_text()).get("machine_id", "")
+    print(v if isinstance(v, str) and re.fullmatch(r"[0-9a-f]{8}", v) else "")
+except Exception:
+    pass
+EOF
+)"
+if [ -z "$MACHINE_ID" ]; then
+  MACHINE_ID="$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
+fi
+[ -n "$MACHINE_ID" ] || die "无法生成 machine_id"
+
 # 重装合并旗标：1＝本次输入显式提供（env/json 高优先路）照常覆盖；0＝仅回退
 # 内置默认值，保留既有 config 的值（F-merge：重装不得静默改写已调字段）。
 CB_EXPLICIT=$([ -n "${ISSUE_AGENT_CALLBACK_URL:-}" ] && echo 1 || echo 0)
@@ -766,6 +783,7 @@ api_base="$API_BASE" pat="$PAT" repo="$CANONICAL" cb="$CALLBACK_URL" \
   out_of_scope="$OUT_OF_SCOPE" verify_command="$VERIFY_COMMAND" \
   execution_mode="$EXECUTION_MODE" router_model="$ROUTER_MODEL" \
   agora_home="$AGORA_HOME_CFG" agora_poll_interval="$AGORA_POLL" \
+  machine_id="$MACHINE_ID" \
   old_config="$CONFIG_FILE" cb_explicit="$CB_EXPLICIT" ssl_explicit="$SSL_EXPLICIT" \
   branch_explicit="$BRANCH_EXPLICIT" verify_explicit="$VERIFY_EXPLICIT" \
   mp_explicit="$MP_EXPLICIT" mode_explicit="$MODE_EXPLICIT" \
@@ -792,6 +810,8 @@ cfg = {
     "default_branch": os.environ["default_branch"],
     "max_parallel": int(os.environ["max_parallel"]),
     "worktree_path": "",  # deprecated: kept for schema compat, always empty
+    # 双机认领协议 v2：本机终身身份（重装幂等复用）
+    "machine_id": os.environ["machine_id"],
 }
 # agora 四键（计划 Task 6）：仅显式提供才写；poll interval 走 int 强转
 # （上方 shell 面已挡非正整数，坏类型在此按缺省丢弃而非崩溃）。
@@ -890,123 +910,46 @@ WantedBy=default.target
 EOF
 note "unit 已写入：${UNIT_FILE}"
 
-# --- 6. webhook upsert (ONLY issues + issue_comment events) -------------------
+# --- 6. webhook 全量清除（协议 v2 纯轮询：不再注册任何 webhook） ---------------
 
 API_ROOT="${API_BASE%/}"
 HOOKS_URL="${API_ROOT}/api/v1/repos/${PROJECT_API}/hooks"
-hook_body="$(cb="$CALLBACK_URL" secret="$SECRET" python3 - <<'EOF'
-import json, os
-print(json.dumps({
-    "type": "gitea",
-    "active": True,
-    "branch_filter": "*",
-    "events": ["issues", "issue_comment"],
-    "config": {"url": os.environ["cb"], "content_type": "json",
-               "secret": os.environ["secret"]},
-}))
-EOF
-)"
 
-# B2: the hook body embeds the webhook secret — it must never sit on the
-# curl argv (/proc/<pid>/cmdline is world-readable; the file's own F2
-# rule for the PAT). Park it in a 0600 temp file and send -d @file.
-BODY_FILE="$(mktemp)"
-chmod 600 "$BODY_FILE"
-printf '%s' "$hook_body" > "$BODY_FILE"
-trap 'rm -f "$HDR_FILE" "$BODY_FILE"' EXIT
-
-sweep_stale_hooks() { # B3: same-instance hooks are identified by :PORT —
-  # delete any whose URL no longer matches the current callback, so
-  # LAN-IP churn never stacks registrations across re-installs.
-  local sid ids
-  ids="$(printf '%s' "$hooks_json" | port="$PORT" cb="$CALLBACK_URL" python3 -c '
-import json, os, sys
+# 协议 v2：认领/事件面改由 daemon 扫描循环纯轮询驱动。安装时全量删除
+# 本项目既有 hooks（含旧版本注册的回调与任何残留注册）——双机部署下
+# 仓库面不允许存在任何 webhook 拉扯事件源。
+# 分页口径（B 册终闸复核）：恒拉第 1 页——删除使剩余条目前移，「删满
+# 页→重拉首页」天然翻页；递增页码会因偏移前移跳删（>100 条时漏 50 条）。
+sweep_all_hooks() {
+  local round sid ids hooks_json n
+  round=1
+  while :; do
+    hooks_json="$(curl -s "${CURL_TLS[@]}" -X GET -H @"$HDR_FILE" \
+      "${HOOKS_URL}?limit=50&page=1" 2>/dev/null || true)"
+    ids="$(printf '%s' "$hooks_json" | python3 -c '
+import json, sys
 try:
     hooks = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
 for h in hooks if isinstance(hooks, list) else []:
-    url = (h.get("config") or {}).get("url") or ""
-    if url != os.environ["cb"] and url.rstrip("/").endswith(":" + os.environ["port"]):
+    if h.get("id") is not None:
         print(h["id"])
 ' 2>/dev/null || true)"
-  for sid in $ids; do
-    curl -s "${CURL_TLS[@]}" -X DELETE -H @"$HDR_FILE" -o /dev/null \
-      "${HOOKS_URL}/${sid}" 2>/dev/null || true
-    note "已清理陈旧 webhook（id=${sid}：同端口 ${PORT} 的旧回调地址）"
+    for sid in $ids; do
+      curl -s "${CURL_TLS[@]}" -X DELETE -H @"$HDR_FILE" -o /dev/null \
+        "${HOOKS_URL}/${sid}" 2>/dev/null || true
+      note "已删除本项目 webhook（id=${sid}，协议 v2 纯轮询退役 webhook）"
+    done
+    # 短页/空页＝清完收工；空/坏 JSON 按空页收尾
+    n="$(printf '%s' "$ids" | grep -c . || true)"
+    [ "${n:-0}" -lt 50 ] && break
+    round=$((round + 1))
+    [ "$round" -gt 20 ] && { note "警告：webhook 清扫 20 轮仍未清空（服务端持续返回满页）——请到 Gitea 仓库 Settings → Webhooks 人工核对"; break; }
   done
 }
 
-hooks_json="$(curl -s "${CURL_TLS[@]}" -X GET -H @"$HDR_FILE" "${HOOKS_URL}?limit=50" 2>/dev/null || true)"
-sweep_stale_hooks
-existing_id="$(printf '%s' "$hooks_json" | cb="$CALLBACK_URL" python3 -c '
-import json, os, sys
-try:
-    hooks = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-for h in hooks if isinstance(hooks, list) else []:
-    if (h.get("config") or {}).get("url") == os.environ["cb"]:
-        print(h["id"]); break
-' 2>/dev/null || true)"
-# F6: single page only — warn when the 50-hook page cap is hit so a
-# missed match (and thus a duplicate registration) is at least visible.
-hooks_n="$(printf '%s' "$hooks_json" | python3 -c '
-import json, sys
-try:
-    print(len(json.load(sys.stdin)))
-except Exception:
-    print(0)
-' 2>/dev/null || echo 0)"
-if [ "${hooks_n:-0}" -ge 50 ]; then
-  note "警告：仓库 webhook 已达 50 条（分页上限），列表可能不完整——若重复注册，请到 Gitea 仓库 Settings → Webhooks 人工核对"
-fi
-
-if [ -n "$existing_id" ]; then
-  out="$(curl -s "${CURL_TLS[@]}" -X PATCH -H @"$HDR_FILE" -H "Content-Type: application/json" \
-    -d @"$BODY_FILE" -w '\n%{http_code}' "${HOOKS_URL}/${existing_id}" || true)"
-  hook_code="${out##*$'\n'}"
-  [ "$hook_code" = "200" ] || die "webhook 更新失败（HTTP ${hook_code:-无响应}）"
-  hook_id="$existing_id"
-  note "webhook 已更新（id=${hook_id}）"
-else
-  out="$(curl -s "${CURL_TLS[@]}" -X POST -H @"$HDR_FILE" -H "Content-Type: application/json" \
-    -d @"$BODY_FILE" -w '\n%{http_code}' "${HOOKS_URL}" || true)"
-  hook_code="${out##*$'\n'}"
-  body="${out%$'\n'*}"
-  case "$hook_code" in
-    200|201) ;;
-    *) die "webhook 注册失败（HTTP ${hook_code:-无响应}）" ;;
-  esac
-  hook_id="$(printf '%s' "$body" | python3 -c '
-import json, sys
-try:
-    print(json.load(sys.stdin)["id"])
-except Exception:
-    pass' 2>/dev/null || true)"
-  note "webhook 已注册（id=${hook_id:-?}）"
-fi
-
-# B3 post-pass: re-list and sweep again so nothing that slipped in
-# around the upsert outlives this run
-hooks_json="$(curl -s "${CURL_TLS[@]}" -X GET -H @"$HDR_FILE" "${HOOKS_URL}?limit=50" 2>/dev/null || true)"
-sweep_stale_hooks
-
-# --- 7. post-registration reachability (warn only) ---------------------------
-
-if [ -n "${hook_id:-}" ]; then
-  # Gitea test delivery is a push-event probe — proves reachability, so a
-  # failure is a warning, never a rollback trigger.
-  tcode="$(curl -s "${CURL_TLS[@]}" -X POST -H @"$HDR_FILE" -H "Content-Type: application/json" \
-    -d "{\"ref\":\"${DEFAULT_BRANCH}\"}" -o /dev/null -w '%{http_code}' \
-    "${HOOKS_URL}/${hook_id}/tests" || true)"
-  case "$tcode" in
-    200|204) ;;
-    *) note "警告：Gitea test-hook 触发返回 HTTP ${tcode:-无响应}——回调 URL 可能不可达，请检查本机防火墙对端口 ${PORT} 的放行" ;;
-  esac
-else
-  note "警告：未能取得 hook id，跳过 test-hook 可达性检查"
-fi
+sweep_all_hooks
 
 # --- 8. protected-default-branch check (warn only) -----------------------------
 
@@ -1048,13 +991,7 @@ fi
 
 rollback() {
   echo "install: 服务未激活，回滚（保留 ${CONFIG_FILE}）……" >&2
-  # F5: the webhook would keep pointing at a dead callback — delete it
-  # best-effort and always leave the manual-removal hint.
-  if [ -n "${hook_id:-}" ]; then
-    curl -s "${CURL_TLS[@]}" -X DELETE -H @"$HDR_FILE" -o /dev/null \
-      "${HOOKS_URL}/${hook_id}" 2>/dev/null || true
-    echo "install: 已尝试删除 webhook（id=${hook_id}）；若仍存在请到 Gitea 仓库 Settings → Webhooks 手动删除" >&2
-  fi
+  # 协议 v2：无 webhook 注册面，回滚不再涉及 hooks（已删的按删除态保留）
   systemctl --user stop "${SERVICE_NAME}.service" 2>/dev/null || true
   systemctl --user disable "${SERVICE_NAME}.service" 2>/dev/null || true
   rm -f "$UNIT_FILE"

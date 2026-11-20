@@ -268,8 +268,11 @@ assert_grep "$UNIT" '^ExecStart=/usr/bin/python3 %h/\.local/lib/repo-issue-agent
 assert_grep "$UNIT" '^Restart=on-failure$'
 assert_grep "$UNIT" '^Environment="PATH=%h/\.opencode/bin:/usr/local/bin:/usr/bin:/bin"$'
 assert_grep "$STUB_STATE/systemctl.log" 'enable --now repo-issue-agent\.service'
-assert_file "$STUB_STATE/hook_flags_ok"  # webhook: gitea type, issues+issue_comment only
-assert_file "$STUB_STATE/body_via_file"  # B2: hook body sent via -d @file, never on argv
+# 协议 v2 纯轮询：不再注册 webhook——无 hook POST/PATCH；安装全删既有 hooks
+POSTS="$(grep -c '^POST .*/hooks$' "$STUB_STATE/curl.log" || true)"
+assert_eq "$POSTS" "0" "webhook POST never called (protocol v2 polling)"
+PATCHES="$(grep -c '^PATCH .*/hooks' "$STUB_STATE/curl.log" || true)"
+assert_eq "$PATCHES" "0" "webhook PATCH never called (protocol v2 polling)"
 assert_grep "$STUB_STATE/curl.log" 'GET .*/api/v1/user'  # PAT validated via Gitea user endpoint
 python3 - "$CFG" <<'PY' && ok "config fields match config.py schema" || fail "config fields wrong"
 import json, sys
@@ -284,17 +287,21 @@ assert c["port"] == 8644
 assert c["ssl_verify"] is False
 assert c["default_branch"] == "master"
 assert len(c["secret_token"]) > 0
+import re
+assert re.fullmatch(r"[0-9a-f]{8}", c["machine_id"]), c.get("machine_id")
 PY
 assert_nogrep "$SAN/install.out" 'gitea-stub-token'  # PAT never echoed
 assert_nogrep "$STUB_STATE/curl.log" 'gitea-stub-token'  # PAT never logged
 SEC1="$(config_secret)"
+MID1="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["machine_id"])' "$CFG")"
 run_install
 assert_eq "$RC" "0" "install run 2 exit code (idempotent)"
 SEC2="$(config_secret)"
 assert_eq "$SEC2" "$SEC1" "secret_token reused across runs"
+MID2="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["machine_id"])' "$CFG")"
+assert_eq "$MID2" "$MID1" "machine_id reused across runs (sticky machine identity)"
 POSTS="$(grep -c '^POST .*/hooks$' "$STUB_STATE/curl.log" || true)"
-assert_eq "$POSTS" "1" "webhook POST called exactly once across two runs"
-assert_grep "$STUB_STATE/curl.log" '^PATCH .*/hooks/[0-9]'  # run 2 patched, not stacked
+assert_eq "$POSTS" "0" "webhook POST never called across two runs (protocol v2)"
 
 echo "== 1b. snapshot carries every startup template asset the daemon reads =="
 # 口径＝「daemon 启动期会读的模板资产」（daemon.py: PROTOCOL.template.md
@@ -367,20 +374,26 @@ assert_eq "$RC" "1" "linger missing exit code"
 assert_grep "$SAN/install.out" 'sudo loginctl enable-linger'
 assert_no "$FAKE_HOME/.config/systemd/user/repo-issue-agent.service"
 
-echo "== 5. uninstall: stop+unit+webhook+snapshot gone; config+state kept =="
+echo "== 5. uninstall: stop+unit+snapshot gone; config+state kept =="
 new_sandbox
 run_install
 assert_eq "$RC" "0" "install before uninstall"
+# v2：安装不再注册 webhook；模拟人工残留一条旧回调 hook，卸载仍应清掉
+python3 - "$STUB_STATE/hooks.json" <<'PY'
+import json, sys
+json.dump([{"id": 77, "config": {"url": "http://192.0.2.10:8644"}}],
+          open(sys.argv[1], "w"))
+PY
 run_uninstall
 assert_eq "$RC" "0" "uninstall exit code"
 assert_no "$FAKE_HOME/.config/systemd/user/repo-issue-agent.service"
 assert_no "$FAKE_HOME/.local/lib/repo-issue-agent"
 assert_file "$FAKE_HOME/.config/repo-issue-agent/config.json"  # kept
 assert_grep "$STUB_STATE/systemctl.log" 'disable --now repo-issue-agent\.service'
-assert_grep "$STUB_STATE/curl.log" '^DELETE .*/hooks/[0-9]*$'
+assert_grep "$STUB_STATE/curl.log" '^DELETE .*/hooks/77$'  # legacy hook cleaned
 assert_grep "$SAN/uninstall.out" '已保留'
 
-echo "== 6. rollback on non-active service: unit+snapshot+webhook removed, config kept =="
+echo "== 6. rollback on non-active service: unit+snapshot removed, config kept =="
 new_sandbox
 STUB_ACTIVE=failed run_install
 assert_eq "$RC" "1" "rollback exit code"
@@ -388,8 +401,6 @@ assert_grep "$SAN/install.out" '回滚'
 assert_no "$FAKE_HOME/.config/systemd/user/repo-issue-agent.service"
 assert_no "$FAKE_HOME/.local/lib/repo-issue-agent"
 assert_file "$FAKE_HOME/.config/repo-issue-agent/config.json"  # kept by design
-assert_grep "$STUB_STATE/curl.log" '^DELETE .*/hooks/[0-9]*$'  # F5: webhook deleted
-assert_grep "$SAN/install.out" 'webhook'  # manual-removal hint printed
 
 echo "== 7. unprotected default branch: loud warning, install still succeeds =="
 new_sandbox
@@ -470,14 +481,17 @@ c = json.load(open(sys.argv[1]))
 assert c["port"] == 8644
 assert c["default_branch"] == "master"
 PY
-# per-instance idempotency: re-run patches the same hook, secret reused
+# per-instance idempotency: re-run reuses secret + machine_id
 SEC_A="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["secret_token"])' "$CFG_FOO")"
+MID_A="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["machine_id"])' "$CFG_FOO")"
 ISSUE_AGENT_SERVICE_NAME=issue-agent-foo ISSUE_AGENT_PORT=8644 run_install
 assert_eq "$RC" "0" "named-instance re-run exit code (idempotent)"
 SEC_B="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["secret_token"])' "$CFG_FOO")"
 assert_eq "$SEC_B" "$SEC_A" "named-instance secret reused across runs"
+MID_B="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["machine_id"])' "$CFG_FOO")"
+assert_eq "$MID_B" "$MID_A" "named-instance machine_id reused across runs"
 POSTS_FOO="$(grep -c '^POST .*/hooks$' "$STUB_STATE/curl.log" || true)"
-assert_eq "$POSTS_FOO" "1" "webhook POST called exactly once across named-instance runs"
+assert_eq "$POSTS_FOO" "0" "webhook POST never called across named-instance runs (v2)"
 
 echo "== 12. ISSUE_AGENT_DEFAULT_BRANCH override lands in config.json =="
 new_sandbox
@@ -634,24 +648,24 @@ assert_grep "$SAN/install.out" '回滚'
 assert_no "$FAKE_HOME/.config/systemd/user/repo-issue-agent.service"
 assert_no "$FAKE_HOME/.local/lib/repo-issue-agent"
 assert_file "$FAKE_HOME/.config/repo-issue-agent/config.json"  # kept by design
-assert_grep "$STUB_STATE/curl.log" '^DELETE .*/hooks/[0-9]*$'  # F5: webhook deleted
-assert_grep "$SAN/install.out" 'webhook'  # manual-removal hint printed
 
-echo "== 20. stale same-port hook swept on install (LAN IP churn) =="
+echo "== 20. v2 install sweeps ALL pre-existing project hooks =="
 new_sandbox
 mkdir -p "$STUB_STATE"
 python3 - "$STUB_STATE/hooks.json" <<'PY'
 import json, sys
-json.dump([{"id": 41, "config": {"url": "http://192.0.2.99:8644"}}], open(sys.argv[1], "w"))
+json.dump([
+    {"id": 41, "config": {"url": "http://192.0.2.99:8644"}},
+    {"id": 42, "config": {"url": "http://elsewhere.example:9000/hook"}},
+], open(sys.argv[1], "w"))
 PY
 run_install
-assert_eq "$RC" "0" "install with stale same-port hook"
-assert_grep "$STUB_STATE/curl.log" '^DELETE .*/hooks/41$'  # B3: stale swept
-python3 - "$STUB_STATE/hooks.json" <<'PY' && ok "only the fresh callback remains" || fail "stale hook survived the sweep"
+assert_eq "$RC" "0" "install with pre-existing hooks"
+assert_grep "$STUB_STATE/curl.log" '^DELETE .*/hooks/41$'  # same-port legacy swept
+assert_grep "$STUB_STATE/curl.log" '^DELETE .*/hooks/42$'  # ANY project hook swept (v2)
+python3 - "$STUB_STATE/hooks.json" <<'PY' && ok "project hooks emptied (protocol v2)" || fail "hooks survived the v2 sweep"
 import json, sys
-hooks = json.load(open(sys.argv[1]))
-urls = [(h.get("config") or {}).get("url") for h in hooks]
-assert urls == ["http://192.0.2.10:8644"], urls
+assert json.load(open(sys.argv[1])) == []
 PY
 
 echo "== 21. invalid PORT / SERVICE_NAME rejected offline =="

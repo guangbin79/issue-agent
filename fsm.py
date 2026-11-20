@@ -92,6 +92,64 @@ anywhere in the body) is filtered too. Locked by test.
 # via decide(..., markers=(marker,)) — None keeps only the universal set.
 _AGENT_MARKERS = ("🤖",)
 
+# 双机认领协议 v2：认领评论嵌的机器标记（8 位 hex machine_id）。
+# 纯字符串解析（本模块零 import 契约）：<!--claim:machine=<8+位hex>-->
+_CLAIM_TAG = "<!--claim:machine="
+_HEX = set("0123456789abcdef")
+# 三态扫描（协议第 5 条；叠加不替换既有 status 语义）
+IN_FLIGHT, DORMANT, TRIGGERED = "in_flight", "dormant", "triggered"
+
+
+def claim_machine(body):
+    """认领评论里的 machine_id；非认领评论返回 None。纯函数。
+
+    长度帽 16（install 生成 8 位 hex；超长 hex＝敌意 body 的持久化
+    DoS 放大面，C 册终闸判例）——超帽按无标记处理。"""
+    if not isinstance(body, str):
+        return None
+    start = body.find(_CLAIM_TAG)
+    if start < 0:
+        return None
+    rest = body[start + len(_CLAIM_TAG):]
+    end = rest.find("-->")
+    machine = rest[:end].strip().lower() if end > 0 else ""
+    return machine if machine and len(machine) <= 16 \
+        and set(machine) <= _HEX else None
+
+
+def claim_comments(comments):
+    """[(comment_id, machine_id)] — 墙上全部认领评论，按 id 升序。"""
+    out = []
+    for c in comments or []:
+        if not isinstance(c, dict):
+            continue
+        machine = claim_machine(c.get("body"))
+        cid = c.get("id")
+        if machine and isinstance(cid, int):
+            out.append((cid, machine))
+    return sorted(out)
+
+
+def triage(entry, fresh_note_ids):
+    """我名下 issue 的三态分类（协议第 5 条）。
+
+    in_flight＝本地 pending 在飞（无未消评论、非停靠）；dormant＝终报后
+    水位未动（永不重开）／paused 永不自动唤醒／blocked 人工出口／done；
+    triggered＝水位新动或 pending 未消（停靠/崩溃恢复），占槽。
+    """
+    if not isinstance(entry, dict):
+        return DORMANT
+    status = entry.get("status")
+    if status == "pending":
+        if fresh_note_ids or entry.get("agora_pending"):
+            return TRIGGERED  # pending 未消（崩溃恢复）／停靠待派
+        return IN_FLIGHT
+    if status == "defer":
+        return TRIGGERED  # 待重试（回收/停靠/超时）——现有 defer-retry 车道
+    if status in ("active", "adopted"):
+        return TRIGGERED if fresh_note_ids else DORMANT
+    return DORMANT  # paused / blocked / done：永不自动唤醒
+
 
 def decide(event, ledger, markers=None):
     """Map one webhook payload + ledger view to a decision dict. Pure.

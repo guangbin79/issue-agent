@@ -19,8 +19,9 @@ from pathlib import Path
 
 DEFAULT_CONFIG_PATH = (Path.home() / ".config"
                        / Path(__file__).resolve().parent.name / "config.json")
-_REQUIRED_FIELDS = ("api_base", "pat", "repo_path", "callback_url",
-                    "canonical_path")
+# callback_url 已退役（协议 v2 纯轮询去 webhook）：老 config 的
+# port/callback_url/secret_token 字段保留忽略——缺省可载入。
+_REQUIRED_FIELDS = ("api_base", "pat", "repo_path", "canonical_path")
 _TRUTHY = ("1", "true", "yes", "on")
 
 
@@ -66,6 +67,9 @@ class Config:
     # F114 门审命令：非空则每个 agora 任务携 review_cmd 派发——门在 verify
     # 绿后亲自执行（AGORA_REVIEW_BASE 注入任务起点）；空＝协议锚路径
     review_cmd: str = ""
+    # 双机认领协议 v2：本机唯一身份（install.sh 生成一次 8 位 hex 持久化，
+    # 重装幂等复用；禁 hostname——会漂移）
+    machine_id: str = ""
     # ag-fb9e5a 缺陷2：基线领先防护模板——非空且建单基线（target_branch
     # tip）领先/分叉于 origin/master 时，{BASE} 展开为基线 commit 后作
     # verify_cmd 前缀（如 "HX_TIDY_BASE={BASE}"），把 check 型门的改动域
@@ -144,7 +148,7 @@ def load_config(path: "str | Path | None" = None) -> Config:
         api_base=str(raw["api_base"]).rstrip("/"),
         pat=str(raw["pat"]),
         repo_path=str(raw["repo_path"]),
-        callback_url=str(raw["callback_url"]),
+        callback_url=str(raw.get("callback_url", "") or ""),
         canonical_path=str(raw["canonical_path"]),
         secret_token=str(raw.get("secret_token", "")),
         port=_bounded_int(raw.get("port", 8644), "port", 8644, 1, 65535),
@@ -183,6 +187,7 @@ def load_config(path: "str | Path | None" = None) -> Config:
             raw.get("agora_stall_timeout", 1800), "agora_stall_timeout",
             1800, 0),
         review_cmd=str(raw.get("review_cmd", "") or ""),
+        machine_id=str(raw.get("machine_id", "") or ""),
         verify_base_prefix=str(raw.get("verify_base_prefix", "") or ""),
     )
     # Canonical-path pin: after all parsing so every pre-existing error

@@ -81,6 +81,9 @@ RECONCILE_SINCE_OVERLAP_S = 660  # 600s reconcile cadence + 60s margin
 # through list_issue_comments' since seam (a server that ignores since
 # behaves exactly as before the fallback: empty notes / held budget).
 WALL_FALLBACK_SINCE_S = 7 * 86400
+# 双机认领协议 v2（第 3 条）：发认领评论后等的裁决窗——窗内他机可同场
+# 认领，窗后重读全部认领评论按 id 定胜负。测试经模块属性改 0。
+ARBITRATION_WINDOW_S = 60
 
 # Global experience-draft store (the agent-experience capture flow the
 # protocol's 沉淀 step writes to): the post-push capture verification
@@ -190,6 +193,9 @@ def _empty_entry() -> dict:
         "router_goal": None,
         "router_model": None,
         "router_deliverable": None,
+        # 双机认领 v2（与 state._new_issue 同步）
+        "owner": {"machine": None, "claim_comment_id": None},
+        "claim_state": "none",
     }
 
 
@@ -201,7 +207,8 @@ class Orchestrator:
     every same-issue event sequence strictly serial. max_parallel=1 (the
     default) reproduces the historical one-worker turn lock exactly."""
 
-    def __init__(self, *, project, api, journal, listener, state_path, repo_path,
+    def __init__(self, *, project, api, journal, listener=None, state_path,
+                 repo_path,
                  remote_url, protocol_path, ssl_verify=True,
                  default_branch="master",
                  note_marker="", service_name="issue-agent", verify_command="",
@@ -218,6 +225,7 @@ class Orchestrator:
                  verify_base_prefix: str = "",
                  callback_url: str = "",
                  worktree_path: str = "",
+                 machine_id: str = "",
                  teardown: Optional[Callable[[], None]] = None,
                  agora_client=None,
                  router=None,
@@ -226,7 +234,11 @@ class Orchestrator:
         self.project = project
         self.api = api
         self.listener = listener
-        self.queue = listener.queue
+        # 协议 v2 纯轮询：daemon 不再注入 webhook listener——队列改由本类
+        # 自持（worker/scan/reconcile 仍共用同一 job 面）。
+        self.queue = listener.queue if listener is not None else _queue.Queue()
+        # 双机认领 v2：本机身份（空＝不参与认领，只对账——老 config 过渡）
+        self.machine_id = machine_id
         self.state_path = state_path
         self.repo_path = repo_path
         self._journal = journal if journal is not None else (lambda message: None)
@@ -343,6 +355,13 @@ class Orchestrator:
         self._last_reconcile = time.monotonic()
         self._poll_s = min(1.0, self.reconcile_interval)
         self._repo_misses = 0
+        # 双机认领 v2：扫描循环（恒跑；认领唯一入口）与裁决窗内勿扰旗
+        self._scan_interval = self.reconcile_interval
+        self._last_scan = 0.0
+        self._scan_thread = None
+        if not self.machine_id:
+            self._journal("config: machine_id 缺失——本机不参与认领"
+                          "（只对账不发起），重跑 install.sh 生成")
 
     # ------------------------------------------------------------------ setup
 
@@ -361,7 +380,9 @@ class Orchestrator:
         if self.agora_monitor is not None:
             self.agora_monitor.start()
         self._startup_orphan_cleanup()
-        port = self.listener.start()
+        # 协议 v2：listener 可缺省（纯轮询；daemon 不再构造）。注入时照旧
+        # 先开端口（F17 语义保留给测试/过渡部署）。
+        port = self.listener.start() if self.listener is not None else None
         # D1: the startup reconcile is the one call not yet behind a guard —
         # a failure (API down at boot) must journal, never crash the daemon;
         # the worker retries it on the interval via the same path.
@@ -372,6 +393,9 @@ class Orchestrator:
             for n in range(self.max_parallel)]
         for worker in self._workers:
             worker.start()
+        self._scan_thread = threading.Thread(
+            target=self._scan_loop, name="issue-agent-scan", daemon=True)
+        self._scan_thread.start()
         if self.heartbeat_interval:
             self._hb_thread = threading.Thread(
                 target=self._heartbeat_loop, name="issue-agent-heartbeat",
@@ -381,19 +405,26 @@ class Orchestrator:
             self._sweep_thread = threading.Thread(
                 target=self._sweep_loop, name="issue-agent-sweep", daemon=True)
             self._sweep_thread.start()
-        self._journal(f"startup: listener up (port={port}), baseline reconciled, "
-                      f"workers running (max_parallel={self.max_parallel})")
+        if port is not None:
+            self._journal(f"startup: listener up (port={port})")
+        self._journal(f"startup: baseline reconciled, workers running "
+                      f"(max_parallel={self.max_parallel}), scan loop on "
+                      f"(machine={self.machine_id or 'N/A'})")
         return port
 
     def stop(self):
         self._stop.set()
-        try:
-            self.listener.stop()
-        except Exception as exc:  # listener teardown must not mask shutdown
-            self._journal(f"shutdown: listener stop failed: {exc!r}")
+        if self.listener is not None:
+            try:
+                self.listener.stop()
+            except Exception as exc:  # listener teardown must not mask shutdown
+                self._journal(f"shutdown: listener stop failed: {exc!r}")
         for worker in self._workers:
             worker.join(timeout=10)
         self._workers = []
+        if self._scan_thread is not None:
+            self._scan_thread.join(timeout=10)
+            self._scan_thread = None
         if self._hb_thread is not None:
             self._hb_thread.join(timeout=5)
             self._hb_thread = None
@@ -443,6 +474,202 @@ class Orchestrator:
             self.reconcile()
         except Exception as exc:
             self._journal(f"reconcile: failed: {exc!r}")
+
+    # ------------------------------------------------------------- scan (v2)
+
+    def _scan_loop(self):
+        """扫描循环（协议 v2 第 2 条）：恒跑；空槽才认领，满槽不预占。"""
+        while not self._stop.is_set():
+            if time.monotonic() - self._last_scan >= self._scan_interval:
+                self._last_scan = time.monotonic()
+                try:
+                    self._scan_once()
+                except Exception as exc:  # 扫描线程永不死
+                    self._journal(f"scan: failed: {exc!r}")
+            self._stop.wait(min(1.0, self._scan_interval))
+
+    def _scan_once(self):
+        """一次扫描：空槽两级分配（triggered 池优先，池空才认领新 issue）。
+        认领的唯一入口——reconcile 只对账不认领（协议第 1/2 条）。"""
+        if not self.machine_id:
+            return
+        try:
+            issues = self.api.list_open_issues(self.project)
+        except api.ApiAuthError as exc:
+            self._journal(f"CRITICAL: scan cannot read the API: {exc}")
+            return
+        except api.ApiTransientError as exc:
+            self._journal(f"scan: aborted, API transient failure: {exc}")
+            return
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            # 一级 triggered 池需求（pending 未消/停靠/defer 待重试）＋在飞
+            # 占用（agora 注册面）同口径折算空槽；满槽即返回（不预占）。
+            demand = sum(
+                1 for e in ledger["issues"].values()
+                if e.get("claim_state") != "yielded"
+                and (e["status"] in ("pending", "defer")
+                     or e.get("claim_state") == "candidate"))
+            occupied = (len(self.agora_monitor.tasks())
+                        if self.agora_monitor is not None else 0)
+            # 二级候选：无主 open issue——未跟踪（新 issue）／认输后他方
+            # 认领评论已被人工删除（孤儿恢复，协议第 7 条）；adopted 存量
+            # 仅当被人类新评论唤醒（存量唤醒同样走认领面，双机不双吃）
+            candidates = []
+            for issue in issues:
+                iid = issue.get("number")
+                if iid is None:
+                    continue
+                entry = ledger["issues"].get(str(int(iid)))
+                if entry is None \
+                        or entry.get("claim_state") == "yielded" \
+                        or (entry.get("claim_state") == "none"
+                            and entry.get("status") == "adopted"):
+                    candidates.append((int(iid), issue, dict(entry or {})))
+        free = self.max_parallel - max(demand, occupied)
+        for iid, issue, entry in sorted(candidates, key=lambda c: c[0]):
+            if free <= 0:
+                break
+            wake = None
+            if entry.get("claim_state") == "none" \
+                    and entry.get("status") == "adopted":
+                wake = self._fresh_human_notes(iid, entry)
+                if not wake:
+                    continue  # 静默存量：无人类新评论，不认领
+            if self._claim_new_issue(iid, issue, wake_notes=wake):
+                free -= 1  # 接手开工＝占一槽；认输不占
+
+    def _claim_new_issue(self, iid, issue, wake_notes=None) -> bool:
+        """认领协议（第 3/4 条）：复核→发认领评论→裁决窗→id 定胜负。
+        返回 True＝我赢并已接手开工（占槽）。*wake_notes*＝存量唤醒场景的
+        未消费人类评论（接管回合直通，不再二次重放）。"""
+        # 认领前复核：已有任何他机认领评论＝有主（最早认领终身有效）
+        claims = self._read_claims(iid)
+        if claims is None:
+            return False
+        others = [(cid, m) for cid, m in claims if m != self.machine_id]
+        if others:
+            self._record_other_owner(iid, min(others))
+            self._journal(f"claim: issue#{iid} 已被他机 {min(others)[1]} "
+                          f"认领（comment#{min(others)[0]}），本机不参与")
+            return False
+        try:
+            note = self.api.post_claim(self.project, iid, self.machine_id)
+        except Exception as exc:
+            self._journal(f"claim: issue#{iid} 认领评论发送失败: {exc!r}")
+            return False
+        my_id = (note or {}).get("id")
+        if my_id is None:
+            self._journal(f"claim: issue#{iid} 认领评论无 id，放弃本轮")
+            return False
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            entry = ledger["issues"].setdefault(
+                str(int(iid)), _empty_entry())
+            if entry["status"] == "active" and not entry["session_id"] \
+                    and not entry["processed_note_ids"]:
+                entry["status"] = "adopted"  # 新入账候选：未开工过
+            entry["claim_state"] = "candidate"
+            entry["owner"] = {"machine": self.machine_id,
+                              "claim_comment_id": int(my_id)}
+            state.save_state(self.state_path, ledger)
+        self._journal(f"claim: issue#{iid} 认领评论已发（comment#{my_id}），"
+                      f"等 {ARBITRATION_WINDOW_S}s 裁决窗")
+        time.sleep(ARBITRATION_WINDOW_S)
+        return self._arbitrate(iid, issue, wake_notes)
+
+    def _arbitrate(self, iid, issue, wake_notes=None) -> bool:
+        """裁决窗后重读全部认领评论：自己的 id 最小则接手；否则认输
+        （owner=other 不再重试）。candidate 态崩溃后由 reconcile 复算。"""
+        claims = self._read_claims(iid)
+        if claims is None:
+            return False  # candidate 留账，下轮对账复算
+        mine = [cid for cid, m in claims if m == self.machine_id]
+        others = [(cid, m) for cid, m in claims if m != self.machine_id]
+        if mine and (not others or min(mine) < min(others)[0]):
+            with self._ledger_lock:
+                ledger = state.load_state(self.state_path, warn=self._journal)
+                entry = ledger["issues"].setdefault(
+                    str(int(iid)), _empty_entry())
+                if entry["status"] == "pending":
+                    # 裁决窗内 reconcile 的 candidate 恢复已派发（B 册终闸
+                    # 双派发竞态）——本轮不再复派，回合归恢复路径
+                    self._journal(f"claim: issue#{iid} 已在裁决窗内被接管"
+                                  "派发，跳过重复开工")
+                    return True
+                entry["claim_state"] = "owned"
+                entry["owner"] = {"machine": self.machine_id,
+                                  "claim_comment_id": min(mine)}
+                self._claim(iid, [c["id"] for c in wake_notes or []
+                                  if c.get("id") is not None], ledger)
+            self._journal(f"claim: issue#{iid} 裁决胜出（comment#"
+                          f"{min(mine)}），接手开工")
+            self._dispatch_owned(iid, issue, wake_notes)
+            return True
+        if others:
+            self._record_other_owner(iid, min(others))
+            self._journal(f"claim: issue#{iid} 裁决认输（对方 comment#"
+                          f"{min(others)[0]} 更早），不再重试")
+            return False
+        # 我的认领评论被删且无人认领：回 none，下轮重新认领
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            entry = ledger["issues"].get(str(int(iid)))
+            if entry is not None:
+                entry["claim_state"] = "none"
+                entry["owner"] = {"machine": None, "claim_comment_id": None}
+                state.save_state(self.state_path, ledger)
+        return False
+
+    def _read_claims(self, iid):
+        """该 issue 全部认领评论 [(id, machine)]；失败返回 None（下轮再试）。"""
+        try:
+            return fsm.claim_comments(
+                self.api.list_issue_comments(self.project, int(iid)))
+        except Exception as exc:
+            self._journal(f"claim: issue#{iid} 认领评论读取失败: {exc!r}")
+            return None
+
+    def _record_other_owner(self, iid, other):
+        """他机持有记账（认输/复核发现同归）：owner=other、claim_state=yielded。"""
+        cid, machine = other
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            entry = ledger["issues"].setdefault(str(int(iid)), _empty_entry())
+            entry["claim_state"] = "yielded"
+            entry["owner"] = {"machine": machine, "claim_comment_id": int(cid)}
+            state.save_state(self.state_path, ledger)
+
+    def _dispatch_owned(self, iid, issue, wake_notes=None):
+        """认领接管开工：直接进回合管线（非 fsm 事件面——认领是 daemon 决策）。
+        首回合消息＝issue 标题＋正文（与 opened 事件同构）；存量唤醒场景
+        追加未消费人类评论正文（已随 claim 记账，不再二次重放）。"""
+        record = {"issue": {"number": int(iid),
+                            "title": issue.get("title") or "",
+                            "body": issue.get("body") or "", "state": "open"}}
+        message, title = self._message_and_title(record, iid)
+        bodies = [c.get("body") or "" for c in (wake_notes or [])]
+        if bodies:
+            message = _truncate_utf8(
+                message + "\n\n人类新评论：\n" + "\n".join(bodies),
+                MAX_MESSAGE_BYTES)
+        self._run_turn(iid, message=message, title=title, session_id=None,
+                       action="new", event={"kind": "claim-takeover",
+                                            "issue": record["issue"]},
+                       note_id=0)
+
+    def _fresh_human_notes(self, iid, entry):
+        """adopted 存量的未消费人类评论（无 🤖 机器标记）；读失败返回 []
+        ——下轮扫描再判（宁可迟认领不可错认领）。"""
+        try:
+            comments = self.api.list_issue_comments(self.project, int(iid))
+        except Exception as exc:
+            self._journal(f"scan: issue#{iid} 存量唤醒探测失败: {exc!r}")
+            return []
+        processed = set(entry.get("processed_note_ids") or [])
+        return [c for c in comments
+                if c.get("id") is not None and c["id"] not in processed
+                and "\U0001f916" not in (c.get("body") or "")]
 
     # ------------------------------------------------------------------ events
 
@@ -690,6 +917,15 @@ class Orchestrator:
         so ANY failure journals + one comment and never breaks the caller
         (a raised error here would abort the reconcile close loop and skip
         the remaining issues' pushes)."""
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            entry = ledger["issues"].get(str(int(iid)))
+            if entry is not None and entry.get("claim_state") == "yielded":
+                # 协议 v2 让位停推送：他机持有的 issue 不推本机分支
+                self._journal(
+                    f"close: issue#{iid} skipped close-push (yielded to "
+                    f"{(entry.get('owner') or {}).get('machine')})")
+                return
         try:
             with self._branch_lock(iid):  # P2-10 单写者
                 gitop.fetch_base(self.repo_path, self.remote_url,
@@ -726,6 +962,15 @@ class Orchestrator:
         with self._branch_locks_guard:
             return self._branch_locks.setdefault(str(int(iid)),
                                                  threading.Lock())
+
+    def _yielded(self, iid) -> bool:
+        """让位态读检（协议第 6 条停推送守卫，B 册终闸）：回合收尾推送、
+        sweep 欠账补推、评审延迟补推共用此门——他机持有的 issue 不推
+        本机分支（提交留在本地，不丢）。"""
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            entry = ledger["issues"].get(str(int(iid)))
+            return entry is not None and entry.get("claim_state") == "yielded"
 
     def _run_turn(self, iid, *, message, title, session_id, action,
                   event=None, note_id=None):
@@ -783,17 +1028,22 @@ class Orchestrator:
                 # still checked out in the agent's own worktree.
                 pushed = False
                 try:
-                    with self._branch_lock(iid):  # P2-10 单写者
-                        pushed = gitop.has_new_commits_vs_ref(
-                            self.repo_path, iid,
-                            gitop.agent_tracking_ref(self.default_branch))
-                        if pushed:
-                            gitop.push_fix_branch_resilient(self.repo_path, iid, self.remote_url,
-                                                            self.ssl_verify)
-                        else:
-                            self._journal(
-                                f"turn: issue#{iid} no new commits on "
-                                f"{gitop.fix_branch(iid)}; push skipped")
+                    if self._yielded(iid):  # 让位停推送（协议第 6 条）
+                        self._journal(
+                            f"turn: issue#{iid} 让位后跳过推送 "
+                            f"{gitop.fix_branch(iid)}（提交留本地）")
+                    else:
+                        with self._branch_lock(iid):  # P2-10 单写者
+                            pushed = gitop.has_new_commits_vs_ref(
+                                self.repo_path, iid,
+                                gitop.agent_tracking_ref(self.default_branch))
+                            if pushed:
+                                gitop.push_fix_branch_resilient(self.repo_path, iid, self.remote_url,
+                                                                self.ssl_verify)
+                            else:
+                                self._journal(
+                                    f"turn: issue#{iid} no new commits on "
+                                    f"{gitop.fix_branch(iid)}; push skipped")
                 except gitop.PushFailed as exc:
                     # 缺陷A: the blocked exit would drop the turn's reply —
                     # store it for the sweep's deferred delivery first (a
@@ -1584,7 +1834,9 @@ class Orchestrator:
         # re-check + push again (same pattern as the fix push; an idempotent
         # no-op push when the reviewer committed nothing new)
         try:
-            if gitop.has_new_commits_vs_ref(
+            if self._yielded(iid):  # 让位停推送（协议第 6 条）
+                self._journal(f"review: issue#{iid} 让位后跳过评审后推送")
+            elif gitop.has_new_commits_vs_ref(
                     self.repo_path, iid,
                     gitop.agent_tracking_ref(self.default_branch)):
                 with self._branch_lock(iid):  # P2-10 单写者
@@ -1916,45 +2168,50 @@ class Orchestrator:
             self._journal(f"sweep: issue#{iid} skip(unsafe tip, help note sent)")
             push_ok = False
         elif count > 0:
-            try:
-                remote_tip = gitop.remote_branch_tip(
-                    self.repo_path, self.remote_url, gitop.fix_branch(iid),
-                    self.ssl_verify)
-                with self._branch_lock(iid):  # P2-10 单写者
-                    gitop.push_fix_branch_resilient(self.repo_path, iid,
-                                                    self.remote_url, self.ssl_verify)
-                changed_origin = remote_tip != sha
-                self._journal(f"sweep: issue#{iid} push {gitop.fix_branch(iid)} "
-                              f"({count} ahead, origin "
-                              f"{'updated' if changed_origin else 'unchanged'})")
-            except gitop.PermanentPushFailed as exc:
-                # 确定性失败：投一条求助留言（留言落地才记旗，否则下轮连
-                # 留言一起重试）并把 sha 记入 unsafe_flags，同 sha 不再推
-                self._journal(f"sweep: issue#{iid} push permanently failed, "
-                              f"escalating to issue board: {exc}")
+            if self._yielded(iid):  # 让位停推送（协议第 6 条，B 册终闸）
+                self._journal(f"sweep: issue#{iid} skip push (yielded to "
+                              f"peer machine)")
+                push_ok = False
+            else:
                 try:
-                    self.api.post_note(self.project, iid,
-                                       self.api.build_note_body(
-                                           f"欠账巡检：issue#{iid} 推送卡死"
-                                           f"求助——分支 issue/{iid}-fix 与"
-                                           "远端分叉（变基丢失远端已推提交），"
-                                           "daemon 已停止自动重推，请在回合内 "
-                                           "rebase 到 origin tip 后普通推送。"))
-                    unsafe = True
-                    self._journal(f"sweep: issue#{iid} help note posted; "
-                                  f"auto-repush stopped for tip {sha[:12]}")
-                except api.ApiTransientError as exc2:
-                    self._journal(f"sweep: issue#{iid} help note failed, "
-                                  f"will retry next round: {exc2}")
-                except api.ApiAuthError as exc2:
-                    self._journal(f"CRITICAL: sweep: issue#{iid} comment "
-                                  f"channel unavailable, no flag recorded, "
-                                  f"push and note retry next round: {exc2}")
-                push_ok = False
-            except (gitop.PushFailed, gitop.GitopError) as exc:
-                self._journal(f"sweep: issue#{iid} push failed, "
-                              f"retry next round: {exc}")
-                push_ok = False
+                    remote_tip = gitop.remote_branch_tip(
+                        self.repo_path, self.remote_url, gitop.fix_branch(iid),
+                        self.ssl_verify)
+                    with self._branch_lock(iid):  # P2-10 单写者
+                        gitop.push_fix_branch_resilient(self.repo_path, iid,
+                                                        self.remote_url, self.ssl_verify)
+                    changed_origin = remote_tip != sha
+                    self._journal(f"sweep: issue#{iid} push {gitop.fix_branch(iid)} "
+                                  f"({count} ahead, origin "
+                                  f"{'updated' if changed_origin else 'unchanged'})")
+                except gitop.PermanentPushFailed as exc:
+                    # 确定性失败：投一条求助留言（留言落地才记旗，否则下轮连
+                    # 留言一起重试）并把 sha 记入 unsafe_flags，同 sha 不再推
+                    self._journal(f"sweep: issue#{iid} push permanently failed, "
+                                  f"escalating to issue board: {exc}")
+                    try:
+                        self.api.post_note(self.project, iid,
+                                           self.api.build_note_body(
+                                               f"欠账巡检：issue#{iid} 推送卡死"
+                                               f"求助——分支 issue/{iid}-fix 与"
+                                               "远端分叉（变基丢失远端已推提交），"
+                                               "daemon 已停止自动重推，请在回合内 "
+                                               "rebase 到 origin tip 后普通推送。"))
+                        unsafe = True
+                        self._journal(f"sweep: issue#{iid} help note posted; "
+                                      f"auto-repush stopped for tip {sha[:12]}")
+                    except api.ApiTransientError as exc2:
+                        self._journal(f"sweep: issue#{iid} help note failed, "
+                                      f"will retry next round: {exc2}")
+                    except api.ApiAuthError as exc2:
+                        self._journal(f"CRITICAL: sweep: issue#{iid} comment "
+                                      f"channel unavailable, no flag recorded, "
+                                      f"push and note retry next round: {exc2}")
+                    push_ok = False
+                except (gitop.PushFailed, gitop.GitopError) as exc:
+                    self._journal(f"sweep: issue#{iid} push failed, "
+                                  f"retry next round: {exc}")
+                    push_ok = False
         flushed = False
         if pending:
             if changed_origin:
@@ -2275,15 +2532,8 @@ class Orchestrator:
             return  # API unavailable; next pass retries
         open_issues, open_notes = fetched
 
-        # 3. first-run baseline vs new-issue detection (polling fallback):
-        #    - ledger without the "baselined" marker -> first install: adopt
-        #      ALL untracked open issues + note-id snapshot and set the marker
-        #      (one time only; it persists in state.json across restarts)
-        #    - marker present -> an open issue MISSING from the ledger was
-        #      created after the baseline (e.g. webhook delivery blocked by
-        #      server policy): synthesize a Gitea "opened" event and feed it
-        #      through the SAME fsm -> claim -> turn path as webhooks
-        new_events = []
+        # 3. first-run baseline（协议 v2：无主新 issue 不再合成 opened 事件
+        #    ——认领只有扫描循环一个入口，reconcile 纯对账）
         with self._ledger_lock:
             ledger = state.load_state(self.state_path, warn=self._journal)
             if ledger.get("baselined") is not True:
@@ -2297,34 +2547,29 @@ class Orchestrator:
                 state.save_state(self.state_path, ledger)
                 self._journal(
                     f"reconcile: baseline adopted {adopted} issue(s) (first run)")
-            else:
-                new_events = [
-                    {"action": "opened",
-                     "issue": {"number": int(issue["number"]),
-                               "title": issue.get("title") or "",
-                               "body": issue.get("body") or "",
-                               "state": "open"}}
-                    for issue in open_issues
-                    if issue.get("number") is not None
-                    and str(int(issue["number"])) not in ledger["issues"]]
-                if new_events:
-                    self._journal(
-                        f"reconcile: {len(new_events)} new untracked issue(s) "
-                        f"→ processing as new")
-        # _handle_event takes the ledger lock itself: feed OUTSIDE it (same
-        # pattern as the note replay below)
-        for event in new_events:
-            self._handle_event(event)
+
+        # 3.5 双机认领对账（协议第 3/6/7 条）：认领评论面已在手（open_notes）
+        #     ——让位（他人认领评论 id 更小）、candidate 崩溃恢复复算、
+        #     他机持有标记；只对账，绝不发认领评论。
+        self._reconcile_ownership(open_notes, open_issues)
 
         # 4. feed every note through the SAME fsm + per-note-id path; issues
         #    with a live claim are skipped entirely (their owner will finish)
+        #    协议 v2：yielded（他机持有）与 candidate（裁决窗内）不重放——
+        #    他机回合与本机候选期都不被打扰
         with self._ledger_lock:
             ledger = state.load_state(self.state_path, warn=self._journal)
             claimed = {iid for iid, e in ledger["issues"].items()
                        if e["status"] == "pending"}
+            untouchable = {iid for iid, e in ledger["issues"].items()
+                           if e.get("claim_state") in ("yielded", "candidate")
+                           # 未认领的 adopted 存量不重放：人类新评论将其转入
+                           # 认领面（双机不双吃——单机时同样经认领接手）
+                           or (e.get("claim_state") == "none"
+                               and e["status"] == "adopted")}
             feedable = {}
             for iid, notes in open_notes.items():
-                if str(iid) in claimed:
+                if str(iid) in claimed or str(iid) in untouchable:
                     continue
                 fresh = [n for n in notes
                          if n.get("id") is not None
@@ -2385,6 +2630,95 @@ class Orchestrator:
         self._last_reconcile = time.monotonic()
         self._journal("reconcile: done")
 
+    def _reconcile_ownership(self, open_notes, open_issues):
+        """双机认领对账（协议第 3/6/7 条；认领评论＝唯一所有权凭据）：
+
+        - owned＋他人认领评论 id 更小 → 让位：取消在飞任务、owner=other
+        - candidate → 复算裁决（窗口期崩溃恢复）：赢→owned＋自续开工；
+          输→认输记账；评论被删且无人认领 → 回 none
+        - none/yielded＋他人认领评论在场 → 标记他机持有（跳过重放/认领）
+        """
+        if not self.machine_id:
+            # 空 machine_id 下「他机」判定恒真（自己的旧认领全成他机），
+            # 与扫描门同口径直接跳过（B 册终闸：防误让位误取消）
+            return
+        takeovers, yields = [], []
+        by_iid = {int(i["number"]): i for i in open_issues
+                  if i.get("number") is not None}
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            changed = False
+            for iid_s, notes in open_notes.items():
+                entry = ledger["issues"].get(str(iid_s))
+                if not isinstance(entry, dict):
+                    continue
+                claims = fsm.claim_comments(notes)
+                others = [(cid, m) for cid, m in claims
+                          if m != self.machine_id]
+                mine = [cid for cid, m in claims if m == self.machine_id]
+                owner = entry.get("owner") or {}
+                cstate = entry.get("claim_state", "none")
+                if cstate == "owned" and others \
+                        and (owner.get("claim_comment_id") is None
+                             or min(others)[0] < owner["claim_comment_id"]):
+                    # 让位（第 6 条）：判据＝认领评论 id 比较，非「存在他人认领」
+                    entry["claim_state"] = "yielded"
+                    entry["owner"] = {"machine": min(others)[1],
+                                      "claim_comment_id": min(others)[0]}
+                    changed = True
+                    yields.append(int(iid_s))
+                elif cstate == "candidate":
+                    if mine and (not others or min(mine) < min(others)[0]):
+                        entry["claim_state"] = "owned"
+                        entry["owner"] = {"machine": self.machine_id,
+                                          "claim_comment_id": min(mine)}
+                        changed = True
+                        if int(iid_s) in by_iid:
+                            takeovers.append((int(iid_s), by_iid[int(iid_s)]))
+                    elif others:
+                        entry["claim_state"] = "yielded"
+                        entry["owner"] = {"machine": min(others)[1],
+                                          "claim_comment_id": min(others)[0]}
+                        changed = True
+                    elif not mine:
+                        entry["claim_state"] = "none"
+                        entry["owner"] = {"machine": None,
+                                          "claim_comment_id": None}
+                        changed = True
+                elif cstate in ("none", "yielded") and others \
+                        and (entry.get("claim_state") != "yielded"
+                             or (entry.get("owner") or {}).get("machine")
+                             != min(others)[1]):
+                    entry["claim_state"] = "yielded"
+                    entry["owner"] = {"machine": min(others)[1],
+                                      "claim_comment_id": min(others)[0]}
+                    changed = True
+            if changed:
+                state.save_state(self.state_path, ledger)
+        for iid in yields:
+            self._journal(f"yield: issue#{iid} 他机认领评论更早——让位"
+                          "（停派停推，owner=other）")
+            self._yield_cancel(iid)
+        for iid, issue in takeovers:
+            self._journal(f"claim: issue#{iid} candidate 恢复裁决胜出，自续开工")
+            with self._ledger_lock:
+                ledger = state.load_state(self.state_path, warn=self._journal)
+                entry = ledger["issues"].get(str(iid))
+                if entry is None or entry["status"] == "pending":
+                    continue  # 已有在飞/已派回合——不重复接管
+                self._claim(iid, [], ledger)
+            self._dispatch_owned(iid, issue)
+
+    def _yield_cancel(self, iid):
+        """让位收尾（协议第 6 条）：取消在飞 agora 任务（board 态检查复用
+        关单取消面）；停推送由 yielded 守卫承担（_push_on_close/不派回合）。"""
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            entry = ledger["issues"].get(str(int(iid))) or {}
+            tid = entry.get("agora_task_id")
+        if tid:
+            self._agora_cancel_on_close(int(iid), tid)
+
     def _review_push_due(self, entry, now) -> bool:
         """True when the entry's delayed-re-push mark exists and the grace
         period has elapsed (a malformed mark is due once, so it gets cleared
@@ -2413,6 +2747,10 @@ class Orchestrator:
                     or not entry.get("review_push_pending_at"):
                 return
             entry.pop("review_push_pending_at", None)
+            if entry.get("claim_state") == "yielded":  # 让位停推送（第 6 条）
+                self._journal(f"reconcile: issue#{iid} 让位后丢弃评审补推标记")
+                state.save_state(self.state_path, ledger)
+                return
             state.save_state(self.state_path, ledger)
         pushed = False
         try:
@@ -2555,6 +2893,11 @@ class Orchestrator:
             if entry is None or entry["status"] != "defer":
                 status = entry["status"] if entry else "untracked"
                 self._journal(f"requeue: issue#{iid} skipped (status={status})")
+                return
+            if entry.get("claim_state") == "yielded":
+                # 协议 v2 让位停派（B 册终闸）：defer 车道也不得复活他机
+                # 持有的 issue（startup 孤儿回收/claim-timeout 同经此门）
+                self._journal(f"requeue: issue#{iid} skipped (yielded)")
                 return
             entry["status"] = "pending"
             entry["claimed_at"] = _now_iso()

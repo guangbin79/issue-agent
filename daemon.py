@@ -1,12 +1,9 @@
 """GitLab-issue-driven opencode agent daemon — the wiring entrypoint.
 
-config -> GitLabClient + WebhookListener + Orchestrator (listener + worker +
-reconcile timer). Runs until SIGTERM/KeyboardInterrupt, then shuts the
-orchestrator down. stdout is the journal under systemd (Restart=on-failure).
-
-http.py shadows the stdlib http package when this directory is first on
-sys.path, so it is loaded under its importlib alias (the supported pattern,
-see tests/test_listener.py) before anything imports urllib.
+config -> GitLabClient + Orchestrator (scan loop + worker + reconcile timer;
+协议 v2 纯轮询——webhook listener 已退役，事件面由扫描循环驱动). Runs
+until SIGTERM/KeyboardInterrupt, then shuts the orchestrator down. stdout is
+the journal under systemd (Restart=on-failure).
 """
 
 import importlib.util
@@ -36,7 +33,7 @@ _PKG_DIR = Path(__file__).resolve().parent
 _SERVICE_NAME = os.environ.get("ISSUE_AGENT_SERVICE_NAME", "issue-agent")
 _STATE_DIR = Path.home() / ".local" / "state" / _SERVICE_NAME
 _SNAPSHOT_DIR = Path.home() / ".local" / "lib" / _SERVICE_NAME
-_DEFAULT_PORT = int(os.environ.get("ISSUE_AGENT_PORT", "8644"))
+# 协议 v2：listener/port 退役（ISSUE_AGENT_PORT/unit 面保留但 daemon 忽略）
 _SWEEP_IDLE_AFTER = timedelta(hours=24)
 
 
@@ -55,6 +52,8 @@ def _teardown_self_cancel():
 
 
 def _load_http_module():
+    """协议 v2 退役面：daemon 不再构造 WebhookListener。保留加载器仅供
+    手工诊断（http.py 仍随快照部署，tests/test_listener.py 直测）。"""
     spec = importlib.util.spec_from_file_location("issue_agent_http", _PKG_DIR / "http.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -137,8 +136,8 @@ def main(argv=None) -> int:
         config = load_config(
             os.environ.get("ISSUE_AGENT_CONFIG")
             or Path.home() / ".config" / _SERVICE_NAME / "config.json")
-        if not config.secret_token:
-            raise ConfigError("config missing secret_token (written by install.sh)")
+        # 协议 v2 纯轮询：webhook listener 退役——secret_token/port/
+        # callback_url 字段保留忽略（幂等兼容），不再校验。
         # config.project ("owner/repo") wins when set; empty = derive from origin
         project = config.project or _project_from_origin(config.repo_path)
     except ConfigError as exc:
@@ -237,17 +236,10 @@ def main(argv=None) -> int:
                                   max_active=config.max_parallel,
                                   stall_timeout=config.agora_stall_timeout)
                      if config.execution_mode == "agora" else None)
-    http_mod = _load_http_module()
-    # Port: the unit's ISSUE_AGENT_PORT env wins; config.port otherwise
-    # (pre-unit installs and manual config edits keep working unchanged).
-    port = _DEFAULT_PORT if os.environ.get("ISSUE_AGENT_PORT") else config.port
-    listener = http_mod.WebhookListener(
-        port, config.secret_token, warn=journal, host="0.0.0.0")
     orch = orchestrator.Orchestrator(
         project=project,
         api=client,
         journal=journal,
-        listener=listener,
         state_path=_STATE_DIR / "state.json",
         repo_path=config.repo_path,
         remote_url=_remote_url(config.api_base, config.pat, project, config.gitea_user),
@@ -267,6 +259,7 @@ def main(argv=None) -> int:
         max_parallel=config.max_parallel,
         review_cmd=config.review_cmd,  # F114 门审全量接线
         verify_base_prefix=config.verify_base_prefix,  # ag-fb9e5a 基线领先防护
+        machine_id=config.machine_id,  # 协议 v2 双机认领身份
         callback_url=config.callback_url,
         worktree_path=config.worktree_path,
         agora_client=agora_client,
@@ -275,8 +268,8 @@ def main(argv=None) -> int:
         ledger_lock=shared_ledger_lock,
         teardown=_teardown_self_cancel,
     )
-    port = orch.start()
-    journal(f"daemon: ready on :{port} (project={project})")
+    orch.start()
+    journal(f"daemon: ready (project={project}, machine={config.machine_id or 'N/A'})")
     # F16: systemd stop sends SIGTERM; route it to the same shutdown path
     # as KeyboardInterrupt so listener + worker unwind gracefully.
     stop_event = threading.Event()

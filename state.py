@@ -50,6 +50,9 @@ from datetime import datetime, timezone
 from typing import Callable, Optional, Union
 
 STATUSES = ("adopted", "active", "done", "paused", "blocked", "defer", "pending")
+# 双机认领协议 v2：认领态（none=未认领/candidate=裁决窗内/owned=我持有/
+# yielded=已让位或认输——他机持有，永不自动重认）
+CLAIM_STATES = ("none", "candidate", "owned", "yielded")
 DEFAULT_CLAIM_TIMEOUT_S = 5500
 PathLike = Union[str, "os.PathLike[str]"]
 
@@ -83,6 +86,15 @@ def _parse_ts(ts: str) -> datetime:
     return dt
 
 
+def _norm_owner(raw) -> dict:
+    """owner{machine, claim_comment_id} 规整面：坏形回退空 owner。"""
+    if not isinstance(raw, dict):
+        return {"machine": None, "claim_comment_id": None}
+    cid = raw.get("claim_comment_id")
+    return {"machine": raw.get("machine"),
+            "claim_comment_id": int(cid) if isinstance(cid, int) else None}
+
+
 def _new_issue(status: str) -> dict:
     return {
         "status": status,
@@ -103,6 +115,9 @@ def _new_issue(status: str) -> dict:
         "router_goal": None,
         "router_model": None,
         "router_deliverable": None,
+        # 双机认领协议 v2：最早认领终身有效（claim 评论 id 面）
+        "owner": {"machine": None, "claim_comment_id": None},
+        "claim_state": "none",
     }
 
 
@@ -115,6 +130,9 @@ def _normalize(state: dict) -> dict:
         entry = raw if isinstance(raw, dict) else {}
         if entry.get("status") not in STATUSES:
             raise ValueError(f"issue {iid}: unknown status {entry.get('status')!r}")
+        if entry.get("claim_state", "none") not in CLAIM_STATES:
+            raise ValueError(f"issue {iid}: unknown claim_state "
+                             f"{entry.get('claim_state')!r}")
         note_ids = sorted({int(n) for n in entry.get("processed_note_ids") or []})
         issues[str(int(iid))] = {
             "status": entry["status"],
@@ -136,6 +154,9 @@ def _normalize(state: dict) -> dict:
             "router_goal": entry.get("router_goal"),
             "router_model": entry.get("router_model"),
             "router_deliverable": entry.get("router_deliverable"),
+            # 双机认领 v2 字段：旧账缺键 → 默认（向后兼容）
+            "owner": _norm_owner(entry.get("owner")),
+            "claim_state": entry.get("claim_state", "none"),
         }
     state["issues"] = issues
     return state

@@ -41,7 +41,7 @@ ISSUE_AGENT_CA_BUNDLE=/path/to/ca.pem bash scripts/issue-agent/install.sh
 # 运行期覆盖（不重写 config）：unit 加 Environment 后 restart 即可生效
 ```
 
-安装器流程：**canonical 路径钉定 + origin 归属校验（离线，最先执行）** → 探测 API base（`/api/v1/version` 须返回 200——Gitea 版本接口无需认证——否则中止）→ 校验 PAT（`GET /api/v1/user`，同时捕获 `login` 写入 config 的 `gitea_user`，用于构造 `https://{gitea_user}:{PAT}@host/{owner}/{repo}.git` 推送 URL；PAT 经 0600 头文件以 `Authorization: token` 传给 curl，绝不上 argv）→ 预检监听端口（占用则退出码 2；服务已 active 时跳过该项——active 守护进程本就持有端口，重跑更新不会误判）与 linger（未启用会打印精确 sudo 命令并中止）→ 部署快照到 `~/.local/lib/<service>/` → 写 `~/.config/<service>/config.json`（0600，含 PAT、`gitea_user`、`project`=owner/repo、service_name/canonical_path/identity/out_of_scope；基线分支取 `.issue-agent.json` 的 default_branch，可用 `ISSUE_AGENT_DEFAULT_BRANCH` 覆盖）→ 装 systemd user unit → 按回调 URL upsert webhook（Gitea `type=gitea`，仅 `issues`+`issue_comment` 事件，`config.url` 匹配幂等）→ branch_protections 保护检查（空/403/404 均告警不中止）→ 触发 test-hook 验证可达（仅告警）→ 启动并验证（失败自动回滚并删除 webhook，保留配置；服务原本 active 则 restart 以加载新快照）。**幂等**：重复运行更新而不堆叠（webhook 复用同一 URL，secret 复用）。
+安装器流程：**canonical 路径钉定 + origin 归属校验（离线，最先执行）** → 探测 API base（`/api/v1/version` 须返回 200——Gitea 版本接口无需认证——否则中止）→ 校验 PAT（`GET /api/v1/user`，同时捕获 `login` 写入 config 的 `gitea_user`，用于构造 `https://{gitea_user}:{PAT}@host/{owner}/{repo}.git` 推送 URL；PAT 经 0600 头文件以 `Authorization: token` 传给 curl，绝不上 argv）→ 预检监听端口（占用则退出码 2；服务已 active 时跳过该项——active 守护进程本就持有端口，重跑更新不会误判）与 linger（未启用会打印精确 sudo 命令并中止）→ 部署快照到 `~/.local/lib/<service>/` → 写 `~/.config/<service>/config.json`（0600，含 PAT、`gitea_user`、`project`=owner/repo、service_name/canonical_path/identity/out_of_scope、`machine_id` 双机认领身份；基线分支取 `.issue-agent.json` 的 default_branch，可用 `ISSUE_AGENT_DEFAULT_BRANCH` 覆盖）→ 装 systemd user unit → **全量删除本项目既有 webhook（协议 v2 纯轮询：不再注册任何 webhook）** → branch_protections 保护检查（空/403/404 均告警不中止）→ 启动并验证（失败自动回滚，保留配置；服务原本 active 则 restart 以加载新快照）。**幂等**：重复运行更新而不堆叠（secret/machine_id 复用）。
 
 ## 卸载
 
@@ -161,11 +161,22 @@ daemon 不再本地拉起 opencode worker，而是经**持久语义 Router** 分
 - **bot 沉淀纪律**（协议步骤 4：修复提交后、删 worktree 前，agent 在 worktree 内做知识 ingest——知识改动以 `docs(issue-agent):` 单独提交随 `issue/<iid>-fix` 分支走评审与人工合并；经验按 agent-experience capture 写草稿入全局库 `~/.dotfiles/.agent-experiences/`，project 字段为 owner/repo，人工审核后 confirmed）：
   - 轻验证口径：仅 pushed 回合；knowledge 检查为累计口径——基线未前移期间多轮续修任一轮写入即 ok，人工合并后基线前移，以本轮新增为准；经验检查按 issue#<iid> 词边界＋project 双门；缺失仅 journal `capture:` warning 不阻塞；Trivial/豁免回合通常 missing（log-only 例外为 ok），warning 属预期噪音而非违规信号。
 
+## 双机部署（认领协议 v2）
+
+两台机共用同一 Gitea 事件源、各跑一个本项目实例（可同 `max_parallel`）时，靠**纯轮询＋粘住式认领＋无抢占**保证不双吃：
+
+- **安装**：两台机各自正常跑 `install.sh`。安装时自动生成 `machine_id`（8 位 hex，写入 `~/.config/<service>/config.json`，重装幂等复用；**勿手改**——它是本机终身身份）。
+- **无 webhook**：v2 起 install.sh 不再注册 webhook，并会**全量删除本项目既有 hooks**；daemon 也不再启动 webhook listener（老 config 的 `port`/`callback_url`/`secret_token` 字段保留忽略）。
+- **认领规则**：认领评论（含 `<!--claim:machine=<id>-->` 标记）id 最小者胜，最早认领终身有效（无过期、无抢占）；败方记账不重试。满槽不认领；本机 triggered 单优先于认领新 issue。
+- **让位**：若墙上出现他人更早（id 更小）的认领评论，本机让位——取消在飞任务、停推送。
+- **孤儿恢复**：死机重启自续（本地账本）；永久死机由人在 Gitea 删掉其认领评论，他机下轮扫描即视为无主重新认领（详见 `PROTOCOL.template.md` 的「双机认领协议」段与孤儿恢复 runbook）。
+
 ## 常见问题
 
 - **API base 探测失败**：`/api/v1/version` 未返回 200——确认填的是 Gitea web 地址（形如 `http://host[:port]`，不带 `/api/v1` 后缀）后重跑安装。
 - **自签名证书**（https Gitea）：客户端按 `ssl_verify=false` 跳过校验（安装器默认写入，属已接受的设计）；`curl` 报证书错误（exit 60）属预期。可用 `ISSUE_AGENT_SSL_VERIFY=true` / `ISSUE_AGENT_CA_BUNDLE=...` 开启完整校验（见上文安装节）。
-- **明文 HTTP 回调**：默认回调 `http://<局域网IP>:<port>` 为按设计接受的方案，webhook 密钥理论上可被局域网嗅探伪造；安装器会打印警告，生产环境建议前置 HTTPS 反向代理后改用 https:// 回调。
+- **明文 HTTP API**：默认 `http://<局域网IP>:<port>` 访问 Gitea API 为按设计接受的方案，PAT 理论上可被局域网嗅探；生产环境建议前置 HTTPS 反向代理。协议 v2 起 webhook 已退役（纯轮询，无回调暴露面）。
+- **机器身份**：`machine_id`（8 位 hex）是双机认领的终身凭据，install.sh 生成并幂等复用；手改成非 hex 会让本机认领评论对他机失明（安装器按无效值重新生成）。
 - **查看日志**：`journalctl --user -u <service>-issue-agent -f`。
-- **回调不可达**：检查本机防火墙对监听端口的放行（安装器会尝试触发 Gitea test-hook 验证）。
+- **回调不可达**：协议 v2 纯轮询后本项已退役（无 webhook 回调面）；事件迟滞先查扫描循环日志（`journalctl --user -u <service>` 中的 `scan:`/`reconcile:` 行）。
 - **issue 与本仓库无关时会怎样**：agent 会以「范围外」开头回复并说明建议去向，不动代码；补充说明后可重新触发处理。

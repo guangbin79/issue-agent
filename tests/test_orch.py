@@ -144,6 +144,19 @@ class FakeApi:
         if self.order is not None:
             self.order.append("note")
 
+    # --- 双机认领协议 v2：认领评论面（与 api.GitLabClient 同形） ----------
+    def build_claim_body(self, machine_id):
+        return (f"\U0001f916 认领本 issue（machine={machine_id}）\n"
+                f"<!--claim:machine={machine_id}-->\n{self.note_marker}")
+
+    def post_claim(self, project, iid, machine_id):
+        body = self.build_claim_body(machine_id)
+        self.next_comment_id = getattr(self, "next_comment_id", 9000) + 1
+        cid = self.next_comment_id
+        self.issues.setdefault(int(iid), []).append(api_comment(cid, body))
+        self.posts.append((int(iid), body))
+        return {"id": cid}
+
     def list_hooks(self, project):
         return list(self.hooks)
 
@@ -1632,10 +1645,12 @@ def test_fetch_partial_transient_holds_since_store(harness, monkeypatch):
 
 def test_reconcile_after_baseline_new_issue_runs_turn(tmp_path, monkeypatch):
     """First reconcile adopts (marker set); a LATER reconcile seeing a new
-    untracked issue must feed a synthetic 'opened' event through _handle_event
-    -> fsm new -> claim -> turn (fresh session), not adopt it silently."""
+    untracked issue must NOT claim it (协议 v2 认领单入口＝扫描循环)——
+    reconcile 只对账；_scan_once 认领并开工（fresh session）。"""
+    monkeypatch.setattr(orchestrator, "ARBITRATION_WINDOW_S", 0)
     harness = Harness(tmp_path, monkeypatch,
-                      api_issues={11: [api_comment(101, "存量评论")]}, start=False)
+                      api_issues={11: [api_comment(101, "存量评论")]}, start=False,
+                      machine_id="aaaa1111")
     harness.orch.start()
     try:
         assert harness.entry(11)["status"] == "adopted"
@@ -1643,10 +1658,15 @@ def test_reconcile_after_baseline_new_issue_runs_turn(tmp_path, monkeypatch):
 
         harness.api.issues[12] = [api_comment(201, "新 issue 的评论")]
         harness.orch.reconcile()
-        assert harness.journal("new untracked issue(s)"), harness.journal_msgs
+        # v2：reconcile 不得对无主新 issue 预占/开工
+        assert harness.entry(12) is None or \
+            harness.entry(12)["status"] != "pending"
+        assert not harness.runner.new_calls, "reconcile must not claim (v2)"
+
+        harness.orch._scan_once()
         assert wait_until(lambda: harness.entry(12)["status"] == "active"), (
             harness.journal_msgs)
-        assert len(harness.runner.new_calls) == 1, "new issue started a fresh session"
+        assert len(harness.runner.new_calls) == 1, "scan claimed + started a fresh session"
         assert harness.runner.new_calls[0]["title"].startswith("issue#12:")
         assert any("已接手 issue#12" in b for _, b in harness.api.posts)
     finally:
@@ -1655,16 +1675,19 @@ def test_reconcile_after_baseline_new_issue_runs_turn(tmp_path, monkeypatch):
 
 def test_restart_does_not_adopt_new_untracked_issue(tmp_path, monkeypatch):
     """A daemon restart (fresh Orchestrator, same state file) must NOT re-adopt:
-    the persisted 'baselined' marker routes a new untracked issue into a real
-    turn instead of the first-install adoption path."""
+    the persisted 'baselined' marker routes a new untracked issue into the
+    scan-loop claim path instead of the first-install adoption path."""
+    monkeypatch.setattr(orchestrator, "ARBITRATION_WINDOW_S", 0)
     state_path = tmp_path / "state.json"
-    first = Harness(tmp_path, monkeypatch, api_issues={11: []}, start=False)
+    first = Harness(tmp_path, monkeypatch, api_issues={11: []}, start=False,
+                    machine_id="aaaa1111")
     first.orch.start()
     first.orch.stop()
     assert first.journal("baseline adopted")
     assert state.load_state(state_path).get("baselined") is True
 
-    second = Harness(tmp_path, monkeypatch, api_issues={11: [], 12: []}, start=False)
+    second = Harness(tmp_path, monkeypatch, api_issues={11: [], 12: []}, start=False,
+                     machine_id="aaaa1111")
     second.orch.start()
     try:
         assert second.journal("baseline adopted") == [], "restart re-adopted!"
@@ -1700,16 +1723,18 @@ def test_baselined_ledger_with_tracked_issues_no_readoption(harness):
 
 
 def test_synthetic_event_carries_title_and_body(tmp_path, monkeypatch):
-    """The synthetic opened event must carry the API issue title/body so
-    prompt building works exactly like a webhook 'opened' delivery."""
-    harness = Harness(tmp_path, monkeypatch, api_issues={}, start=False)
+    """协议 v2：无主新 issue 由扫描循环认领接管——接管回合必须携带 API
+    issue 标题/正文（与 webhook opened 投递同构的 prompt 面）。"""
+    monkeypatch.setattr(orchestrator, "ARBITRATION_WINDOW_S", 0)
+    harness = Harness(tmp_path, monkeypatch, api_issues={}, start=False,
+                      machine_id="aaaa1111")
     harness.orch.start()
     try:
         assert harness.journal("baseline adopted")
         harness.api.issues[13] = []
         harness.api.issue_records[13] = {"title": "修复登录超时", "body": "登录 30s 后超时"}
-        harness.orch.reconcile()
-        assert harness.runner.new_calls, harness.journal_msgs
+        harness.orch._scan_once()
+        assert wait_until(lambda: harness.runner.new_calls), harness.journal_msgs
         call = harness.runner.new_calls[0]
         assert call["title"].startswith("issue#13:")
         assert "修复登录超时" in call["title"]
