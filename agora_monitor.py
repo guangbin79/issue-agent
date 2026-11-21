@@ -49,6 +49,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import gitop
@@ -95,6 +96,13 @@ ANSWER_CONTINUE_CONTRACT = (
     "答案送达后必须继续任务直至 post(done) 或 post(kind=question)，"
     "不得以回应答案作为回合终局")
 
+# ag-791c36：死等升级缺省阈值——同文 note 连响轮数（连续 ≥N 条逐字
+# 相同 worker note 触发处置卡）／awaiting_external 持续秒数；0＝关闸。
+# 事故背景（ag-0f7d7f 死等 18h 放大器）：worker 逐字同文 note × Router
+# 逐轮 nudge 互为放大器，无人识别死锁，需人裁决事项从未上 issue 面板。
+DEFAULT_STUCK_NOTE_ROUNDS = 3
+DEFAULT_STUCK_AWAIT_S = 7200
+
 # ag-da7410 C：僵态阶梯缺省阈值（秒，configurable 经 config.
 # agora_stall_timeout；0＝关闸）＋第一档 nudge 强指令文案（服务面
 # /task_nudge 契约 ≤2000 字符）。
@@ -130,6 +138,27 @@ def _stall_load(state_path) -> dict:
 def _stall_save(state_path, row) -> None:
     state.write_json_atomic(str(state_path) + ".agora-stalls.json", row)
 
+
+# ag-791c36：死等裁定 store（账本旁，仿 _sweep_path 形态）——
+# {"tasks": {tid: 检测行}, "rulings": {rid: 裁定记录（id/任务/动作类型/
+# 精确参数/时间）}}；裁定记录随发卡持久化，供后续批准执行任务消费。
+def _stuck_store_load(state_path) -> dict:
+    try:
+        raw = json.loads(
+            Path(str(state_path) + ".agora-rulings.json").read_text(
+                encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"tasks": {}, "rulings": {}}
+    if not isinstance(raw, dict):
+        return {"tasks": {}, "rulings": {}}
+    raw.setdefault("tasks", {})
+    raw.setdefault("rulings", {})
+    return raw
+
+
+def _stuck_store_save(state_path, store) -> None:
+    state.write_json_atomic(str(state_path) + ".agora-rulings.json", store)
+
 # board 主状态（task 行 state）：这三个对本监视器是终态（名额可释放）
 _TERMINAL_STATES = ("merged", "closed", "cancelled")
 
@@ -155,13 +184,18 @@ class AgoraMonitor:
     """本实例活动 agora 任务的登记簿＋轮询线程＋外部交付状态机。"""
 
     def __init__(self, *, client, journal=None, max_active=1,
-                 stall_timeout=DEFAULT_STALL_TIMEOUT_S):
+                 stall_timeout=DEFAULT_STALL_TIMEOUT_S,
+                 stuck_note_rounds=DEFAULT_STUCK_NOTE_ROUNDS,
+                 stuck_await_s=DEFAULT_STUCK_AWAIT_S):
         self._client = client
         self._journal = journal if journal is not None else (
             lambda message: None)
         self._max_active = max(1, int(max_active))
         # ag-da7410 C：僵态阶梯阈值（秒；0＝关闸）
         self._stall_timeout = max(0, int(stall_timeout))
+        # ag-791c36：死等升级阈值（0＝关闸）
+        self._stuck_note_rounds = max(0, int(stuck_note_rounds))
+        self._stuck_await_s = max(0, int(stuck_await_s))
         self._guard = threading.Lock()
         self._active = {}  # iid(int) -> tid(str|None)：一 issue 一活动任务
         self._stop = threading.Event()
@@ -424,6 +458,10 @@ class AgoraMonitor:
         with self._guard:  # 心跳显示最新 board 态（Task 5）
             if iid in self._hb:
                 self._hb[iid]["status"] = status
+        # ag-791c36：awaiting_external 悬置检测（处置卡；裁定落盘先行）
+        card = self._stuck_track_await(iid, tid, delivery)
+        if card is not None:
+            self._comment(iid, card)
         if task_state in _TERMINAL_STATES:
             self._journal(f"agora-monitor: issue#{iid} task {tid} "
                           f"{task_state}; slot released")
@@ -561,6 +599,12 @@ class AgoraMonitor:
         idle = now - max(task.get("created") or 0.0, seen, st["epoch"])
         if idle < self._stall_timeout or st["exhausted"]:
             return
+        if self._state_path is not None and _stuck_store_load(
+                self._state_path)["tasks"].get(tid, {}).get("escalated"):
+            # ag-791c36：死等升级在案（处置卡已在 issue 等人工）——停止
+            # 对该卡点催办：整梯跳过（nudge/自动重派），人工处置后经面板
+            # 「重试」（redispatched）复位死等行重新武装
+            return
         if st["nudges"] < 2:
             try:
                 result = self._client.task_nudge(tid, STALL_NUDGE_TEXT)
@@ -627,6 +671,125 @@ class AgoraMonitor:
         self._journal(f"agora-monitor: issue#{iid} task {tid} stalled after "
                       "auto-redispatch; blocked on panel, slot released")
 
+    # ---- 死等升级：处置卡＋裁定 store（ag-791c36）----
+
+    def _stuck_card(self, tid, rid, fact) -> str:
+        """处置卡文案：任务 id＋卡点事实＋Router 裁定行＋需人工处理＋
+        裁定 id（uuid4 短形）。Router 裁定目前无在案持久面（问答经
+        answer 即时闭环）——恒写「待 Router 裁定」，有裁定源后此行替换。"""
+        return (f"【死等处置卡｜任务 {tid}｜裁定id {rid}】需人工处理\n"
+                f"卡点事实：{fact}\n"
+                "Router 裁定：待 Router 裁定（暂无在案自动裁定与待执行"
+                "命令）")
+
+    def _stuck_on_note(self, iid, tid, body):
+        """同文 note 死等检测：连续逐字相同 worker note 计数，达
+        stuck_note_rounds 发处置卡（同卡点仅一张）。调用方持 _store_lock
+        （与报告入库同一临界区）；落盘先行——裁定与去重键持久化成功才
+        评论（崩溃窗宁可少一条评论也不重复刷屏）。返回卡文本或 None。"""
+        if not self._stuck_note_rounds or self._state_path is None:
+            return None
+        store = _stuck_store_load(self._state_path)
+        row = store["tasks"].setdefault(tid, {})
+        if row.get("last_body") == body:
+            row["rounds"] = int(row.get("rounds", 0)) + 1
+        else:
+            row["rounds"] = 1
+            row["last_body"] = body
+            row["escalated"] = False  # 卡点已变：恢复催办、允许新卡
+        card = None
+        key = "notes:" + body
+        if row["rounds"] >= self._stuck_note_rounds \
+                and row.get("note_card") != key:
+            rid = uuid.uuid4().hex[:8]
+            row["escalated"] = True
+            row["note_card"] = key
+            store["rulings"][rid] = {
+                "task": tid, "iid": int(iid),
+                "action": "stuck_escalation",
+                "params": {"kind": "identical_notes",
+                           "rounds": row["rounds"], "body": body},
+                "time": time.time()}
+            card = self._stuck_card(
+                tid, rid,
+                f"worker 已连续 {row['rounds']} 轮发送逐字相同的 note"
+                f"（等待外部处置，自动催办已停止）。note 原文：{body}")
+        try:
+            _stuck_store_save(self._state_path, store)
+        except OSError as exc:
+            # 未持久化不发卡（防重复刷屏）：状态不前移，下一轮重试
+            self._journal(f"agora-monitor: stuck store write failed: {exc}")
+            return None
+        if card is not None:
+            self._journal(f"agora-monitor: issue#{iid} task {tid} stuck on "
+                          f"{row['rounds']} identical notes; escalation "
+                          f"card posted")
+        return card
+
+    def _stuck_track_await(self, iid, tid, delivery):
+        """awaiting_external 悬置检测：done 后交付窗持续超
+        stuck_await_s 发处置卡（同卡点仅一张）；离开 awaiting 清计时。"""
+        if self._state_path is None:
+            return None
+        store = _stuck_store_load(self._state_path)
+        row = store["tasks"].setdefault(tid, {})
+        if (delivery or {}).get("status") != "awaiting_external":
+            if row.pop("await_since", None) is not None:
+                try:
+                    _stuck_store_save(self._state_path, store)
+                except OSError as exc:
+                    self._journal(f"agora-monitor: stuck store write "
+                                  f"failed: {exc}")
+            return None
+        if not self._stuck_await_s:
+            return None
+        now = time.time()
+        if not row.get("await_since"):
+            row["await_since"] = now
+            try:
+                _stuck_store_save(self._state_path, store)
+            except OSError as exc:
+                self._journal(f"agora-monitor: stuck store write "
+                              f"failed: {exc}")
+            return None
+        elapsed = now - row["await_since"]
+        if elapsed < self._stuck_await_s or row.get("await_card"):
+            return None
+        rid = uuid.uuid4().hex[:8]
+        row["escalated"] = True
+        row["await_card"] = True
+        store["rulings"][rid] = {
+            "task": tid, "iid": int(iid), "action": "stuck_escalation",
+            "params": {"kind": "awaiting_external", "await_s": int(elapsed),
+                       "commit": (delivery or {}).get("commit")},
+            "time": now}
+        card = self._stuck_card(
+            tid, rid,
+            f"任务已 done 且交付 awaiting_external 持续 {int(elapsed)} 秒"
+            f"（超阈值 {self._stuck_await_s} 秒）无进展，自动催办已停止。")
+        try:
+            _stuck_store_save(self._state_path, store)
+        except OSError as exc:
+            self._journal(f"agora-monitor: stuck store write failed: {exc}")
+            return None
+        self._journal(f"agora-monitor: issue#{iid} task {tid} stuck "
+                      f"awaiting_external {int(elapsed)}s; escalation card "
+                      "posted")
+        return card
+
+    def _stuck_row_prune(self, tid):
+        """终态/重派清死等检测行（裁定记录保留在 rulings——账本旁
+        archive 供后续批准执行消费；sidecar tasks 段不随任务数无界增长）。"""
+        if self._state_path is None:
+            return
+        store = _stuck_store_load(self._state_path)
+        if store["tasks"].pop(tid, None) is None:
+            return
+        try:
+            _stuck_store_save(self._state_path, store)
+        except OSError as exc:
+            self._journal(f"agora-monitor: stuck store prune failed: {exc}")
+
     # ---- 终态汇报（Task 5）----
 
     @staticmethod
@@ -665,6 +828,7 @@ class AgoraMonitor:
         else:
             self._report_comment(iid, tid, delivery.get("commit"))
         self._stall_row_prune(tid)
+        self._stuck_row_prune(tid)  # ag-791c36：死等行随终态出账
         self.release(iid, tid)
 
     def _finish_blocked(self, iid, tid, delivery):
@@ -681,6 +845,7 @@ class AgoraMonitor:
             "\n处置：评论『重试』重派，或『取消任务』归档。",
             mark="blocked")
         self._stall_row_prune(tid)
+        self._stuck_row_prune(tid)  # ag-791c36：死等行随 blocked 出账
         self.release(iid, tid)
 
     def redispatched(self, iid, tid):
@@ -701,6 +866,7 @@ class AgoraMonitor:
             stall = self._stall_fresh(0.0)
             stall["epoch"] = time.time()
             self._stall_row_save(tid, stall)
+            self._stuck_row_prune(tid)  # ag-791c36：新一轮重武装死等检测
             if self._state_path is None:
                 return
             with self._store_lock:  # B-F1：与 poll 线程报告入库互斥
@@ -1183,7 +1349,9 @@ class AgoraMonitor:
     def _store_report_note(self, iid, tid, mid, body):
         """worker note 持久化为报告候选（最新 note_id 胜；重放旧批次不
         回退）。终态回评与重发汇报共用此库。ag-1c7315（B-F1）：写段持
-        写者互斥锁——与处置侧 redispatched 清标互斥。"""
+        写者互斥锁——与处置侧 redispatched 清标互斥。ag-791c36：入库后
+        同临界区跑同文 note 死等检测（裁定落盘先行，评论出锁后发）。"""
+        card = None
         with self._store_lock:
             store = self._reports_load()
             reports = store.setdefault("reports", {})
@@ -1202,6 +1370,9 @@ class AgoraMonitor:
                 # 终闸 B-3：落盘瞬态失败≠毒消息——留 pending 下一轮重放，
                 # 不让报告永久丢失成降级评论
                 raise _MailDeferred(f"reports store write failed: {exc}") from exc
+            card = self._stuck_on_note(iid, tid, body)
+        if card is not None:
+            self._comment(iid, card)
 
     def _handle_worker_question(self, iid, tid, body):
         """worker 提问 → 答复回调（orchestrator 在 ledger_lock 内交

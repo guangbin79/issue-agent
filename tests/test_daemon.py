@@ -464,5 +464,6 @@ def test_daemon_agora_mode_builds_monitor_and_threads_it(tmp_path, monkeypatch):
     journal = kwargs.pop("journal")
     assert callable(journal)
     assert kwargs == {"client": captured["agora_client"], "max_active": 1,
-                      "stall_timeout": 1800}
+                      "stall_timeout": 1800,
+                      "stuck_note_rounds": 3, "stuck_await_s": 7200}
     assert captured["agora_monitor"] is built[0]

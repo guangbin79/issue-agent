@@ -234,7 +234,9 @@ def main(argv=None) -> int:
     # 生命周期。legacy 恒 None。
     agora_monitor = (AgoraMonitor(client=agora_client, journal=journal,
                                   max_active=config.max_parallel,
-                                  stall_timeout=config.agora_stall_timeout)
+                                  stall_timeout=config.agora_stall_timeout,
+                                  stuck_note_rounds=config.stuck_note_rounds,
+                                  stuck_await_s=config.stuck_await_s)
                      if config.execution_mode == "agora" else None)
     orch = orchestrator.Orchestrator(
         project=project,

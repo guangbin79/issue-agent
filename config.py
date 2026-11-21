@@ -64,6 +64,12 @@ class Config:
     # ag-da7410 C：僵态升级阶梯阈值（秒）——running 任务板面零活动超此值
     # 触发 nudge×2→自动重派一次→blocked；0＝关闸
     agora_stall_timeout: int = 1800
+    # ag-791c36：死等升级——同文 note 连响轮数（连续 ≥N 条逐字相同
+    # worker note → issue 处置卡＋停 nudge）；0＝关闸
+    stuck_note_rounds: int = 3
+    # ag-791c36：死等升级——done 后 delivery awaiting_external 持续秒数
+    # 阈值（超时 → issue 处置卡）；0＝关闸
+    stuck_await_s: int = 7200
     # F114 门审命令：非空则每个 agora 任务携 review_cmd 派发——门在 verify
     # 绿后亲自执行（AGORA_REVIEW_BASE 注入任务起点）；空＝协议锚路径
     review_cmd: str = ""
@@ -186,6 +192,10 @@ def load_config(path: "str | Path | None" = None) -> Config:
         agora_stall_timeout=_bounded_int(
             raw.get("agora_stall_timeout", 1800), "agora_stall_timeout",
             1800, 0),
+        stuck_note_rounds=_bounded_int(
+            raw.get("stuck_note_rounds", 3), "stuck_note_rounds", 3, 0),
+        stuck_await_s=_bounded_int(
+            raw.get("stuck_await_s", 7200), "stuck_await_s", 7200, 0),
         review_cmd=str(raw.get("review_cmd", "") or ""),
         machine_id=str(raw.get("machine_id", "") or ""),
         verify_base_prefix=str(raw.get("verify_base_prefix", "") or ""),
