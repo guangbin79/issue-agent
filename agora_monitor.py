@@ -505,6 +505,7 @@ class AgoraMonitor:
                 if isinstance(commit, str) and _HEX40_OK.fullmatch(commit):
                     self._record_delivery_commit(iid, commit)
                 self._report_comment(iid, tid, commit)
+                self._stuck_row_prune(tid)  # R1-F2：成功收口清死等行
                 self.release(iid, tid)
         # 其余（pending/integrating 与未到 done 的运行态）：本轮无动作——
         # running 且零板面活动超阈值时走僵态阶梯（ag-da7410 C）
@@ -713,7 +714,10 @@ class AgoraMonitor:
             card = self._stuck_card(
                 tid, rid,
                 f"worker 已连续 {row['rounds']} 轮发送逐字相同的 note"
-                f"（等待外部处置，自动催办已停止）。note 原文：{body}")
+                f"（等待外部处置，自动催办已停止）。note 原文："
+                + " ⏎ ".join(body.splitlines()))  # R1-F4：换行中性化，
+            # 防 body 伪造卡内协议行（如假「Router 裁定：」行）；
+            # ruling store params.body 仍逐字存档（数据面不消毒）
         try:
             _stuck_store_save(self._state_path, store)
         except OSError as exc:
@@ -728,67 +732,82 @@ class AgoraMonitor:
 
     def _stuck_track_await(self, iid, tid, delivery):
         """awaiting_external 悬置检测：done 后交付窗持续超
-        stuck_await_s 发处置卡（同卡点仅一张）；离开 awaiting 清计时。"""
+        stuck_await_s 发处置卡（同卡点仅一张）；离开 awaiting 清计时
+        ＋清卡去重键（状态变＝新卡点，重武装，评审环 R1-F3）。整段持
+        _store_lock：裁定 store 全部写者（_stuck_on_note 调用方持锁、
+        _stuck_row_prune、本方法）共用一把互斥锁——跨线程丢更新会
+        复活 escalated 行或抹去去重键（评审环 R1-F1）；锁序恒
+        reconcile→store，无反向路径。"""
         if self._state_path is None:
             return None
-        store = _stuck_store_load(self._state_path)
-        row = store["tasks"].setdefault(tid, {})
-        if (delivery or {}).get("status") != "awaiting_external":
-            if row.pop("await_since", None) is not None:
+        with self._store_lock:
+            store = _stuck_store_load(self._state_path)
+            row = store["tasks"].setdefault(tid, {})
+            if (delivery or {}).get("status") != "awaiting_external":
+                if row.pop("await_since", None) is not None:
+                    row.pop("await_card", None)  # R1-F3：状态变重武装
+                    try:
+                        _stuck_store_save(self._state_path, store)
+                    except OSError as exc:
+                        self._journal(f"agora-monitor: stuck store write "
+                                      f"failed: {exc}")
+                return None
+            if not self._stuck_await_s:
+                return None
+            now = time.time()
+            if not row.get("await_since"):
+                row["await_since"] = now
                 try:
                     _stuck_store_save(self._state_path, store)
                 except OSError as exc:
                     self._journal(f"agora-monitor: stuck store write "
                                   f"failed: {exc}")
-            return None
-        if not self._stuck_await_s:
-            return None
-        now = time.time()
-        if not row.get("await_since"):
-            row["await_since"] = now
+                return None
+            elapsed = now - row["await_since"]
+            if elapsed < self._stuck_await_s or row.get("await_card"):
+                return None
+            rid = uuid.uuid4().hex[:8]
+            row["escalated"] = True
+            row["await_card"] = True
+            store["rulings"][rid] = {
+                "task": tid, "iid": int(iid), "action": "stuck_escalation",
+                "params": {"kind": "awaiting_external",
+                           "await_s": int(elapsed),
+                           "commit": (delivery or {}).get("commit")},
+                "time": now}
+            card = self._stuck_card(
+                tid, rid,
+                f"任务已 done 且交付 awaiting_external 持续 {int(elapsed)} 秒"
+                f"（超阈值 {self._stuck_await_s} 秒）无进展，自动催办已停止。")
             try:
                 _stuck_store_save(self._state_path, store)
             except OSError as exc:
                 self._journal(f"agora-monitor: stuck store write "
                               f"failed: {exc}")
-            return None
-        elapsed = now - row["await_since"]
-        if elapsed < self._stuck_await_s or row.get("await_card"):
-            return None
-        rid = uuid.uuid4().hex[:8]
-        row["escalated"] = True
-        row["await_card"] = True
-        store["rulings"][rid] = {
-            "task": tid, "iid": int(iid), "action": "stuck_escalation",
-            "params": {"kind": "awaiting_external", "await_s": int(elapsed),
-                       "commit": (delivery or {}).get("commit")},
-            "time": now}
-        card = self._stuck_card(
-            tid, rid,
-            f"任务已 done 且交付 awaiting_external 持续 {int(elapsed)} 秒"
-            f"（超阈值 {self._stuck_await_s} 秒）无进展，自动催办已停止。")
-        try:
-            _stuck_store_save(self._state_path, store)
-        except OSError as exc:
-            self._journal(f"agora-monitor: stuck store write failed: {exc}")
-            return None
-        self._journal(f"agora-monitor: issue#{iid} task {tid} stuck "
-                      f"awaiting_external {int(elapsed)}s; escalation card "
-                      "posted")
-        return card
+                return None
+            self._journal(f"agora-monitor: issue#{iid} task {tid} stuck "
+                          f"awaiting_external {int(elapsed)}s; escalation "
+                          "card posted")
+            return card
 
     def _stuck_row_prune(self, tid):
         """终态/重派清死等检测行（裁定记录保留在 rulings——账本旁
-        archive 供后续批准执行消费；sidecar tasks 段不随任务数无界增长）。"""
+        archive 供后续批准执行消费；sidecar tasks 段不随任务数无界
+        增长，评审环 R1-F2）。持 _store_lock：与 poll 线程裁定 store
+        写者互斥（R1-F1）。malformed-handoff 本地释放与 _ack failed
+        出口有意不清行——该形态任务会被 _reconcile_ledger 重新补登记，
+        残行去重键防补登记后重复发卡；单任务至多一行，有界。"""
         if self._state_path is None:
             return
-        store = _stuck_store_load(self._state_path)
-        if store["tasks"].pop(tid, None) is None:
-            return
-        try:
-            _stuck_store_save(self._state_path, store)
-        except OSError as exc:
-            self._journal(f"agora-monitor: stuck store prune failed: {exc}")
+        with self._store_lock:
+            store = _stuck_store_load(self._state_path)
+            if store["tasks"].pop(tid, None) is None:
+                return
+            try:
+                _stuck_store_save(self._state_path, store)
+            except OSError as exc:
+                self._journal(f"agora-monitor: stuck store prune "
+                              f"failed: {exc}")
 
     # ---- 终态汇报（Task 5）----
 
@@ -1128,6 +1147,7 @@ class AgoraMonitor:
                 if board_state in _TERMINAL_STATES else "closed/delivered"
             self._sync_agora_status(iid, status)
             self._report_comment(iid, tid, delivery.get("commit") or commit)
+            self._stuck_row_prune(tid)  # R1-F2：成功收口清死等行
             self.release(iid, tid)
             return
         self._journal(f"agora-monitor: issue#{iid} board moved after "
@@ -1166,6 +1186,7 @@ class AgoraMonitor:
             # ocr R1 #3：board 确认交付必须回评报告——release 后无人再
             # 轮询，静默释放会让汇报丢到重启。
             self._report_comment(iid, tid, attempted)
+            self._stuck_row_prune(tid)  # R1-F2：成功收口清死等行
             self.release(iid, tid)
             return
         # 仍 awaiting_external（同 commit＝未处理，异 commit＝已轮转）或
