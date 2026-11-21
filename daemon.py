@@ -262,6 +262,7 @@ def main(argv=None) -> int:
         review_cmd=config.review_cmd,  # F114 门审全量接线
         verify_base_prefix=config.verify_base_prefix,  # ag-fb9e5a 基线领先防护
         machine_id=config.machine_id,  # 协议 v2 双机认领身份
+        approvers=config.approvers,  # ag-72646a 评论批准白名单
         callback_url=config.callback_url,
         worktree_path=config.worktree_path,
         agora_client=agora_client,

@@ -223,6 +223,14 @@ class AgoraClient:
         self._task_call("/task_update",
                         {"task": tid, "verify_cmd": verify_cmd})
 
+    def root_task_update(self, tid, verify_cmd) -> None:
+        """ag-72646a：root 牌 verify 改写——评论批准执行器的唯一执行面。
+        verify 建单即锁后 dispatcher/worker 的 task_update 均 403
+        （ag-0f7d7f 判例：最终人工以 root HTTP 落账）；root 牌直接来自
+        服务发现（service.json＋root.token），不经 cred_for_sid。"""
+        self._call("/task_update", {"task": tid, "verify_cmd": verify_cmd},
+                   self._discover())
+
     def task_nudge(self, tid, body) -> dict:
         """ag-da7410 C：既有 /task_nudge HTTP 面 dispenser 提示注入（服务
         返回 {"nudged": bool, "reason": ...}；body ≤2000 字符服务端校验）。"""

@@ -151,8 +151,13 @@ def _stuck_store_load(state_path) -> dict:
         return {"tasks": {}, "rulings": {}}
     if not isinstance(raw, dict):
         return {"tasks": {}, "rulings": {}}
-    raw.setdefault("tasks", {})
-    raw.setdefault("rulings", {})
+    # 容器级矫正（ag-72646a 评审环 B 册）：已存在但非 dict 的段＝坏档，
+    # 按空表处理——消费面（ruling_get/mark_consumed）不得让 AttributeError
+    # 逃逸（尤其在 root 落账后炸断消费确认闭环）
+    if not isinstance(raw.get("tasks"), dict):
+        raw["tasks"] = {}
+    if not isinstance(raw.get("rulings"), dict):
+        raw["rulings"] = {}
     return raw
 
 
@@ -789,6 +794,37 @@ class AgoraMonitor:
                           f"awaiting_external {int(elapsed)}s; escalation "
                           "card posted")
             return card
+
+    # ---- 裁定 store 消费面（ag-72646a 评论批准执行器）----
+
+    def ruling_get(self, rid):
+        """裁定记录只读（copy）；未知/坏形返回 None。持 _store_lock：与
+        本类全部 store 写者互斥（R1-F1 同款纪律）。"""
+        if self._state_path is None:
+            return None
+        with self._store_lock:
+            record = _stuck_store_load(self._state_path)["rulings"].get(rid)
+            return dict(record) if isinstance(record, dict) else None
+
+    def ruling_mark_consumed(self, rid):
+        """裁定标记 consumed（落盘，跨重启）。返回 False＝未知 id 或写
+        失败（调用方回评如实示警）。持 _store_lock。"""
+        if self._state_path is None:
+            return False
+        with self._store_lock:
+            store = _stuck_store_load(self._state_path)
+            record = store["rulings"].get(rid)
+            if not isinstance(record, dict):
+                return False
+            record["consumed"] = True
+            record["consumed_at"] = time.time()
+            try:
+                _stuck_store_save(self._state_path, store)
+            except OSError as exc:
+                self._journal(f"agora-monitor: ruling consume write "
+                              f"failed: {exc}")
+                return False
+            return True
 
     def _stuck_row_prune(self, tid):
         """终态/重派清死等检测行（裁定记录保留在 rulings——账本旁

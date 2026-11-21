@@ -51,6 +51,7 @@ from typing import Callable, Optional
 
 import api
 from api import NOTE_MARKER as _DEFAULT_NOTE_MARKER
+import approval
 import fsm
 import gitop
 import router
@@ -226,6 +227,7 @@ class Orchestrator:
                  callback_url: str = "",
                  worktree_path: str = "",
                  machine_id: str = "",
+                 approvers: tuple = (),
                  teardown: Optional[Callable[[], None]] = None,
                  agora_client=None,
                  router=None,
@@ -327,6 +329,16 @@ class Orchestrator:
                 answer_question=self._answer_worker_question,
                 heartbeat_interval=self.heartbeat_interval)
             self.agora_monitor.attach_slot_callback(self._on_slots_freed)
+            # ag-72646a：评论批准执行器（「批准 <裁定id>」面板指令 → root
+            # task_update）。构造在 monitor 接线之后（消费其裁定 store）；
+            # approvers 白名单来自 config（缺省 [gitea_user]）。纯代码零
+            # LLM——router 不入本链路。
+            self.approval = approval.CommentApproval(
+                api=api, project=project, agora_client=agora_client,
+                monitor=self.agora_monitor, approvers=approvers,
+                journal=self._journal, post_note=self._post_note)
+        else:
+            self.approval = None
         # bounded turn slots + per-issue locks replace the historical process-
         # wide turn lock: at most max_parallel turns in flight, and a given
         # issue's turns never overlap (same-issue events queue behind the lock).
@@ -719,6 +731,10 @@ class Orchestrator:
         # (whole-line 重试/取消任务 — classified by the fsm)
         if action in ("redispatch", "cancel_task"):
             self._agora_disposal_command(iid, action, event)
+            return
+        # ag-72646a: panel approval command (whole-line 批准 <裁定id>)
+        if action == "approve":
+            self._approval_command(iid, event)
             return
         # pause / unpause / close / reopen: ledger mutation inside the lock
         with self._ledger_lock:
@@ -1343,6 +1359,26 @@ class Orchestrator:
                     self.agora_monitor.announce_cancelled(iid, tid)
                 self._journal(f"disposal: issue#{iid} task {tid} cancelled "
                               "by panel command")
+
+    def _approval_command(self, iid, event):
+        """ag-72646a：面板批准指令「批准 <裁定id>」→ 评论授权执行器。
+        消费即记 note id（同 disposal 口径）；未接线（legacy/缺 monitor）
+        journal 忽略。白名单/正文回读/裁定 store/consumed/幂等复核与
+        root task_update 执行全在执行器（approval.CommentApproval）——
+        本方法零 LLM，永不触 Router。"""
+        comment = event.get("comment") or {}
+        note_ids = self._note_ids(event)
+        with self._ledger_lock:
+            ledger = state.load_state(self.state_path, warn=self._journal)
+            if note_ids:
+                state.mark_processed(ledger, iid, note_ids)
+            state.save_state(self.state_path, ledger)
+        if self.approval is None:
+            self._journal(f"approval: issue#{iid} 「批准」 ignored "
+                          "(approval executor not wired)")
+            return
+        with self._iid_lock(iid):  # 与同 issue 回合串行（同回合锁序）
+            self.approval.handle(iid, comment.get("id"))
 
     def _agora_relay_comment(self, iid, tid, message, note_id,
                              defer_on_fail=False):

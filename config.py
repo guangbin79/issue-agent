@@ -81,6 +81,9 @@ class Config:
     # verify_cmd 前缀（如 "HX_TIDY_BASE={BASE}"），把 check 型门的改动域
     # 基点钉在基线上，免被基线存量提交污染；空＝不动
     verify_base_prefix: str = ""
+    # ag-72646a：评论批准白名单（「批准 <裁定id>」面板指令的作者面）；
+    # 缺省回落 [gitea_user]（bot 账号即默认批准人）
+    approvers: tuple = ()
 
     @property
     def note_marker(self) -> str:
@@ -150,6 +153,14 @@ def load_config(path: "str | Path | None" = None) -> Config:
     if missing:
         raise ConfigError(f"config missing required fields: {', '.join(missing)}")
     ssl_env = _env_ssl_verify()
+    if raw.get("approvers") is not None \
+            and not isinstance(raw["approvers"], (list, tuple)):
+        # approvers 须为登录名列表：裸字符串会按字符拆成单字符白名单
+        # （评审环 C 册：单字符账号即可越权批准），bool/标量迭代即
+        # TypeError——入口拒绝，点名字段（同 execution_mode 纪律）
+        raise ConfigError(
+            "config field approvers must be a list of login names, "
+            f"got {type(raw['approvers']).__name__}")
     cfg = Config(
         api_base=str(raw["api_base"]).rstrip("/"),
         pat=str(raw["pat"]),
@@ -199,6 +210,10 @@ def load_config(path: "str | Path | None" = None) -> Config:
         review_cmd=str(raw.get("review_cmd", "") or ""),
         machine_id=str(raw.get("machine_id", "") or ""),
         verify_base_prefix=str(raw.get("verify_base_prefix", "") or ""),
+        approvers=(tuple(str(a) for a in raw["approvers"] if str(a))
+                   if "approvers" in raw  # 显式 []＝空表 fail-closed（关闭批准）
+                   else ((str(raw["gitea_user"]),)  # 缺省回落 [gitea_user]
+                         if raw.get("gitea_user") else ())),
     )
     # Canonical-path pin: after all parsing so every pre-existing error
     # contract (missing fields, bad numerics) fires unchanged. Both sides

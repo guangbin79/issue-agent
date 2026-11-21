@@ -48,6 +48,11 @@ Actions and what the orchestrator must do for each:
                the SAME task; anything else -> journal-only ignore
     "cancel_task" panel disposal (ag-1c7315, whole line 取消任务/取消):
                task_cancel on the blocked task; same ignore rule
+    "approve"   panel approval (ag-72646a, whole line 批准 <8-hex 裁定id>):
+                the comment-approval executor validates (whitelist/comment
+                read-back/ruling store/consumed/idempotent board recheck)
+                and executes the published task_update ruling with root
+                credentials — pure code, zero LLM
     "ignore"   nothing
 
 Inputs
@@ -76,7 +81,8 @@ Rules (in evaluation order)
     Then, before the general rule, whole-line commands (body.strip() equal):
     暂停 / pause (case-insensitive) -> "pause"; 恢复 / resume
     (case-insensitive) -> "unpause"; 重发汇报 -> "repost"; 重试 / 解决冲突 /
-    重派 -> "redispatch"; 取消任务 / 取消 -> "cancel_task". Containment
+    重派 -> "redispatch"; 取消任务 / 取消 -> "cancel_task"; 批准 <8 位小写
+    hex> -> "approve" (ag-72646a). Containment
     ("这个暂停逻辑有 bug") must NOT trigger.
     General rule: ledger status paused -> ignore; adopted -> "new";
     anything else -> "continue".
@@ -248,6 +254,11 @@ def _command(body):
         return "redispatch"
     if line in ("取消任务", "取消"):
         return "cancel_task"
+    # ag-72646a：评论批准指令「批准 <8 位小写 hex 裁定 id>」——严格全行
+    # （T3 处置卡同源 id）；rid 由执行器从回读正文提取，fsm 只分类不携参
+    if line.startswith("批准 ") and len(line) == 11 \
+            and set(line[3:]) <= _HEX:
+        return "approve"
     return None
 
 
