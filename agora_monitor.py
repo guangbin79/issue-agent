@@ -27,6 +27,11 @@ Task 5：
 - 重启恢复：start() 从账本恢复全部未终态 agora_task_id（幂等 register，
   终态以账本 agora_status 头段为准，未同步按未终态恢复——poll 首轮以
   board 对账收口）。
+- 运行时对账补登记（ag-03f9f3，2026-11-20 #294/ag-dfd3e2）：poll 每轮
+  从账本重导登记缺失的活动任务——名额释放后经 issue 评论外部重派复活
+  的任务此前无再登记通道（登记只有派发回合与启动恢复两个时点），交付
+  停摆至人工改 state.json；补登记零网络（不调 board），真相对账交给
+  本轮既有 board 周期。
 
 活动名额（max_active，接线 config.max_parallel）为原子 check-and-reserve
 （F3）；_run_turn 返回不释放——释放权只在本状态机（终态）与回合失败出口。
@@ -133,6 +138,12 @@ _TERMINAL_STATES = ("merged", "closed", "cancelled")
 # 轮转，直接 deliver(failed, force_rejected) 终局（ag-cad1d6 High-1）
 _MAX_DELIVERY_ATTEMPTS = 3
 
+# ag-03f9f3：账本补登记重试节流（秒）。休眠任务（blocked/交付失败释放
+# 后无人处置）每轮补登记会制造 register→board→release 逐轮抖动（幻影
+# slot-freed＋journal 噪声）；任务书明示补登记节拍「每轮或每 N 轮」由
+# 实现择取——取 30min（僵态阶梯窗口量级），复活接管时延上界＝一窗。
+_RECONCILE_RETRY_S = 1800
+
 
 class _MailDeferred(RuntimeError):
     """瞬态投递失败（answer post 瞬断／sidecar 写 OSError）：本轮停止
@@ -173,6 +184,9 @@ class AgoraMonitor:
         self._questions_this_drain = 0  # 每轮 drain 的 LLM 答复预算（B-4）
         self._released = 0  # ag-6f53fa：release 归还计数（_guard 保护）
         self._on_release = None
+        # ag-03f9f3：补登记重试节流（(iid, tid) -> 上次尝试 monotonic，
+        # _guard 保护；重启清零——启动恢复本就全量登记一次）
+        self._reconcile_retry = {}
         # ag-1c7315（评审 R1）：处置路径（worker 线程）与轮询（poll 线程）
         # 首次出现跨线程并发面——reports sidecar 写者互斥＋per-issue 对账串行
         self._store_lock = threading.Lock()
@@ -251,6 +265,20 @@ class AgoraMonitor:
             now = time.monotonic()
             self._hb[key] = {"start": now, "last": now, "status": ""}
 
+    def _register_if_absent(self, iid, tid) -> bool:
+        """compare-and-register（ag-03f9f3 评审环 R1）：iid 已在案（含
+        reserve 占位）时不写入。补登记与派发回合 reserve/register 跨线程
+        并发——快照后迟到的账本旧 tid 不得覆写在飞新登记或复位心跳基线；
+        判定与写入同临界区，无 check-then-act 窗口。"""
+        with self._guard:
+            key = int(iid)
+            if key in self._active:
+                return False
+            self._active[key] = str(tid)
+            now = time.monotonic()
+            self._hb[key] = {"start": now, "last": now, "status": ""}
+            return True
+
     def release(self, iid, tid=None) -> None:
         """compare-and-release（评审环 ocr #5）：任务终态或回合失败出口
         归还活动名额（幂等）。tid=None 时只清本 issue 的 reserve 占位
@@ -294,13 +322,18 @@ class AgoraMonitor:
     # ---- 轮询与交付状态机 ----
 
     def poll_once(self):
-        """一轮状态 reconciliation：先排干 mailbox（汇报管线），再逐登记
-        任务对账 board，最后心跳。单任务异常只 journal，不拖垮同轮其他
-        任务（线程跨异常存活）。"""
+        """一轮状态 reconciliation：先排干 mailbox（汇报管线），账本对账
+        补登记缺失任务（ag-03f9f3，零网络），再逐登记任务对账 board，
+        最后心跳。单任务异常只 journal，不拖垮同轮其他任务（线程跨异常
+        存活）。"""
         try:
             self._drain_mail()
         except Exception as exc:  # 汇报面异常不阻断交付对账
             self._journal(f"agora-monitor: mail drain failed: {exc!r}")
+        try:
+            self._reconcile_ledger()  # 补登记先行：本轮 board 轮即接管对账
+        except Exception as exc:  # 对账面异常不阻断交付轮
+            self._journal(f"agora-monitor: ledger reconcile failed: {exc!r}")
         for iid, tid in self.tasks():
             if tid is None:  # reserve 占位（回合在途，tid 未定）
                 continue
@@ -327,6 +360,54 @@ class AgoraMonitor:
                 self._on_release(released)
             except Exception as exc:  # 回调病不得拖垮监视线程
                 self._journal(f"agora-monitor: on_release failed: {exc!r}")
+
+    def _reconcile_ledger(self):
+        """运行时对账补登记（ag-03f9f3，2026-11-20 #294/ag-dfd3e2）：
+        poll 每轮从账本重导登记缺失的活动任务。名额释放（blocked/僵态
+        收口）后经 issue 评论外部重派复活的任务，除派发回合 register 与
+        启动 _recover_from_ledger 外无再登记通道——复活后无人轮询，交付
+        停摆至人工干预。口径与 _recover_from_ledger 的终态判定一致
+        （agora_status 头段终态即已收口）外加 issue 账本 status=="done"
+        排除；零网络（不调 board，真相对账交给本轮既有 poll 周期）。
+        两道护栏（评审环 R1）：僵态终档 exhausted 行排除——ladder 对其
+        恒 no-op，重登记会把已释放名额永久占位（redispatched/终态清行
+        后自动恢复补登记）；(iid, tid) 级重试节流——休眠任务不逐轮抖动
+        （复活接管时延上界＝一个节流窗）。"""
+        if self._state_path is None or self._ledger_lock is None:
+            return
+        with self._ledger_lock:
+            ledger = state.load_state(self._state_path, warn=self._journal)
+        # 每轮一读（ocr R2）：pass 内他线程新写的行只影响本轮登记项，
+        # 其后续 _stall_state 读取自会刷新
+        stalls = self._stall_row_load()
+        now = time.monotonic()
+        revived = []
+        for key, entry in ledger["issues"].items():
+            tid = entry.get("agora_task_id")
+            if not tid or entry.get("status") == "done":
+                continue
+            status = entry.get("agora_status") or ""
+            head = status.split("/", 1)[0]
+            # /delivered＝交付已确认（含 done/delivered 恢复出口，ocr R2：
+            # 头段 done 非终态但交付无待办，重登记只会逐窗抖动）；
+            # done/awaiting_external＝事故终态，交付待办、必须可补登记
+            if head in _TERMINAL_STATES or status.endswith("/delivered"):
+                continue
+            iid = int(key)
+            with self._guard:
+                last = self._reconcile_retry.get((iid, str(tid)))
+            if last is not None and now - last < _RECONCILE_RETRY_S:
+                continue  # 节流窗内不重试：休眠任务不逐轮抖动
+            if stalls.get(tid, {}).get("exhausted"):
+                continue  # 僵态终档已释放：重登记将永久占位（见 docstring）
+            if not self._register_if_absent(iid, tid):
+                continue
+            with self._guard:
+                self._reconcile_retry[(iid, str(tid))] = now
+            revived.append(f"issue#{key}={tid}")
+        if revived:
+            self._journal("agora-monitor: ledger reconcile re-registered: "
+                          + ", ".join(revived))
 
     def _reconcile_task(self, iid, tid):
         """ag-1c7315：整段对账持 per-issue 串行锁（见 _iid_reconcile_lock）
