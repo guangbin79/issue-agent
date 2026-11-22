@@ -12,13 +12,15 @@ pre-delivery 不自动重派不弹回 worker（ag-8d6a70：未进交付段的 bl
 从未推送，不误报 push_failed(None)）。
 
 Task 5：
-- 汇报管线：check_mail 整批先原子落盘 state_path+".agora-mail.json" 再
-  按 tid 分发处理（服务端「拉取即送达无 ack」——读后崩溃重放未处理
-  批次，处理完成才标记）；worker note 持久化为报告
-  （state_path+".agora-reports.json"），delivered/closed 后回评 Gitea
-  （原样保留报告末行「坑位：」行），缺报告只发事实型降级评论；worker
-  question 经 answer 回调（orchestrator 在 ledger_lock 内交 Router）后
-  post(answer)；worker answer 回评 issue 线程。
+- 汇报管线：message_pull（F160 二段⑦：v2 面 /check_mail）整批先原子
+  落盘 state_path+".agora-mail.json" 再按 tid 分发处理（服务端「拉取即
+  送达无 ack」——读后崩溃重放未处理批次，处理完成才标记）；单飞＋
+  节流＋AgoraUnavailable 容忍（见 _drain_mail）；worker note 持久化为
+  报告（state_path+".agora-reports.json"）并按频率上限镜像 issue 进度
+  评论，delivered/closed 后回评 Gitea（原样保留报告末行「坑位：」行），
+  缺报告只发事实型降级评论；worker question 呈面（F160 二段⑦：issue
+  评论＋账本 agora_question 字段，不自动作答——人工回评经 relay 直达
+  worker）；worker answer 回评 issue 线程。
 - board 任务态落账（agora_status 首写方＝本模块；以 board 为准，不以
   worker 自述为准）；cancelled 只报取消事实不归因质量失败，blocked+
   delivery.failed 回评具体 push_failed。
@@ -58,43 +60,25 @@ from agora_client import AgoraProtocolError, AgoraRejected, AgoraUnavailable
 
 _HEX40_OK = re.compile(r"[0-9a-f]{40}")
 
-# ag-fb9e5a 缺陷1：worker verify 提案保守识别——消息须同时含「verify_cmd」
-# 字样＋修改诉求（改为/更新为等诉求词，或紧邻的等号）＋一条反引号包裹
-# 的命令原文（判例形态：「verify_cmd 改为 `CMD`」与「verify_cmd=`CMD`」）。
-# 宁可漏判走 Router 文字答复，禁过度智能。
-_VERIFY_PROPOSAL_RE = re.compile(
-    r"verify_cmd[^\n`]{0,60}?"
-    r"(?:改为|改成|换为|换成|更新为|设为|登记为|调整为|=|＝)"
-    r"[^\n`]{0,12}?`([^`\n]{3,})`")
+# ag-da7410 B 已废（F160 二段⑦，2026-11-23）：question 不再自动作答，
+# 答案续作契约行随答复回路一并退役——回答责任在人（issue 回评经 relay
+# 直达 worker），见 _surface_worker_question。
+
+# F160 二段⑦：worker note 镜像进度评论的频率上限（秒，复用心跳评论
+# 通道）；模块常量调用时读，测试可 monkeypatch。窗内的 note 不镜像
+# （报告库照常入库，终态回评不缺）。
+_NOTE_MIRROR_MIN_S = 600
+# 账本 agora_question 字段的 body 截断上限（与 task_nudge 服务面同档）。
+_QUESTION_BODY_MAX_CHARS = 2000
 
 
-def _parse_verify_proposal(body):
-    """worker 提问正文 -> 提案命令原文；识别不了返回 None（照旧 Router）。"""
-    if not isinstance(body, str):
-        return None
-    match = _VERIFY_PROPOSAL_RE.search(body)
-    if match is None:
-        return None
-    cmd = match.group(1).strip()
-    return cmd or None
-
-
-# 采纳门（评审环收紧）：自动登记只放行「一个或多个 NAME=<sha>（7-40 位
-# hex，git 短/长 sha）环境变量前缀＋与面板现状完全一致的命令原文」——即
-# ag-fb9e5a 判例形态（HX_TIDY_BASE=<sha> <现状命令>）；现状为空＝不放行。
-def _verify_adoptable(cmd, current):
-    if not current:
-        return False
-    return re.fullmatch(
-        rf"(?:[A-Za-z_][A-Za-z0-9_]*=[0-9a-f]{{7,40}} )+{re.escape(current)}",
-        cmd) is not None
-
-# ag-da7410 B：daemon relay 答案（post answer）下行正文固定追加的续作
-# 契约行——答案送达≠回合终局（ag-895c11 旧2 实证：worker「回应即收工」
-# 7 小时考古）。对真实答复与事实型兜底答复一体生效。
-ANSWER_CONTINUE_CONTRACT = (
-    "答案送达后必须继续任务直至 post(done) 或 post(kind=question)，"
-    "不得以回应答案作为回合终局")
+def _comment_safe_body(body):
+    """worker 不可信文本进 bot 评论的唯一通道（F160 二段⑦，C 册裁定）：
+    换行中性化（" ⏎ " 连接——ag-791c36 R1-F4 同款纪律，防伪造「处置卡/
+    已交付/批准」协议行）＋截断到 _QUESTION_BODY_MAX_CHARS（账本与评论
+    同档）。报告库仍逐字存档（数据面不消毒）。"""
+    return " ⏎ ".join(
+        body[:_QUESTION_BODY_MAX_CHARS].splitlines())
 
 # ag-791c36：死等升级缺省阈值——同文 note 连响轮数（连续 ≥N 条逐字
 # 相同 worker note 触发处置卡）／awaiting_external 持续秒数；0＝关闸。
@@ -191,7 +175,8 @@ class AgoraMonitor:
     def __init__(self, *, client, journal=None, max_active=1,
                  stall_timeout=DEFAULT_STALL_TIMEOUT_S,
                  stuck_note_rounds=DEFAULT_STUCK_NOTE_ROUNDS,
-                 stuck_await_s=DEFAULT_STUCK_AWAIT_S):
+                 stuck_await_s=DEFAULT_STUCK_AWAIT_S,
+                 mail_pull_min_interval=0):
         self._client = client
         self._journal = journal if journal is not None else (
             lambda message: None)
@@ -201,6 +186,12 @@ class AgoraMonitor:
         # ag-791c36：死等升级阈值（0＝关闸）
         self._stuck_note_rounds = max(0, int(stuck_note_rounds))
         self._stuck_await_s = max(0, int(stuck_await_s))
+        # F160 二段⑦：收件拉取节流（秒；0＝每轮 drain 都拉——测试缺省），
+        # daemon 生产接线给 30；单飞锁防并发 drain 重入（v3 /check_mail
+        # 游标语义下双拉会把消息分箱，谁也见不到全集）
+        self._mail_pull_min_s = max(0, int(mail_pull_min_interval))
+        self._mail_pull_lock = threading.Lock()
+        self._mail_pull_last = 0.0
         self._guard = threading.Lock()
         self._active = {}  # iid(int) -> tid(str|None)：一 issue 一活动任务
         self._stop = threading.Event()
@@ -213,14 +204,14 @@ class AgoraMonitor:
         self._state_path = None
         self._ledger_lock = None
         # 会话面（Task 5，orchestrator 经 attach_conversation 接线）：
-        # post_note=issue 评论通道；answer_question=worker 提问答复回调
-        # （orchestrator 保证先 ledger_lock 再 Router 的锁序）；心跳间隔
-        # 取自 orchestrator.heartbeat_interval（0＝关）。
+        # post_note=issue 评论通道（终态汇报/worker 进度镜像/心跳共用）；
+        # 心跳间隔取自 orchestrator.heartbeat_interval（0＝关）。
         self._post_note = None
-        self._answer_question = None
         self._hb_interval = 0
         self._hb = {}  # iid -> {"start","last","status"}（_guard 保护）
-        self._questions_this_drain = 0  # 每轮 drain 的 LLM 答复预算（B-4）
+        # F160 二段⑦：worker note 镜像进度评论的 per-issue 上次时间
+        # （monotonic；_guard 保护——与 _hb 同面，重启清零＝首条必镜像）
+        self._note_mirror_last = {}
         self._released = 0  # ag-6f53fa：release 归还计数（_guard 保护）
         self._on_release = None
         # ag-03f9f3：补登记重试节流（(iid, tid) -> 上次尝试 monotonic，
@@ -249,15 +240,13 @@ class AgoraMonitor:
         self._ledger_lock = ledger_lock
         self._branch_lock = branch_lock
 
-    def attach_conversation(self, *, post_note, answer_question,
-                            heartbeat_interval=0):
+    def attach_conversation(self, *, post_note, heartbeat_interval=0):
         """会话面接线（orchestrator __init__ 调用，daemon 构造面不变）：
-        issue 评论通道、worker 提问答复回调与心跳间隔。answer_question
-        由 orchestrator 保证锁序（先 ledger_lock 再 Router，T3 锁序铁律）。
-        monitor 轮询线程内同步调用答复回调——worker 提问属低频事件，
-        阻塞轮询可接受（简单性优先）。"""
+        issue 评论通道（终态汇报/worker 进度镜像/worker 提问呈面/心跳
+        共用）与心跳间隔。F160 二段⑦起 worker 提问不再自动作答——
+        answer_question 回调与 Router 答复回路退役（呈面见
+        _surface_worker_question），签名相应收窄。"""
         self._post_note = post_note
-        self._answer_question = answer_question
         self._hb_interval = max(0, int(heartbeat_interval))
 
     def attach_slot_callback(self, callback):
@@ -1274,27 +1263,58 @@ class AgoraMonitor:
             return {"reports": {}}
 
     def _drain_mail(self):
-        """check_mail 汇报管线：服务端「拉取即送达（无 ack）」——整批先
-        原子落盘再按 tid 分发处理；pending 逐条推进（处理完成才标记）；
-        重启先重放未处理批次（读后崩溃不丢消息、不吞其他任务消息）。"""
+        """message_pull 汇报管线（F160 二段⑦：单飞＋节流，AgoraUnavailable
+        容忍）：服务端「拉取即送达（无 ack）」——整批先原子落盘再按 tid
+        分发处理；pending 逐条推进（处理完成才标记）；重启先重放未处理
+        批次（读后崩溃不丢消息、不吞其他任务消息）。
+
+        单飞：整段（重放＋拉取＋处理）持非阻塞锁，并发 drain 不合流
+        直接跳过本轮——v3 /check_mail 游标语义下双拉会把消息分箱到两
+        次调用，谁也见不到全集。节流：距上次成功拉取不足
+        mail_pull_min_interval 秒时只重放本地 pending、不发网络请求
+        （板面对账照常按 poll 轮跑，收件拉取独立降频）。拉取失败
+        （不可达/被拒/协议错）journal 后下一轮天然重试，不推进节流钟。"""
         if self._state_path is None:
             return
-        self._questions_this_drain = 0  # 每轮至多一个 LLM 答复（终闸 B-4）
-        replay = self._mail_pending()
-        if replay:
-            self._journal(f"agora-monitor: replaying {len(replay)} "
-                          "unprocessed mail message(s)")
-            self._process_batch(replay)
-        try:
-            batch = self._client.check_mail()
-        except (AgoraUnavailable, AgoraRejected, AgoraProtocolError) as exc:
-            self._journal(f"agora-monitor: check_mail failed, retry next "
-                          f"poll: {exc}")
+        if not self._mail_pull_lock.acquire(blocking=False):
+            self._journal("agora-monitor: mail drain skipped "
+                          "(another drain in flight)")
             return
-        if batch:
-            state.write_json_atomic(self._mail_path(),
-                                    {"pending": list(batch)})
-            self._process_batch(batch)
+        try:
+            replay = self._mail_pending()
+            if replay:
+                self._journal(f"agora-monitor: replaying {len(replay)} "
+                              "unprocessed mail message(s)")
+                self._process_batch(replay)
+                if self._mail_pending():
+                    # A 册 F2：重放有 deferred 残留——本轮不拉新批，防
+                    # 新批落盘覆盖 deferred 尾巴丢消息（下轮重放先行，
+                    # 排干后恢复拉取；节流钟不动）
+                    return
+            now = time.monotonic()
+            if now - self._mail_pull_last < self._mail_pull_min_s:
+                return  # 节流窗内：只重放本地，不拉新批
+            try:
+                batch = self._client.message_pull()
+            except (AgoraUnavailable, AgoraRejected, AgoraProtocolError) \
+                    as exc:
+                self._journal(f"agora-monitor: message_pull failed, retry "
+                              f"next poll: {exc}")
+                return
+            self._mail_pull_last = now
+            if batch:
+                try:
+                    state.write_json_atomic(self._mail_path(),
+                                            {"pending": list(batch)})
+                except OSError as exc:
+                    # B 册裁定：拉取即送达无 ack——预落盘失败也不得整批
+                    # 丢弃；就地处理，渐进推进面各自落盘能保多少保多少
+                    # （消息面幂等门：note_id 新鲜度/sent_marks/mark 去重）。
+                    self._journal(f"agora-monitor: mail batch persist "
+                                  f"failed, processing in memory: {exc}")
+                self._process_batch(batch)
+        finally:
+            self._mail_pull_lock.release()
 
     def _mail_pending(self) -> list:
         try:
@@ -1314,15 +1334,10 @@ class AgoraMonitor:
     def _process_batch(self, messages):
         """逐条处理并逐条推进 pending 标记：瞬态失败（_MailDeferred）停
         止推进留待重放；确定性异常只 journal 不吞批次（毒消息不得无限
-        重放，也不得拖垮同批其他任务的消息）。每轮 drain 至多答复一个
-        question（终闸 B-4：封顶 monitor 线程持 ledger_lock 跨 LLM 的
-        停摆窗，其余顺延下一轮）。"""
+        重放，也不得拖垮同批其他任务的消息）。F160 二段⑦起 question
+        呈面零 LLM 成本，无每轮答复预算（旧 B-4 上限随答复回路退役）。"""
         remaining = list(messages)
         for message in messages:
-            if isinstance(message, dict) \
-                    and message.get("kind") == "question" \
-                    and self._questions_this_drain >= 1:
-                return  # 本轮答复预算已用：其余 question 留 pending 重放
             if not isinstance(message, dict):
                 # ocr R1 #5：非对象毒元素在此丢弃——except 处理器自身的
                 # message.get 再抛会中断整批一轮
@@ -1339,9 +1354,6 @@ class AgoraMonitor:
                     self._journal(f"agora-monitor: mail message "
                                   f"{message.get('id')!r} processing failed: "
                                   f"{exc!r}")
-                else:
-                    if message.get("kind") == "question":
-                        self._questions_this_drain += 1
             remaining = remaining[1:]
             state.write_json_atomic(self._mail_path(),
                                     {"pending": remaining})
@@ -1367,7 +1379,7 @@ class AgoraMonitor:
         if kind == "note":
             self._store_report_note(iid, tid, message.get("id"), body)
         elif kind == "question":
-            self._handle_worker_question(iid, tid, body)
+            self._surface_worker_question(iid, tid, body)
         elif kind == "answer":
             self._comment(iid, f"worker 答复（任务 {tid}）：\n{body}")
         elif kind == "result":
@@ -1407,8 +1419,12 @@ class AgoraMonitor:
         """worker note 持久化为报告候选（最新 note_id 胜；重放旧批次不
         回退）。终态回评与重发汇报共用此库。ag-1c7315（B-F1）：写段持
         写者互斥锁——与处置侧 redispatched 清标互斥。ag-791c36：入库后
-        同临界区跑同文 note 死等检测（裁定落盘先行，评论出锁后发）。"""
+        同临界区跑同文 note 死等检测（裁定落盘先行，评论出锁后发）。
+        F160 二段⑦：新鲜 note 另镜像一条 issue 进度评论（复用 _comment
+        通道，per-issue 频率上限 _NOTE_MIRROR_MIN_S——窗内不重复刷屏，
+        报告库照常全文入库，终态回评不缺）。"""
         card = None
+        mirror = None
         with self._store_lock:
             store = self._reports_load()
             reports = store.setdefault("reports", {})
@@ -1416,7 +1432,7 @@ class AgoraMonitor:
             current_id = current.get("note_id")
             if current_id is not None and mid is not None \
                     and int(mid) <= int(current_id):
-                return  # 已有更新的报告（或同条重放）
+                return  # 已有更新的报告（或同条重放）——镜像同免
             reports[tid] = {"iid": int(iid), "note": body,
                             "note_id": int(mid) if mid is not None else -1,
                             "finalized": bool(current.get("finalized")),
@@ -1428,101 +1444,59 @@ class AgoraMonitor:
                 # 不让报告永久丢失成降级评论
                 raise _MailDeferred(f"reports store write failed: {exc}") from exc
             card = self._stuck_on_note(iid, tid, body)
+            mirror = self._note_mirror_due(iid, tid, body)
         if card is not None:
             self._comment(iid, card)
+        if mirror is not None:
+            self._comment(iid, mirror)
 
-    def _handle_worker_question(self, iid, tid, body):
-        """worker 提问 → 答复回调（orchestrator 在 ledger_lock 内交
-        Router，T3 锁序）→ post(answer)。回调故障给事实型兜底答复，不
-        虚构、不静默吞问题（worker 不能无限等待）。
+    def _note_mirror_due(self, iid, tid, body):
+        """worker note 进度评论镜像的频率门（F160 二段⑦）：per-issue 距
+        上次镜像不足 _NOTE_MIRROR_MIN_S 秒返回 None（本条不镜像）；
+        到期返回评论文本并前移计时（_guard 保护——与 _hb 同面；重启
+        清零＝重启后首条必镜像）。body 换行中性化（ag-791c36 R1-F4 同款
+        纪律）：worker 不可信文本不得在 bot 评论里伪造「处置卡/已交付」
+        等协议行；超长按呈面同档截断。"""
+        now = time.monotonic()
+        with self._guard:
+            last = self._note_mirror_last.get(int(iid), 0.0)
+            if now - last < _NOTE_MIRROR_MIN_S:
+                return None
+            self._note_mirror_last[int(iid)] = now
+        return (f"worker 进度（agora 任务 {tid}）："
+                + _comment_safe_body(body))
 
-        ag-fb9e5a 缺陷1：先走 verify 提案执行回路——保守识别出
-        「verify_cmd 改为 X」诉求时以 daemon 建单身份直接 task_update
-        登记，登记结果作为 answer 闭环（此前 daemon 只会文字答复，全库
-        无 task_update 执行面，任务僵死 4.5h）；识别不了照旧 Router。"""
-        proposal = _parse_verify_proposal(body)
-        if proposal is not None:
-            answer = self._execute_verify_proposal(tid, proposal)
-        else:
-            if self._answer_question is None:
-                self._journal(f"agora-monitor: worker question for {tid} "
-                              "dropped (no conversation face)")
-                return
-            answer = None
-            try:
-                answer = self._answer_question(iid, tid, body)
-            except Exception as exc:
-                self._journal(f"agora-monitor: answer callback failed for "
-                              f"{tid}: {exc!r}")
-            if not answer:
-                answer = (f"自动化答复暂不可用，需要人工在 Gitea issue#{iid} "
-                          f"跟进。worker 原问题（任务 {tid}）：{body}")
-        answer = f"{answer}\n\n{ANSWER_CONTINUE_CONTRACT}"
-        try:
-            self._client.post(tid, "answer", answer)
-        except (AgoraUnavailable, AgoraProtocolError) as exc:
-            # 终闸 B-2：瞬断不吞——消息留 pending 下一轮重放重试（worker
-            # 提问无服务端重投通道，丢了就是永久等待）
-            raise _MailDeferred(f"answer post transient for {tid}: {exc}") \
-                from exc
-        except AgoraRejected as exc:
-            self._journal(f"agora-monitor: answer post rejected for {tid}, "
-                          f"dropped (deterministic): {exc}")
+    def _surface_worker_question(self, iid, tid, body):
+        """F160 二段⑦：worker question 呈面——issue 评论＋账本记字段，
+        不自动作答。回答责任在人：本 issue 回评经 relay 直达 worker
+        （post(kind=question) 唤醒通道）；verify 改登记走派发面
+        post(kind=verify) 提案——自动作答（Router 答复回路）与自动采纳
+        （ag-fb9e5a verify 执行回路）一并退役：LLM 答复质量不可控，且
+        plaza 面已有派发方登记通道。
 
-    def _execute_verify_proposal(self, tid, cmd):
-        """ag-fb9e5a 缺陷1：verify 提案执行——board 幂等对账（任务页
-        verify.cmd 已等于提案命令则不重复登记，直接回执现状）→
-        采纳门（只放行「现状命令＋NAME=hex 基线前缀」形态，见
-        _VERIFY_ADOPT_RE）→ task_update(task, verify_cmd=cmd) → 结果文本
-        （成功/失败原因/未采纳原因）交调用方作为 answer 回 worker 闭环。
-        board/task_update 瞬断抛 _MailDeferred 留 pending 重放（重放先过
-        幂等对账，不双登记）。
-
-        采纳口径（评审环收紧，ocr/B 册判例）：仓库恒界＝验收命令只出自
-        实例可信配置（Router 七键硬过滤同理）——worker 提案仅在「给现
-        状命令加基线钉前缀」这一判例形态（HX_TIDY_BASE=<sha> …，ag-
-        fb9e5a）时自动采纳，防 worker 提 `true` 自绿门/提问误判改写；
-        其余形态不采纳、事实型回执转人工。"""
-        try:
-            task = self._board_task(tid)
-        except AgoraRejected as exc:
-            # 确定性 4xx：不再执行，事实型回执转人工
-            return (f"verify 提案未登记：任务面板读取被拒（{exc}），"
-                    "请人工在 issue 跟进。")
-        except (AgoraUnavailable, AgoraProtocolError) as exc:
-            raise _MailDeferred(f"proposal board read transient for "
-                                f"{tid}: {exc}") from exc
-        if task.get("state") in _TERMINAL_STATES:
-            return (f"verify 提案未登记：任务已终态"
-                    f"（{task.get('state')}），提案不再执行——请人工在 "
-                    "issue 跟进。")
-        verify = task.get("verify")
-        # B 册＋Round2：verify 载荷契约外形态（非 dict／cmd 非 str）不得让
-        # 异常逃逸——那是静默吞问题（零答复不重放），恰是本缺陷要修的僵死
-        # 形态；契约外一律按现状为空走未采纳回执
-        value = verify.get("cmd") if isinstance(verify, dict) else None
-        current = value.strip() if isinstance(value, str) else ""
-        if current == cmd:
-            return (f"verify_cmd 已是提案命令，无需重复登记（幂等现状）：\n"
-                    f"{cmd}")
-        if not _verify_adoptable(cmd, current):
-            return (f"verify 提案未采纳：自动登记只放行「现状命令＋"
-                    f"NAME=<sha> 基线前缀」形态（如 HX_TIDY_BASE=<sha> "
-                    f"命令原文），提案不满足。现状命令保留不变："
-                    f"{current or '（无）'}——需要其他改写请人工在 issue "
-                    "确认。")
-        try:
-            self._client.task_update(tid, verify_cmd=cmd)
-        except AgoraRejected as exc:
-            return (f"verify 提案登记被拒：{exc}\n命令未生效，现状仍为："
-                    f"{current or '（无）'}——请人工在 issue 跟进。")
-        except (AgoraUnavailable, AgoraProtocolError) as exc:
-            raise _MailDeferred(f"proposal task_update transient for "
-                                f"{tid}: {exc}") from exc
-        self._journal(f"agora-monitor: verify proposal registered for "
-                      f"{tid}: {cmd}")
-        return (f"verify_cmd 已按提案登记：\n{cmd}\n"
-                "请按新命令重新走验收（post(done)）。")
+        落账先行：账本写失败（OSError）抛 _MailDeferred 留 pending 重放
+        （防评论重复刷屏）；评论 best-effort（_comment 病只 journal）。"""
+        if self._ledger_lock is not None and self._state_path is not None:
+            with self._ledger_lock:
+                ledger = state.load_state(self._state_path, warn=self._journal)
+                entry = ledger["issues"].get(str(int(iid)))
+                if entry is not None:
+                    entry["agora_question"] = {
+                        "tid": tid,
+                        "body": body[:_QUESTION_BODY_MAX_CHARS],
+                        "time": time.time(),
+                    }
+                    try:
+                        state.save_state(self._state_path, ledger)
+                    except OSError as exc:
+                        raise _MailDeferred(
+                            f"question ledger write failed: {exc}") from exc
+        self._comment(
+            iid,
+            f"worker 提问（agora 任务 {tid}）：\n\n"
+            f"{_comment_safe_body(body)}\n\n"
+            "在本 issue 回评即可答复（评论直达 worker）；已记入账本"
+            "（agora_question）待人工跟进。")
 
     def _handle_result_mail(self, iid, tid, body):
         """生命周期迁移回传（agorad notify_transition：终态与 blocked 实时

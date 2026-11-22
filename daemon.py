@@ -236,7 +236,10 @@ def main(argv=None) -> int:
                                   max_active=config.max_parallel,
                                   stall_timeout=config.agora_stall_timeout,
                                   stuck_note_rounds=config.stuck_note_rounds,
-                                  stuck_await_s=config.stuck_await_s)
+                                  stuck_await_s=config.stuck_await_s,
+                                  # F160 二段⑦：收件拉取节流（秒）——板面
+                                  # 对账照常按 poll 轮跑，收件拉取独立降频
+                                  mail_pull_min_interval=30)
                      if config.execution_mode == "agora" else None)
     orch = orchestrator.Orchestrator(
         project=project,

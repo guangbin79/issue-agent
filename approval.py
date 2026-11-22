@@ -99,8 +99,9 @@ class CommentApproval:
         except _AGORA_ERRORS as exc:
             self._fail(iid, rid, f"board 复核不可达：{exc}")
             return
-        # 契约外形态按不可读处理（monitor _execute_verify_proposal 同款
-        # 纪律）：非 dict 不得让异常逃逸，非 str cmd 绝不带病执行
+        # 契约外形态按不可读处理（原 monitor verify 提案回路同款纪律，
+        # ag-fb9e5a 裁定延续）：非 dict 不得让异常逃逸，非 str cmd 绝不带
+        # 病执行
         verify = task.get("verify") if isinstance(task, dict) else None
         current = verify.get("cmd") if isinstance(verify, dict) else None
         if current == new_cmd:

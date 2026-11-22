@@ -51,7 +51,9 @@ def note(mid, body):
 
 def stuck_monitor(tmp_path, client, *, stall_timeout=1800,
                   stuck_note_rounds=3, stuck_await_s=7200):
-    """接线完毕的 monitor（iid=7 已登记，账本在案，repo 未接＝零 git）。"""
+    """接线完毕的 monitor（iid=7 已登记，账本在案，repo 未接＝零 git）。
+    F160 二段⑦起 worker note 会镜像进度评论——本文件只测死等升级卡面，
+    频率门拨到永不到期把镜像隔离掉（inf：now-last 恒为负）。"""
     face = ConversationFace()
     journal = []
     state_path = tmp_path / "state.json"
@@ -65,8 +67,8 @@ def stuck_monitor(tmp_path, client, *, stall_timeout=1800,
                             ssl_verify=True, state_path=state_path,
                             ledger_lock=threading.RLock())
     monitor.attach_conversation(post_note=face.post_note,
-                                answer_question=face.answer_question,
                                 heartbeat_interval=0)
+    monitor._note_mirror_last = {IID: float("inf")}
     monitor.register(IID, TID)
     return monitor, face, journal, state_path
 

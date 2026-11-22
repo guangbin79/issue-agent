@@ -21,8 +21,9 @@ IID = 7
 
 
 class PendingBoardClient:
-    """零网络替身：check_mail 恒空、board 恒 pending（poll 本轮无动作态
-    ——补登记后不联动释放，补登记行为与 board 真态解耦断言）。"""
+    """零网络替身：message_pull（F160 二段⑦：v2 面 /check_mail）恒空、
+    board 恒 pending（poll 本轮无动作态——补登记后不联动释放，补登记
+    行为与 board 真态解耦断言）。"""
 
     def __init__(self):
         self.board_calls = []
@@ -30,7 +31,7 @@ class PendingBoardClient:
     def poll_interval(self):
         return 15.0
 
-    def check_mail(self):
+    def message_pull(self):
         return []
 
     def board(self, tid):

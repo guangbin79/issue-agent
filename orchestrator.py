@@ -86,6 +86,12 @@ WALL_FALLBACK_SINCE_S = 7 * 86400
 # 认领，窗后重读全部认领评论按 id 定胜负。测试经模块属性改 0。
 ARBITRATION_WINDOW_S = 60
 
+# F160 二段⑧（任务页规格面）：goal 超过该长度（复杂 issue——长断言清单）
+# 时整篇溢写 wiki 规格页 issue-specs/<owner-repo>-<iid>.md，goal 换成
+# ≤10 行短指针（规格页指针＋F160 契约句＋验收口径），对冲长 goal 上下文
+# 膨胀致 worker 僵死的根因；模块常量调用时读，测试可 monkeypatch。
+GOAL_SPEC_SPILL_CHARS = 2400
+
 # Global experience-draft store (the agent-experience capture flow the
 # protocol's 沉淀 step writes to): the post-push capture verification
 # scans it for this issue's draft. Module constant read at CALL time, so
@@ -196,6 +202,9 @@ def _empty_entry() -> dict:
         "router_goal": None,
         "router_model": None,
         "router_deliverable": None,
+        # F160 二段⑦：worker 提问呈面记录（{tid, body, time}，最新一条
+        # 覆盖；人工回评经 relay 直达 worker 后由人清视野，不自动消解）
+        "agora_question": None,
         # 双机认领 v2（与 state._new_issue 同步）
         "owner": {"machine": None, "claim_comment_id": None},
         "claim_state": "none",
@@ -323,12 +332,12 @@ class Orchestrator:
                 ssl_verify=self.ssl_verify, state_path=self.state_path,
                 ledger_lock=self._ledger_lock,
                 branch_lock=self._branch_lock)  # P2-10 分支 ref 单写者锁
-            # 会话面接线（Task 5）：issue 评论通道（终态汇报/worker 答复
-            # 回评）、worker 提问答复回调（锁序见 _answer_worker_question）
-            # 与心跳间隔。daemon 构造面依旧不变。
+            # 会话面接线（Task 5）：issue 评论通道（终态汇报/worker 进度
+            # 镜像/提问呈面/心跳共用）与心跳间隔。F160 二段⑦起 worker
+            # 提问不再自动作答（answer_question 回调与 Router 答复回路
+            # 退役）。daemon 构造面依旧不变。
             self.agora_monitor.attach_conversation(
                 post_note=self._post_note,
-                answer_question=self._answer_worker_question,
                 heartbeat_interval=self.heartbeat_interval)
             self.agora_monitor.attach_slot_callback(self._on_slots_freed)
             # ag-72646a：评论批准执行器（「批准 <裁定id>」面板指令 → root
@@ -1198,7 +1207,7 @@ class Orchestrator:
                     self._agora_out_of_band(iid, decision)
                     return
                 payload = dict(
-                    goal=decision.goal,
+                    goal=self._agora_goal(iid, decision),
                     project_dir=self.repo_path,
                     target_branch=gitop.fix_branch(iid),
                     verify_cmd=self._verify_base_guard(
@@ -1248,6 +1257,48 @@ class Orchestrator:
             finally:
                 if self.agora_monitor is not None and not registered:
                     self.agora_monitor.release(iid)
+
+    def _agora_goal(self, iid, decision):
+        """⑧ F160 二段（任务页规格面）：goal 短指针面。长 goal（复杂
+        issue）经 agora wiki_write 溢写规格页 issue-specs/<owner-repo>-
+        <iid>.md（wiki/tasks/ 前缀服务独占拒写，勿用），goal 换成 ≤10 行
+        指针——worker 开工前先 wiki_read 规格页（需求分析/断言清单/契约
+        全在页内）。溢写失败（不可达/被拒/旧版服务无此路由的 404）回退
+        原文：规格页是上下文瘦身优化，不是派发前提，绝不因它丢派发。
+        中断恢复走同 client_key 幂等取回原任务，重复溢写同路径覆盖，
+        幂等无害。"""
+        goal = decision.goal
+        if len(goal) <= GOAL_SPEC_SPILL_CHARS:
+            return goal
+        path = f"issue-specs/{self.project.replace('/', '-')}-{int(iid)}.md"
+        page = (f"# issue-specs：{self.project}#{int(iid)} 任务规格\n\n"
+                f"- 生成：{_now_iso()}；服务：{self.service_name}\n"
+                "- 来源：Router 决策 goal 全文（本页为任务规格唯一权威，"
+                "任务 goal 只携带指针）\n"
+                "- 本页由 issue-agent 自动生成，同 issue 新回合派发时整页"
+                "覆盖\n\n---\n\n" + goal)
+        try:
+            self.agora_client.wiki_write(path, page)
+        except (AgoraUnavailable, AgoraRejected, AgoraProtocolError) as exc:
+            self._journal(f"turn: issue#{iid} spec spill failed, "
+                          f"full goal kept: {exc}")
+            return goal
+        self._journal(f"turn: issue#{iid} goal spilled to wiki/{path} "
+                      f"({len(goal)} chars)")
+        return (
+            f"任务规格全文：wiki/{path}——开工前先 wiki_read 该页（需求"
+            "分析、改动范围、断言清单与环境/沉淀/汇报契约都在页内，本 "
+            "goal 只是指针）。\n"
+            f"issue：{self.project}#{int(iid)}；在派发 env（worktree 副本）"
+            f"内工作，交付分支 {gitop.fix_branch(iid)} 由外部统一推送，"
+            "禁止自行 push、禁止动共享分支。\n"
+            "验收口径：任务页登记的 verify 命令必须绿灯；规格页断言清单"
+            "逐条给出 pass/fail＋证据一行。\n"
+            f"提交信息含 trailer `Issue: #{int(iid)}`。\n"
+            "worker 契约（F160）：里程碑（开工、关键节点完成、受阻或转向）"
+            "一律 post(kind=note) 一句话汇报；收到 nudge 后必须 post 自检"
+            "结论（仍在做/已完成即重报 done/受阻转 question），板面零活动"
+            "会被僵态阶梯判僵误重派，禁静默。")
 
     def _agora_disposal_command(self, iid, action, event):
         """面板评论指令处置 blocked（ag-1c7315，用户裁定：处置面搬到
@@ -1561,21 +1612,6 @@ class Orchestrator:
         self._journal(f"turn: issue#{iid} stale task {tid} cancelled "
                       "(blocked/delivery failed); new round may start")
         return False
-
-    def _answer_worker_question(self, iid, tid, body):
-        """worker 提问答复回调（Task 5，monitor 汇报管线调用）：T3 锁序
-        铁律——Router 的唯一合法入口是先持 orchestrator ledger_lock 再进
-        （与 _agora_route 同序；反序获取会与之死锁）。Router 故障返回
-        None（monitor 侧给事实型兜底答复，不虚构）。"""
-        with self._ledger_lock:
-            try:
-                return self.router.answer(iid=iid, task=tid, question=body)
-            except (router.RouterDecisionError, router.RouterCircuitOpen,
-                    runner.SessionInvalid, runner.TurnTimeout,
-                    runner.TurnCrash) as exc:
-                self._journal(f"agora-monitor: router answer for {tid} "
-                              f"failed: {exc}")
-                return None
 
     def _agora_route(self, iid, *, event, message):
         """账本锁临界区内的 Router 决策与 goal/model 持久化（T2 共享 RLock

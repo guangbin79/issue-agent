@@ -34,6 +34,8 @@ which note ids have already been consumed. Layout:
         "router_model": str|null,
         "router_deliverable": str|null,  # dispatch 交付面提示（ag-da7410 A）：
         #   "out_of_band"＝零提交 review-only；null＝external_branch 缺省
+        "agora_question": dict|null,     # F160 二段⑦ worker 提问呈面记录：
+        #   {tid, body, time} 最新一条覆盖，人工回评经 relay 直达 worker
         #   ^ legacy session_id 永不被 agora 覆盖（§9.4 每回合一新会话）。
     }}}
 
@@ -115,6 +117,8 @@ def _new_issue(status: str) -> dict:
         "router_goal": None,
         "router_model": None,
         "router_deliverable": None,
+        # F160 二段⑦：worker 提问呈面记录（monitor 首写方）
+        "agora_question": None,
         # 双机认领协议 v2：最早认领终身有效（claim 评论 id 面）
         "owner": {"machine": None, "claim_comment_id": None},
         "claim_state": "none",
@@ -154,6 +158,8 @@ def _normalize(state: dict) -> dict:
             "router_goal": entry.get("router_goal"),
             "router_model": entry.get("router_model"),
             "router_deliverable": entry.get("router_deliverable"),
+            # F160 二段⑦：worker 提问呈面记录（dict 整体透传，最新覆盖）
+            "agora_question": entry.get("agora_question"),
             # 双机认领 v2 字段：旧账缺键 → 默认（向后兼容）
             "owner": _norm_owner(entry.get("owner")),
             "claim_state": entry.get("claim_state", "none"),

@@ -360,6 +360,9 @@ class FakeAgoraClient:
         self.cancel_calls = []   # task_cancel 调用记账（关单语义必须为零）
         self.cancel_calls_full = []  # {"task","force"} 全量记账（close 回收）
         self.cancel_responses = []   # 可脚本化应答队列（缺省 cancelled=1）
+        # F160 二段⑧：wiki 规格页溢写记账与失败注入
+        self.wiki_writes = []     # (path, text)
+        self.wiki_failures = []   # 提交时抛出的异常队列
 
     def post(self, tid, kind, body):
         if self.post_failures:
@@ -384,6 +387,12 @@ class FakeAgoraClient:
         if isinstance(self.doctor_result, Exception):
             raise self.doctor_result
         return self.doctor_result
+
+    def wiki_write(self, path, text):
+        """F160 二段⑧：规格页溢写替身（失败注入同 post 面：先抛后记）。"""
+        if self.wiki_failures:
+            raise self.wiki_failures.pop(0)
+        self.wiki_writes.append((path, text))
 
     @staticmethod
     def _execution_payload(kwargs):
@@ -3212,6 +3221,77 @@ def test_router_out_of_band_hint_creates_review_only_task(tmp_path,
         h.orch.stop()
 
 
+def test_long_goal_spilled_to_wiki_spec_page_with_short_pointer(
+        tmp_path, monkeypatch):
+    """F160 二段⑧：长 goal（复杂 issue）→ wiki_write 溢写规格页
+    issue-specs/<owner-repo>-<iid>.md（规格全文在页内），create_task 收
+    ≤10 行短指针（规格页指针＋F160 契约句＋验收口径）——对冲长 goal
+    上下文膨胀致 worker 僵死。Req: F160-compat-2"""
+    monkeypatch.setattr(orchestrator, "GOAL_SPEC_SPILL_CHARS", 100)
+    long_goal = "需求分析：修 X。" + "断言清单逐条很长；" * 30
+    assert len(long_goal) > 100
+    client = FakeAgoraClient()
+    router_ = FakeRouter(agora_decision(goal=long_goal))
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        assert len(client.wiki_writes) == 1, h.journal_msgs
+        path, page = client.wiki_writes[0]
+        assert path == "issue-specs/group-repo-7.md"
+        assert long_goal in page, "规格全文必须在页内"
+        goal = client.create_calls[0]["goal"]
+        assert goal != long_goal, "goal 必须换短指针"
+        assert len(goal.splitlines()) <= 10
+        assert "issue-specs/group-repo-7.md" in goal
+        assert "wiki_read" in goal, "指针必须指引先读规格页"
+        assert "F160" in goal and "post(kind=note)" in goal
+        assert "验收口径" in goal
+        assert client.dispatch_calls == ["ag-123"], "派发照常"
+    finally:
+        h.orch.stop()
+
+
+def test_short_goal_not_spilled_wiki_write_untouched(tmp_path, monkeypatch):
+    """F160 二段⑧：短 goal（阈值内）原样进 create_task，零 wiki_write。
+    Req: F160-compat-2"""
+    client = FakeAgoraClient()
+    router_ = FakeRouter(agora_decision(goal="goal-v1\nIssue: #7"))
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        assert client.wiki_writes == []
+        assert client.create_calls[0]["goal"] == "goal-v1\nIssue: #7"
+    finally:
+        h.orch.stop()
+
+
+def test_spec_spill_failure_falls_back_to_full_goal(tmp_path, monkeypatch):
+    """F160 二段⑧：溢写失败（不可达/被拒/旧服务 404）回退原文 goal——
+    规格页是优化不是派发前提，绝不因它丢派发。Req: F160-compat-2"""
+    monkeypatch.setattr(orchestrator, "GOAL_SPEC_SPILL_CHARS", 100)
+    long_goal = "需求分析：修 Y。" + "断言清单逐条很长；" * 30
+    client = FakeAgoraClient()
+    client.wiki_failures.append(
+        AgoraRejected("/wiki_write -> HTTP 404: not found"))
+    router_ = FakeRouter(agora_decision(goal=long_goal))
+    h = agora_harness(tmp_path, monkeypatch, client=client, router_=router_)
+    try:
+        h.listener.queue.put(issue_open_event(iid=7))
+        assert wait_until(lambda: turn_finalized(h, 7)), h.journal_msgs
+
+        assert client.wiki_writes == []
+        assert client.create_calls[0]["goal"] == long_goal, "回退全文"
+        assert client.created_ids == ["ag-123"], "派发不因规格页失败而丢"
+        assert any("spec spill failed" in m for m in h.journal_msgs), \
+            h.journal_msgs
+    finally:
+        h.orch.stop()
+
+
 def test_router_answer_decision_posts_answer_without_task(tmp_path,
                                                           monkeypatch):
     """ag-da7410 A：纯解答类 action=answer → 不建任务不派发不登记，答案
@@ -4005,9 +4085,9 @@ def test_requeue_placeholder_fetches_issue_context(tmp_path, monkeypatch):
 
 class LifecycleAgoraClient(FakeAgoraClient):
     """交付生命周期替身（Task 6 锚例）：在 FakeAgoraClient（建单幂等/
-    doctor/post）之上镜像 board/deliver/check_mail 的 wire 语义——任务行可
+    doctor/post）之上镜像 board/deliver/message_pull 的 wire 语义——任务行可
     脚本化置 done+awaiting_external，deliver(delivered)→closed/delivered；
-    worker 报告经 check_mail 一次性送达（拉取即送达）。"""
+    worker 报告经 message_pull 一次性送达（拉取即送达）。"""
 
     def __init__(self, report="根因：竞态窗口\n改动：x.py\n坑位：替身测试勿信"):
         super().__init__()
@@ -4031,7 +4111,8 @@ class LifecycleAgoraClient(FakeAgoraClient):
             raise AgoraRejected(f"unknown task {tid} (fake)")
         return {"task": json.loads(json.dumps(row)), "events": []}
 
-    def check_mail(self):
+    def message_pull(self):
+        """F160 二段⑦：v2 面 /check_mail 收件（拉取即送达）。"""
         got, self.mail = self.mail, []
         return got
 

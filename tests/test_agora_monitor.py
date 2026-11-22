@@ -216,9 +216,9 @@ class FakeAgoraClient:
     ack_mode：""＝正常；"lost"＝服务端已处理但回包丢失（先落账再抛
     AgoraUnavailable）；"down"＝未处理即抛（纯超时）。
 
-    Task 5 面：check_mail 一次性吐出 mail 队列（镜像「拉取即送达」——
-    返回即清空）；post 记账（answer 直投）；create_task/cancel 记账
-    （重启恢复必须零 create，关单语义必须零 cancel）。"""
+    Task 5 面：message_pull（F160 二段⑦：v2 面 /check_mail）一次性吐出
+    mail 队列（镜像「拉取即送达」——返回即清空）；post 记账；create_task/
+    cancel 记账（重启恢复必须零 create，关单语义必须零 cancel）。"""
 
     def __init__(self, tid=TID, commit=None):
         commit = commit or hex40("a")
@@ -245,7 +245,7 @@ class FakeAgoraClient:
         self.nudges = []
         self.dispatch_calls = []
 
-    def check_mail(self):
+    def message_pull(self):
         self.check_mail_calls += 1
         got, self.mail = self.mail, []
         return got
@@ -1052,27 +1052,19 @@ def mail_msg(mid, tid=TID, kind="note", body="进度正常"):
 
 
 class ConversationFace:
-    """会话面间谍：post_note 记账（可校验调用时报告已先持久化）、
-    answer_question 记录问题并返回脚本化答复。"""
+    """会话面间谍：post_note 记账（可校验调用时报告已先持久化）。
+    F160 二段⑦起 answer_question 回调退役——question 走呈面（评论＋
+    账本），无答复面可间谍。"""
 
-    def __init__(self, answer_text="答复正文", answer_error=None):
+    def __init__(self):
         self.posts = []       # (iid, text)
-        self.answers = []     # (iid, tid, body)
-        self.answer_text = answer_text
-        self.answer_error = answer_error
         self.note_hook = None  # callable(iid) 在每次 post_note 前调用
 
     def post_note(self, iid, text):
         if self.note_hook is not None:
-            self.note_hook(iid)
+            self.note_hook(iid, text)
         self.posts.append((int(iid), text))
         return True
-
-    def answer_question(self, iid, tid, body):
-        self.answers.append((int(iid), tid, body))
-        if self.answer_error is not None:
-            raise self.answer_error
-        return self.answer_text
 
 
 def conversation_monitor(tmp_path, monkeypatch, client, face=None,
@@ -1083,7 +1075,6 @@ def conversation_monitor(tmp_path, monkeypatch, client, face=None,
     monitor, state_path, journal = delivery_monitor(tmp_path, monkeypatch,
                                                     client)
     monitor.attach_conversation(post_note=face.post_note,
-                                answer_question=face.answer_question,
                                 heartbeat_interval=heartbeat_interval)
     return monitor, state_path, journal, face
 
@@ -1107,12 +1098,13 @@ def test_delivered_report_comment_preserves_pitfalls_line(
                    mail_msg(2, kind="note", body=report)]
     monitor, state_path, journal, face = conversation_monitor(
         tmp_path, monkeypatch, client)
-    # 回评发生时报告必须已先持久化（先持久化再回评）
-    face.note_hook = lambda iid: None  # placeholder，下方重设断言
-
+    # 回评发生时报告必须已先持久化（先持久化再回评）——note_hook 带 text，
+    # 只盯终态交付回评（F160 二段⑦起 worker 进度镜像也走本通道，不算回评）
     report_file_seen = []
 
-    def hook(iid):
+    def hook(iid, text):
+        if "已交付" not in text:
+            return
         report_file_seen.append(
             report in json.loads(
                 Path(reports_path_of(state_path)).read_text(encoding="utf-8")
@@ -1128,10 +1120,11 @@ def test_delivered_report_comment_preserves_pitfalls_line(
     assert entry(state_path)["delivery_commit"] == hex40("a")
     assert monitor.tasks() == []
 
-    # 终态评论只发一次：重启后再轮询不得重复回评
+    # 终态评论只发一次：重启后再轮询不得重复回评（F160 二段⑦的进度
+    # 镜像评论属进度面，不在此列）
     monitor.register(7, TID)
     monitor.poll_once()
-    assert len(face.posts) == 1
+    assert len([t for _, t in face.posts if "已交付" in t]) == 1
 
 
 def test_missing_report_posts_factual_comment_only(tmp_path, monkeypatch):
@@ -1156,205 +1149,88 @@ def test_missing_report_posts_factual_comment_only(tmp_path, monkeypatch):
     assert monitor.tasks() == []
 
 
-def test_worker_question_answered_via_callback_and_posted_as_answer(
+def test_worker_question_surfaced_to_issue_without_auto_answer(
         tmp_path, monkeypatch):
-    """计划 L345：worker question 交答复回调（orchestrator 在 ledger_lock
-    内交 Router）后 post(kind=answer) 回 worker。ag-da7410 B：答案正文固定
-    追加续作指令行——答案送达≠回合终局，防「回应即收工」陷阱。"""
+    """F160 二段⑦：worker question 呈面——issue 评论（含回评指引）＋
+    账本 agora_question 字段；不自动作答（零 post(kind=answer)）。
+    Req: F160-compat-2"""
     client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "running"  # 零交付噪声：呈面测试只看评论面
     client.mail = [mail_msg(3, kind="question", body="测试 X 可以删吗？")]
     monitor, state_path, _, face = conversation_monitor(
-        tmp_path, monkeypatch, client,
-        face=ConversationFace(answer_text="可以删，它是替身"))
+        tmp_path, monkeypatch, client)
 
     monitor.poll_once()
 
-    assert face.answers == [(7, TID, "测试 X 可以删吗？")]
-    assert len(client.posts) == 1
-    posted = client.posts[0]
-    assert posted["kind"] == "answer"
-    assert posted["body"].startswith("可以删，它是替身")
-    assert "答案送达后必须继续任务直至 post(done) 或 post(kind=question)" \
-        in posted["body"], "答案必须携带续作契约行"
-    assert "不得以回应答案作为回合终局" in posted["body"]
+    assert client.posts == [], "呈面语义：绝不自动 post(answer)"
+    assert client.task_updates == [], "verify 自动采纳回路已退役"
+    assert len(face.posts) == 1
+    iid, text = face.posts[0]
+    assert iid == 7
+    assert "测试 X 可以删吗？" in text and TID in text
+    assert "回评" in text, "评论必须告诉人如何答复 worker"
+    recorded = entry(state_path)["agora_question"]
+    assert recorded["tid"] == TID
+    assert recorded["body"] == "测试 X 可以删吗？"
+    assert recorded["time"] > 0
 
 
-def test_answer_relay_fallback_also_carries_continue_contract(
+def test_verify_proposal_question_surfaced_not_auto_registered(
         tmp_path, monkeypatch):
-    """ag-da7410 B：Router 故障走事实型兜底答复时，续作指令行同样必须在
-    场——兜底不是豁免，worker 同样不能以收到答复收工。"""
-    client = FakeAgoraClient()
-    client.mail = [mail_msg(3, kind="question", body="测试 X 可以删吗？")]
-    monitor, state_path, _, face = conversation_monitor(
-        tmp_path, monkeypatch, client,
-        face=ConversationFace(answer_error=RuntimeError("router down")))
-
-    monitor.poll_once()
-
-    assert len(client.posts) == 1
-    body = client.posts[0]["body"]
-    assert "自动化答复暂不可用" in body
-    assert "不得以回应答案作为回合终局" in body
-
-
-PROPOSAL_CMD = "HX_TIDY_BASE=0f7b145e ./container/build.sh check"
-PROPOSAL_BODY = (
-    "【verify 失败根因＋处置请求】改动域基点取错被基线存量提交污染。\n"
-    f"修法（已验证）：verify_cmd 改为 `{PROPOSAL_CMD}`。\n"
-    "注意：勿改用 --tidy-full。")
-
-
-def test_verify_proposal_question_registers_cmd_and_answers(
-        tmp_path, monkeypatch):
-    """ag-fb9e5a 缺陷1 断言1：含「verify_cmd 改为 X」诉求的 worker
-    question → 以 daemon 建单身份 task_update(tid, verify_cmd=X) ≥1 次，
-    回复 answer 含登记成功结果（不经 Router 文字答复）。"""
+    """F160 二段⑦（ag-fb9e5a 回路退役判例）：含「verify_cmd 改为 X」
+    诉求的 worker question 同样只呈面——task_update 零调用、零 answer，
+    verify 改登记归派发面 post(kind=verify) 提案。Req: F160-compat-2"""
     client = FakeAgoraClient()
     client.tasks[TID]["verify"] = {"cmd": "./container/build.sh check",
                                    "state": "registered"}
+    client.tasks[TID]["state"] = "running"  # 零交付噪声：呈面测试只看评论面
     client.mail = [mail_msg(5, kind="question", body=PROPOSAL_BODY)]
     monitor, state_path, _, face = conversation_monitor(
         tmp_path, monkeypatch, client)
 
     monitor.poll_once()
 
-    assert client.task_updates == [{"task": TID, "verify_cmd": PROPOSAL_CMD}]
-    assert face.answers == [], "提案走执行回路，不交 Router"
-    assert len(client.posts) == 1
-    posted = client.posts[0]
-    assert posted["kind"] == "answer"
-    assert PROPOSAL_CMD in posted["body"]
-    assert "已按提案登记" in posted["body"]
-    assert "答案送达后必须继续任务直至 post(done) 或 post(kind=question)" \
-        in posted["body"], "提案回执同样携带续作契约行"
+    assert client.task_updates == [], "自动采纳已退役：呈面转人工"
+    assert client.posts == [], "不自动作答"
+    assert len(face.posts) == 1
+    assert "verify_cmd" in face.posts[0][1], "提案诉求必须原样上墙"
+    assert entry(state_path)["agora_question"]["body"] == PROPOSAL_BODY
 
 
-def test_plain_question_never_calls_task_update(tmp_path, monkeypatch):
-    """ag-fb9e5a 缺陷1 断言2：普通技术提问（无修改诉求）→ task_update
-    零调用，照旧 Router 文字答复。"""
+def test_question_ledger_save_failure_defers_for_replay(tmp_path, monkeypatch):
+    """F160 二段⑦：呈面落账（agora_question）写失败＝瞬态——消息留
+    pending 下一轮重放，不吞问题、不重复刷评论。Req: F160-compat-2"""
     client = FakeAgoraClient()
-    client.mail = [mail_msg(3, kind="question", body="测试 X 可以删吗？")]
-    monitor, state_path, _, face = conversation_monitor(
-        tmp_path, monkeypatch, client,
-        face=ConversationFace(answer_text="可以删，它是替身"))
-
-    monitor.poll_once()
-
-    assert client.task_updates == []
-    assert face.answers == [(7, TID, "测试 X 可以删吗？")]
-    assert client.posts[0]["body"].startswith("可以删，它是替身")
-
-
-def test_verify_proposal_idempotent_when_cmd_already_registered(
-        tmp_path, monkeypatch):
-    """ag-fb9e5a 缺陷1 幂等：任务页 verify.cmd 已等于提案命令 → 不重复
-    登记（task_update 零调用），answer 回执现状。"""
-    client = FakeAgoraClient()
-    client.tasks[TID]["verify"] = {"cmd": PROPOSAL_CMD,
-                                   "state": "registered"}
-    client.mail = [mail_msg(6, kind="question", body=PROPOSAL_BODY)]
-    monitor, state_path, _, face = conversation_monitor(
+    client.tasks[TID]["state"] = "running"  # 零交付噪声：呈面测试只看评论面
+    client.mail = [mail_msg(3, kind="question", body="基线分支是哪个？")]
+    monitor, state_path, journal, face = conversation_monitor(
         tmp_path, monkeypatch, client)
 
+    real_save = state.save_state
+
+    def failing_save(path, data):
+        raise OSError("disk full (fake)")
+
+    monkeypatch.setattr(state, "save_state", failing_save)
     monitor.poll_once()
-
-    assert client.task_updates == []
-    assert len(client.posts) == 1
-    assert "已是提案命令" in client.posts[0]["body"]
-    assert "无需重复登记" in client.posts[0]["body"]
-
-
-def test_verify_proposal_rejected_reports_reason(tmp_path, monkeypatch):
-    """ag-fb9e5a 缺陷1 回执：task_update 被确定性拒（AgoraRejected）→
-    不重放不吞，answer 携失败原因与现状转人工。"""
-    client = FakeAgoraClient()
-    client.tasks[TID]["verify"] = {"cmd": "./container/build.sh check",
-                                   "state": "registered"}
-    client.task_update_error = AgoraRejected(
-        "/task_update -> HTTP 403: dispatcher 不得登记（fake）")
-    client.mail = [mail_msg(7, kind="question", body=PROPOSAL_BODY)]
-    monitor, state_path, _, face = conversation_monitor(
-        tmp_path, monkeypatch, client)
-
-    monitor.poll_once()
-
-    assert len(client.task_updates) == 1, "拒绝也要有执行尝试在案"
-    assert len(client.posts) == 1
-    body = client.posts[0]["body"]
-    assert "登记被拒" in body and "403" in body
-    assert "./container/build.sh check" in body, "回执必须带未生效的现状命令"
+    assert face.posts == [], "落账失败不得先发评论"
     assert json.loads(
         Path(mail_path_of(state_path)).read_text(encoding="utf-8")
-    )["pending"] == [], "确定性拒绝不重放"
+    )["pending"] != [], "瞬态失败留 pending 重放"
 
-
-def test_verify_proposal_adoption_gate_only_allows_prefix_pin(
-        tmp_path, monkeypatch):
-    """ag-fb9e5a 缺陷1 采纳门（评审环收紧）：worker 提 `true` 自绿门或
-    非「现状＋NAME=<sha> 前缀」形态 → 不登记（task_update 零调用），
-    answer 事实型回执未采纳原因＋现状保留。"""
-    client = FakeAgoraClient()
-    client.tasks[TID]["verify"] = {"cmd": "./container/build.sh check",
-                                   "state": "registered"}
-    client.mail = [
-        mail_msg(8, kind="question", body="verify_cmd 改为 `true` 好了"),
-        mail_msg(9, kind="question",
-                 body="verify_cmd 里可以写 = 号吗？例如 `HX_TIDY_BASE=x "
-                      "./check.sh`"),
-        mail_msg(10, kind="question", body=PROPOSAL_BODY),
-    ]
-    monitor, state_path, _, face = conversation_monitor(
-        tmp_path, monkeypatch, client)
-
-    monitor.poll_once()  # 每轮至多答复一个 question（终闸 B-4）
-
-    assert client.task_updates == [], "非判例形态一律不得登记"
-    assert len(client.posts) == 1
-    body = client.posts[0]["body"]
-    assert "未采纳" in body and "./container/build.sh check" in body
+    monkeypatch.setattr(state, "save_state", real_save)
+    monitor.poll_once()  # 重放：落账成功＋评论一次
+    assert len(face.posts) == 1
+    assert entry(state_path)["agora_question"]["body"] == "基线分支是哪个？"
     assert json.loads(
         Path(mail_path_of(state_path)).read_text(encoding="utf-8")
-    )["pending"] != [], "其余 question 留 pending 下一轮"
+    )["pending"] == []
 
 
-def test_verify_proposal_non_dict_verify_field_answers_not_swallows(
-        tmp_path, monkeypatch):
-    """ag-fb9e5a 缺陷1（B 册 warning＋Round2 high）：board verify 载荷
-    契约外形态（非 dict／dict 内 cmd 非 str）不得让异常逃逸成静默吞问
-    ——零答复不重放正是本缺陷要修的僵死形态；必须照常给事实型 answer。"""
-    for bad in ("registered-string", {"cmd": 1234567, "state": "registered"}):
-        client = FakeAgoraClient()
-        client.tasks[TID]["verify"] = bad
-        client.mail = [mail_msg(11, kind="question", body=PROPOSAL_BODY)]
-        monitor, state_path, _, face = conversation_monitor(
-            tmp_path, monkeypatch, client)
-
-        monitor.poll_once()
-
-        assert client.task_updates == []
-        assert len(client.posts) == 1, "必须答复，不得静默消费"
-        assert "未采纳" in client.posts[0]["body"]
-        assert json.loads(
-            Path(mail_path_of(state_path)).read_text(encoding="utf-8")
-        )["pending"] == []
-
-
-def test_verify_proposal_terminal_task_not_executed(tmp_path, monkeypatch):
-    """ag-fb9e5a 缺陷1（C 册 suggestion）：终态任务的提案不执行——
-    僵尸 worker 对已终态任务的改写诉求只回事实型回执，零 task_update。"""
-    client = FakeAgoraClient()
-    client.tasks[TID]["state"] = "closed"
-    client.tasks[TID]["verify"] = {"cmd": "./container/build.sh check",
-                                   "state": "registered"}
-    client.mail = [mail_msg(12, kind="question", body=PROPOSAL_BODY)]
-    monitor, state_path, _, face = conversation_monitor(
-        tmp_path, monkeypatch, client)
-
-    monitor.poll_once()
-
-    assert client.task_updates == []
-    assert len(client.posts) == 1
-    assert "已终态" in client.posts[0]["body"]
+PROPOSAL_BODY = (
+    "【verify 失败根因＋处置请求】改动域基点取错被基线存量提交污染。\n"
+    "修法（已验证）：verify_cmd 改为 `HX_TIDY_BASE=0f7b145e ./container/build.sh check`。\n"
+    "注意：勿改用 --tidy-full。")
 
 
 def test_worker_answer_relayed_to_issue_thread(tmp_path, monkeypatch):
@@ -1383,7 +1259,9 @@ def test_check_mail_crash_after_read_replays_without_loss(
 
     monitor.poll_once()  # 新收件为空：先重放未处理批次
 
-    assert any("崩溃前的问题？" in body for _, _, body in face.answers)
+    assert any("崩溃前的问题？" in text for _, text in face.posts), \
+        "重放的 question 照常呈面上墙"
+    assert entry(state_path)["agora_question"]["body"] == "崩溃前的问题？"
     reports = json.loads(
         Path(reports_path_of(state_path)).read_text(encoding="utf-8"))
     assert reports["reports"][TID]["note"] == "崩溃前的进度 note"
@@ -1397,18 +1275,23 @@ def test_mail_processing_failure_does_not_swallow_other_messages(
     """计划 L345：单条消息处理失败只 journal 不吞批次——同批其他任务的
     消息照常处理，pending 照常推进。"""
     client = FakeAgoraClient()
-    face = ConversationFace(answer_error=RuntimeError("router down (fake)"))
+    client.tasks[TID]["state"] = "running"
     monitor, state_path, journal, face = conversation_monitor(
-        tmp_path, monkeypatch, client, face=face)
-    client.mail = [mail_msg(1, kind="question", body="会失败的问题"),
-                   mail_msg(2, kind="note", body="不受影响的汇报 note")]
+        tmp_path, monkeypatch, client)
+    # 第一条 question 的呈面注入确定性故障（处理失败只 journal）；
+    # 第二条 answer 照常回评
+    def broken_surface(iid, tid, body):
+        raise RuntimeError("surface down (fake)")
+
+    monkeypatch.setattr(monitor, "_surface_worker_question", broken_surface)
+    client.mail = [mail_msg(1, kind="question", body="会失败的提问"),
+                   mail_msg(2, kind="answer", body="不受影响的答复")]
 
     monitor.poll_once()
 
-    assert any("router down" in m for m in journal), journal
-    reports = json.loads(
-        Path(reports_path_of(state_path)).read_text(encoding="utf-8"))
-    assert reports["reports"][TID]["note"] == "不受影响的汇报 note"
+    assert any("processing failed" in m for m in journal), journal
+    assert any("不受影响的答复" in text for _, text in face.posts), \
+        face.posts
     assert json.loads(
         Path(mail_path_of(state_path)).read_text(encoding="utf-8")
     )["pending"] == []
@@ -1617,31 +1500,6 @@ def test_unknown_task_mail_warns_with_attribution_hint(tmp_path, monkeypatch):
 # --- 终闸三分册修复（B-1/B-2/B-3/B-4） -------------------------------------------
 
 
-def test_answer_post_transient_defers_for_replay(tmp_path, monkeypatch):
-    """终闸 B-2：answer post 瞬断——消息留 pending 下一轮重放重试，绝不
-    吞问题（worker 无限等待）也不重复投递已成功答复。"""
-    client = FakeAgoraClient()
-    client.mail = [mail_msg(5, kind="question", body="瞬断窗口的提问")]
-    client.post_failures.append(AgoraUnavailable("post down (fake)"))
-    monitor, state_path, journal, face = conversation_monitor(
-        tmp_path, monkeypatch, client)
-
-    monitor.poll_once()
-
-    assert client.posts == [], "未送达不得记账"
-    pending = json.loads(
-        Path(mail_path_of(state_path)).read_text(encoding="utf-8"))["pending"]
-    assert len(pending) == 1, "瞬断的消息必须留待重放"
-
-    client.post_failures.clear()
-    monitor.poll_once()
-    answers = [p for p in client.posts if p["kind"] == "answer"]
-    assert len(answers) == 1, "重放恰好补投一次"
-    assert json.loads(
-        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
-    )["pending"] == []
-
-
 def test_reports_store_write_failure_defers_note(tmp_path, monkeypatch):
     """终闸 B-3/A-1：reports 落盘瞬态 OSError≠毒消息——消息留 pending
     重放，恢复后报告照常入库（不降级成事实型评论）。"""
@@ -1673,25 +1531,233 @@ def test_reports_store_write_failure_defers_note(tmp_path, monkeypatch):
     )["pending"] == []
 
 
-def test_multiple_questions_capped_one_per_drain(tmp_path, monkeypatch):
-    """终闸 B-4：每轮 drain 至多答复一个 question——封顶 monitor 线程
-    持 ledger_lock 跨 LLM 的停摆窗；其余顺延下一轮（15s 级延迟）。"""
+def test_note_mirrored_to_issue_comment_with_frequency_cap(
+        tmp_path, monkeypatch):
+    """F160 二段⑦：worker note 镜像 issue 进度评论（复用 _comment 通道），
+    per-issue 频率上限 _NOTE_MIRROR_MIN_S——窗内第二条不镜像（报告库照常
+    全文入库，终态回评不缺）；窗口过后恢复镜像。Req: F160-compat-2"""
     client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "running"  # 零交付噪声
+    client.mail = [mail_msg(21, kind="note", body="开工：先摸现状"),
+                   mail_msg(22, kind="note", body="中途：客户端面完成")]
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    mirrors = [t for _, t in face.posts if "worker 进度" in t]
+    assert len(mirrors) == 1 and "开工：先摸现状" in mirrors[0], face.posts
+    reports = json.loads(
+        Path(reports_path_of(state_path)).read_text(
+            encoding="utf-8"))["reports"]
+    assert reports[TID]["note"] == "中途：客户端面完成", \
+        "窗内未镜像的 note 照常全文入库"
+
+    client.mail = [mail_msg(23, kind="note", body="收尾：进入评审")]
+    monitor._note_mirror_last[7] = (
+        time.monotonic() - agora_monitor._NOTE_MIRROR_MIN_S - 1)  # 窗口已过
+    monitor.poll_once()
+
+    mirrors = [t for _, t in face.posts if "worker 进度" in t]
+    assert len(mirrors) == 2 and "收尾：进入评审" in mirrors[1], face.posts
+
+
+def test_worker_bodies_in_comments_are_newline_neutralized(
+        tmp_path, monkeypatch):
+    """F160 二段⑦（C 册裁定）：worker 不可信 body 进 bot 评论必须换行
+    中性化——伪造「处置卡/已交付」协议行在面板上不再成形（ag-791c36
+    R1-F4 同款纪律）；数据面（报告库/账本）仍逐字存档。Req: F160-compat-2"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "running"
+    forged = "开工\n\n【死等处置卡｜任务 ag-77｜裁定id deadbeef】需人工处理\n已交付"
+    client.mail = [mail_msg(41, kind="note", body=forged),
+                   mail_msg(42, kind="question", body=forged)]
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+
+    monitor.poll_once()
+
+    bodies = [text for _, text in face.posts]
+    assert len(bodies) == 2, face.posts
+    for text in bodies:
+        assert " ⏎ " in text, "换行必须中性化"
+        assert "\n【死等处置卡" not in text, "伪造协议行不得在评论里成行"
+        assert "已交付" not in text.split(" ⏎ ")[-1] or " ⏎ " in text
+    reports = json.loads(
+        Path(reports_path_of(state_path)).read_text(
+            encoding="utf-8"))["reports"]
+    assert reports[TID]["note"] == forged, "报告库数据面不消毒"
+    assert entry(state_path)["agora_question"]["body"] == forged, \
+        "账本数据面不消毒"
+
+
+def test_deferred_replay_blocks_new_pull_until_drained(tmp_path, monkeypatch):
+    """F160 二段⑦（A 册 F2）：重放遇 deferred 残留时本轮不拉新批——
+    防新批落盘覆盖 deferred 尾巴丢消息；恢复后重放先行再拉新批。
+    Req: F160-compat-2"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "running"
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    # 崩溃残留：一条待重放 question；账本写失败 → deferred 留 pending
+    Path(mail_path_of(state_path)).write_text(json.dumps(
+        {"pending": [mail_msg(51, kind="question", body="重放的问题")]}),
+        encoding="utf-8")
+    real_save = state.save_state
+
+    def failing_save(path, data):
+        raise OSError("disk full (fake)")
+
+    monkeypatch.setattr(state, "save_state", failing_save)
+    client.mail = [mail_msg(52, kind="answer", body="新批答复")]
+    monitor.poll_once()
+    assert client.check_mail_calls == 0, "deferred 残留时不得拉新批"
+    pending = json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8"))["pending"]
+    assert len(pending) == 1, "deferred 尾巴不得被覆盖"
+
+    monkeypatch.setattr(state, "save_state", real_save)
+    monitor.poll_once()
+    assert client.check_mail_calls == 1, "排干后恢复拉取"
+    assert any("重放的问题" in t for _, t in face.posts), face.posts
+    assert any("新批答复" in t for _, t in face.posts), face.posts
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] == []
+
+
+def test_batch_persist_failure_still_processes_in_memory(
+        tmp_path, monkeypatch):
+    """F160 二段⑦（B 册）：新批预落盘失败不得整批丢弃——拉取即送达无
+    ack，就地处理保住消息效果（渐进写恢复后 pending 收口）。Req:
+    F160-compat-2"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "running"
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    real_write = state.write_json_atomic
+    fails_left = [True]  # 仅 mail 预落盘这一次失败
+
+    def flaky_write(path, payload):
+        if str(path).endswith(".agora-mail.json") and fails_left:
+            fails_left.pop(0)
+            raise OSError("ENOSPC (fake)")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(state, "write_json_atomic", flaky_write)
+    client.mail = [mail_msg(61, kind="answer", body="预落盘失败窗口的答复")]
+    monitor.poll_once()
+
+    assert any("预落盘失败窗口的答复" in t for _, t in face.posts), \
+        face.posts
+    assert any("persist failed" in m for m in journal), journal
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] == [], "渐进写恢复正常后 pending 收口"
+
+
+def test_stale_note_replay_is_not_mirrored(tmp_path, monkeypatch):
+    """F160 二段⑦：陈旧 mid（重放旧批次）不重新镜像——报告库新鲜度门
+    先行，进度评论不因重放刷屏。Req: F160-compat-2"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "running"
+    client.mail = [mail_msg(24, kind="note", body="唯一一条进度")]
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    monitor.poll_once()
+    assert len([t for _, t in face.posts if "worker 进度" in t]) == 1
+
+    monitor._note_mirror_last[7] = 0  # 频率门敞开：重放也不得镜像
+    client.mail = []
+    Path(mail_path_of(state_path)).write_text(json.dumps(
+        {"pending": [mail_msg(24, kind="note", body="唯一一条进度")]}),
+        encoding="utf-8")
+    monitor.poll_once()
+
+    mirrors = [t for _, t in face.posts if "worker 进度" in t]
+    assert len(mirrors) == 1, "同 mid 重放零镜像"
+
+
+def test_mail_pull_throttled_within_interval_replays_pending_only(
+        tmp_path, monkeypatch):
+    """F160 二段⑦：节流窗内只重放本地 pending、零网络拉取；窗口过后
+    恢复拉取。Req: F160-compat-2"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "running"
+    client.mail = [mail_msg(31, kind="note", body="第一条")]
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    monitor._mail_pull_min_s = 30
+
+    monitor.poll_once()
+    assert client.check_mail_calls == 1
+
+    # 节流窗内：pending 重放照常（answer 回评上墙），但不发拉取
+    Path(mail_path_of(state_path)).write_text(json.dumps(
+        {"pending": [mail_msg(33, kind="answer", body="窗内答复")]}),
+        encoding="utf-8")
+    client.mail = [mail_msg(32, kind="note", body="窗内新消息")]
+    monitor.poll_once()
+    assert client.check_mail_calls == 1, "节流窗内零网络拉取"
+    assert any("窗内答复" in t for _, t in face.posts), face.posts
+
+    monitor._mail_pull_last = time.monotonic() - 31  # 窗口已过
+    monitor.poll_once()
+    assert client.check_mail_calls == 2
+    reports = json.loads(
+        Path(reports_path_of(state_path)).read_text(
+            encoding="utf-8"))["reports"]
+    assert reports[TID]["note"] == "窗内新消息"
+
+
+def test_mail_pull_single_flight_skips_overlap(tmp_path, monkeypatch):
+    """F160 二段⑦：单飞——并发 drain 第二路直接跳过并 journal（v3
+    /check_mail 游标语义下双拉会分箱消息）。Req: F160-compat-2"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "running"
+    monitor, state_path, journal = delivery_monitor(tmp_path, monkeypatch,
+                                                    client)
+    entered = threading.Event()
+    release = threading.Event()
+    pulls = []
+
+    def slow_pull():
+        pulls.append(1)
+        entered.set()
+        release.wait(timeout=5)
+        return []
+
+    client.message_pull = slow_pull
+    thread = threading.Thread(target=monitor._drain_mail)
+    thread.start()
+    assert entered.wait(timeout=3)
+    monitor._drain_mail()  # 并发第二路：跳过
+    release.set()
+    thread.join(timeout=5)
+
+    assert len(pulls) == 1, "重入 drain 不得重复拉取"
+    assert any("in flight" in m for m in journal), journal
+
+
+def test_multiple_questions_all_surfaced_in_one_drain(tmp_path, monkeypatch):
+    """F160 二段⑦：question 呈面零 LLM 成本——旧 B-4 每轮一答预算随答复
+    回路退役，同批多条 question 一轮全部上墙＋落账。Req: F160-compat-2"""
+    client = FakeAgoraClient()
+    client.tasks[TID]["state"] = "running"  # 零交付噪声：呈面测试只看评论面
     client.mail = [mail_msg(7, kind="question", body="第一问"),
                    mail_msg(8, kind="question", body="第二问")]
     monitor, state_path, journal, face = conversation_monitor(
         tmp_path, monkeypatch, client)
 
     monitor.poll_once()
-    answers = [p for p in client.posts if p["kind"] == "answer"]
-    assert len(answers) == 1, "每轮至多一个 LLM 答复"
-    pending = json.loads(
-        Path(mail_path_of(state_path)).read_text(encoding="utf-8"))["pending"]
-    assert len(pending) == 1, "第二问顺延"
 
-    monitor.poll_once()
-    answers = [p for p in client.posts if p["kind"] == "answer"]
-    assert len(answers) == 2, "下一轮补答"
+    assert client.posts == [], "呈面语义：零 answer 投递"
+    texts = [text for _, text in face.posts]
+    assert len(texts) == 2, "一轮全部呈面，无预算顺延"
+    assert any("第一问" in t for t in texts)
+    assert any("第二问" in t for t in texts)
+    assert entry(state_path)["agora_question"]["body"] == "第二问", \
+        "账本记最新一条"
     assert json.loads(
         Path(mail_path_of(state_path)).read_text(encoding="utf-8")
     )["pending"] == []
@@ -1859,7 +1925,7 @@ def test_redispatch_during_blocked_finalize_keeps_registration(
     in_comment = threading.Event()
     release_comment = threading.Event()
 
-    def gated_hook(iid):  # 卡住 blocked 回评 POST：拉长 poll 的收口窗口
+    def gated_hook(iid, text):  # 卡住 blocked 回评 POST：拉长 poll 的收口窗口
         in_comment.set()
         assert release_comment.wait(timeout=5)
 
@@ -1937,7 +2003,6 @@ def stall_monitor(tmp_path, client, face=None, stall_timeout=1800):
                             state_path=state_path,
                             ledger_lock=threading.RLock())
     monitor.attach_conversation(post_note=face.post_note,
-                                answer_question=face.answer_question,
                                 heartbeat_interval=0)
     monitor.register(7, TID)
     return monitor, state_path, journal, face

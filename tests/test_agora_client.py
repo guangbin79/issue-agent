@@ -211,7 +211,7 @@ def test_dispatcher_token_signed_exactly_once_across_calls(tmp_path):
         client.board("ag-123")
         client.board()
         client.post("ag-123", "note", "hi")
-        client.check_mail()
+        client.message_pull()
         client.doctor()
         client.deliver("ag-123", "delivered", "a" * 40)
     requests = combo.server.requests
@@ -259,11 +259,53 @@ def test_deliver_omits_base_key_when_none_and_always_sends_reason(tmp_path):
     assert bodies[1]["reason"] == "", "reason 恒传（默认空串）"
 
 
-def test_check_mail_unwraps_messages_and_post_returns_none(tmp_path):
+def test_message_pull_unwraps_messages_and_post_returns_none(tmp_path):
+    """F160 二段⑦：message_pull 走 v2 面 /check_mail（dispatcher 牌），
+    unwrap messages；post/dispatch 恒返 None。Req: F160-compat-2"""
     with with_server(default_routes(), tmp_path) as combo:
-        assert combo.client.check_mail() == [{"id": 1}]
+        assert combo.client.message_pull() == [{"id": 1}]
         assert combo.client.post("ag-123", "note", "hi") is None
         assert combo.client.dispatch("ag-123") is None
+    pulls = [r for r in combo.server.requests if r["path"] == "/check_mail"]
+    assert len(pulls) == 1
+    assert pulls[0]["token"] == DISPATCHER_TOKEN
+    assert pulls[0]["json"] == {}
+
+
+def test_message_pull_missing_messages_list_is_protocol_error(tmp_path):
+    """F160 二段⑦：200 非 messages list（契约外载荷）＝AgoraProtocolError，
+    不静默吞收件。Req: F160-compat-2"""
+    routes = dict(default_routes())
+    routes[("POST", "/check_mail")] = lambda rec: (200, {"ok": True})
+    with pytest.raises(AgoraProtocolError):
+        with with_server(routes, tmp_path) as combo:
+            combo.client.message_pull()
+
+
+def test_wiki_write_wire_shape(tmp_path):
+    """F160 二段⑧：/wiki_write 携 dispatcher 牌，body 恰为 {path, text}。
+    Req: F160-compat-2"""
+    routes = dict(default_routes())
+    routes[("POST", "/wiki_write")] = lambda rec: (200, {"ok": True})
+    with with_server(routes, tmp_path) as combo:
+        combo.client.wiki_write("issue-specs/demo-repo-7.md", "# 规格\n正文")
+    reqs = [r for r in combo.server.requests if r["path"] == "/wiki_write"]
+    assert len(reqs) == 1
+    assert reqs[0]["token"] == DISPATCHER_TOKEN
+    assert reqs[0]["json"] == {"path": "issue-specs/demo-repo-7.md",
+                               "text": "# 规格\n正文"}
+
+
+def test_wiki_write_rejection_surfaces_as_agora_rejected(tmp_path):
+    """F160 二段⑧：服务端 4xx（如 wiki/tasks/ 前缀拒写、旧版服务 404）
+    映射 AgoraRejected——调用方按回退处置。Req: F160-compat-2"""
+    routes = dict(default_routes())
+    routes[("POST", "/wiki_write")] = lambda rec: (
+        403, {"error": "wiki/tasks/ 前缀拒写（服务独占）"})
+    with pytest.raises(AgoraRejected) as excinfo:
+        with with_server(routes, tmp_path) as combo:
+            combo.client.wiki_write("tasks/ag-1.md", "x")
+    assert "服务独占" in str(excinfo.value)
 
 
 def test_task_cancel_carries_dispatcher_plane_and_task_body(tmp_path):
@@ -401,7 +443,7 @@ def test_root_token_v3_authsvc_json_form(tmp_path):
         (home / ".agora" / "root.token").write_text(
             json.dumps({"token": ROOT_TOKEN}))
         client = make_client(str(home))
-        assert client.check_mail() == [{"id": 1}]
+        assert client.message_pull() == [{"id": 1}]
     assert server.requests[0]["path"] == "/cred_for_sid"
     assert server.requests[0]["token"] == ROOT_TOKEN
 
@@ -433,7 +475,7 @@ def test_root_token_numeric_plaintext_is_v2_not_v3(tmp_path):
             json.dumps({"port": server.server_address[1]}))
         (home / ".agora" / "root.token").write_text("123456\n")
         client = make_client(str(home))
-        assert client.check_mail() == [{"id": 1}]
+        assert client.message_pull() == [{"id": 1}]
     assert server.requests[0]["token"] == "123456"
 
 
@@ -469,7 +511,7 @@ def test_client_follows_service_json_port_change_after_refused(tmp_path):
     with fake_agora(default_routes()) as old_server:
         home = agora_home(tmp_path, old_server.server_address[1])
         client = make_client(home)
-        assert client.check_mail() == [{"id": 1}]  # 首连成功（发现+签发）
+        assert client.message_pull() == [{"id": 1}]  # 首连成功（发现+签发）
     old_port = old_server.server_address[1]
     # 占死旧端口：新 server 必拿不同端口（确定性）。SO_REUSEADDR——旧 server
     # 已关连接的服务端 socket 残留 TIME_WAIT 时不致 EADDRINUSE（对活监听仍拒绑）。
@@ -482,7 +524,7 @@ def test_client_follows_service_json_port_change_after_refused(tmp_path):
             with open(os.path.join(home, ".agora", "service.json"),
                       "w", encoding="utf-8") as f:
                 json.dump({"port": new_server.server_address[1]}, f)
-            assert client.check_mail() == [{"id": 1}], \
+            assert client.message_pull() == [{"id": 1}], \
                 "拒连后自动失效端口缓存、跟随 service.json 新端口"
             assert [r["path"] for r in new_server.requests] == ["/check_mail"], \
                 "dispatcher 牌缓存不动：拒连只失效端口/base 发现缓存"
@@ -496,7 +538,7 @@ def test_vanished_service_json_on_reconnect_is_unavailable(tmp_path):
     with fake_agora(default_routes()) as server:
         home = agora_home(tmp_path, server.server_address[1])
         client = make_client(home)
-        client.check_mail()
+        client.message_pull()
     os.unlink(os.path.join(home, ".agora", "service.json"))
     with pytest.raises(AgoraUnavailable):
-        client.check_mail()
+        client.message_pull()

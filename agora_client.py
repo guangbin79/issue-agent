@@ -7,7 +7,8 @@ v2 明文 / v3 authsvc JSON {"token": ...}，F160）。构造
 
 凭据两段：root 牌仅用于 POST /cred_for_sid 为 "issue-agent:<service_name>"
 签发/取回 dispatcher 牌（一个客户端实例恰签发一次，进程内缓存）；此后
-任务面（create/dispatch/board/post/check_mail/doctor/deliver）全部携
+任务面（create/dispatch/board/post/message_pull(/check_mail)/doctor/
+deliver/wiki_write）全部携
 dispatcher 牌，root 牌不再出现。
 
 错误三分类（调用方按类处置）：
@@ -279,13 +280,23 @@ class AgoraClient:
     def post(self, tid, kind, body) -> None:
         self._task_call("/post", {"task": tid, "kind": kind, "body": body})
 
-    def check_mail(self) -> list:
+    def message_pull(self) -> list:
+        """F160 二段⑦：收件箱拉取——v3 工具名 message_pull 经 v2 兼容根
+        路由 /check_mail（dispatcher 牌）。响应 200 非 messages list ＝
+        AgoraProtocolError（调用方按毒形态处置）。"""
         payload = self._task_call("/check_mail", {})
         messages = payload.get("messages")
         if not isinstance(messages, list):
             raise AgoraProtocolError(
                 "/check_mail -> 200 response missing messages list")
         return messages
+
+    def wiki_write(self, path, text) -> None:
+        """F160 二段⑧：wiki 页写入（/wiki_write，dispatcher 牌）。wiki/
+        tasks/ 前缀服务独占拒写（AgoraRejected）——规格页只写 issue-specs/
+        面。4xx（含旧版服务无此路由的 404）同样 AgoraRejected，由调用方
+        决定回退。"""
+        self._task_call("/wiki_write", {"path": path, "text": text})
 
     def doctor(self) -> dict:
         return self._task_call("/doctor", {})
