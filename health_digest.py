@@ -49,6 +49,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import agora_client
+
 # agorad 任务终态口径（agorad report._TERMINAL）：merged/closed＝已合并，
 # blocked/cancelled＝已拍人处置。本巡检故意只认 merged/closed/cancelled
 # 为终态：blocked 仍需人处置，入「在飞·卡死」桶逐单点名计问题
@@ -145,8 +147,8 @@ def _agora_probe(agora_home, service_name, task_ids, timeout_s=3.0):
         port = int(service["port"])
         if not 1 <= port <= 65535:
             raise ValueError(f"port out of range: {port}")
-        token = (agora_dir / "root.token").read_text(
-            encoding="utf-8").strip()
+        token = agora_client.parse_root_token(
+            (agora_dir / "root.token").read_text(encoding="utf-8"))
         if not token or not all(0x21 <= ord(c) <= 0x7E for c in token):
             raise ValueError("root token missing or illegal")
     except (OSError, ValueError, KeyError, TypeError) as exc:

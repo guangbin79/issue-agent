@@ -1,7 +1,8 @@
 """agora HTTP 服务客户端（计划 Task 1）——python3 stdlib only。
 
 服务发现（对齐 agora-plugin 同款规则）：<home>/.agora/service.json 的
-port（base=http://127.0.0.1:<port>）与 <home>/.agora/root.token。构造
+port（base=http://127.0.0.1:<port>）与 <home>/.agora/root.token（两形：
+v2 明文 / v3 authsvc JSON {"token": ...}，F160）。构造
 惰性：不触网、不读盘，首个 API 调用才做发现。
 
 凭据两段：root 牌仅用于 POST /cred_for_sid 为 "issue-agent:<service_name>"
@@ -34,6 +35,26 @@ class AgoraRejected(RuntimeError):
 
 class AgoraProtocolError(RuntimeError):
     """agora 返回 200 但响应不是 JSON 对象。"""
+
+
+def parse_root_token(raw):
+    """F160 两形：root.token 原文 → 牌值。v3 authsvc 写 JSON 对象
+    {"token": ...}——dict 形按 v3 取键（缺键/非 str/深嵌套溢出均抛
+    ValueError，由调用方归入各自发现失败口径）；其余（含 JSON 解析失败）
+    按 v2 明文，返回 strip 后文本（合法性交 _checked_token / 调用方入口
+    校验）。"""
+    text = raw.strip()
+    try:
+        cred = json.loads(text)
+    except ValueError:
+        cred = None
+    except RecursionError as exc:  # 深嵌套坏形不是 ValueError 子类——就地归入 fail-closed 通道
+        raise ValueError("root.token JSON too deeply nested") from exc
+    if isinstance(cred, dict):
+        if not isinstance(cred.get("token"), str):
+            raise ValueError("root.token JSON lacks string token")
+        return cred["token"]
+    return text
 
 
 def _checked_token(token, error_cls, where):
@@ -77,8 +98,8 @@ class AgoraClient:
             port = int(service["port"])
             if not 1 <= port <= 65535:  # 越界值会在 urlopen 抛 OverflowError（非 OSError）逸出分类
                 raise ValueError(f"port out of range: {port}")
-            root_token = (agora_dir / "root.token").read_text(
-                encoding="utf-8").strip()
+            root_token = parse_root_token(
+                (agora_dir / "root.token").read_text(encoding="utf-8"))
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise AgoraUnavailable(
                 f"agora service discovery failed under {self.home}: "

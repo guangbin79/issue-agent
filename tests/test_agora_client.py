@@ -387,6 +387,56 @@ def test_service_discovery_failures_are_unavailable(tmp_path):
         make_client(str(home)).doctor()
 
 
+# --- F160: root.token two forms (v2 plaintext / v3 authsvc JSON) ---------------
+
+
+def test_root_token_v3_authsvc_json_form(tmp_path):
+    """F160：v3 authsvc 把 root.token 写成 JSON 对象 {"token": ...}——两形
+    读等价：解析出的 token 仍只出现在 /cred_for_sid（其余走 v2 用例）。"""
+    with fake_agora(default_routes()) as server:
+        home = tmp_path / "plaza"
+        (home / ".agora").mkdir(parents=True)
+        (home / ".agora" / "service.json").write_text(
+            json.dumps({"port": server.server_address[1]}))
+        (home / ".agora" / "root.token").write_text(
+            json.dumps({"token": ROOT_TOKEN}))
+        client = make_client(str(home))
+        assert client.check_mail() == [{"id": 1}]
+    assert server.requests[0]["path"] == "/cred_for_sid"
+    assert server.requests[0]["token"] == ROOT_TOKEN
+
+
+@pytest.mark.parametrize("bad", [
+    json.dumps({"token": 5}),      # v3 形但 token 非 str
+    json.dumps({"token": None}),
+    json.dumps({}),                # v3 形但缺 token 键
+    json.dumps({"other": "x"}),
+], ids=["non-string", "null-token", "empty-object", "wrong-key"])
+def test_root_token_v3_bad_json_object_fails_closed(tmp_path, bad):
+    """F160：dict 形而坏 v3 形（缺 token 键/非 str）＝发现失败
+    AgoraUnavailable（fail-closed，不回退误读为明文）。"""
+    home = tmp_path / "plaza"
+    (home / ".agora").mkdir(parents=True)
+    (home / ".agora" / "service.json").write_text(json.dumps({"port": 1}))
+    (home / ".agora" / "root.token").write_text(bad)
+    with pytest.raises(AgoraUnavailable):
+        make_client(str(home)).doctor()
+
+
+def test_root_token_numeric_plaintext_is_v2_not_v3(tmp_path):
+    """F160 判形规则锚：仅 dict 形按 v3 解析——纯数字 v2 明文（恰是合法
+    JSON 标量）原样作为明文 token 使用。"""
+    with fake_agora(default_routes()) as server:
+        home = tmp_path / "plaza"
+        (home / ".agora").mkdir(parents=True)
+        (home / ".agora" / "service.json").write_text(
+            json.dumps({"port": server.server_address[1]}))
+        (home / ".agora" / "root.token").write_text("123456\n")
+        client = make_client(str(home))
+        assert client.check_mail() == [{"id": 1}]
+    assert server.requests[0]["token"] == "123456"
+
+
 def test_illegal_token_characters_rejected_before_header(tmp_path):
     """牌值含 header 非法字符（内嵌换行）在客户端入口即拒：putheader 的
     ValueError repr 含牌值，穿透 _scrub 泄牌（终闸 C 册 finding）。"""

@@ -115,7 +115,9 @@ REPOST_NOT_FOUND_NOTE = ("「重发汇报」：本会话历史中未找到三段
 # from the current remote tip) on the issue panel.
 REDISPATCH_NOTE = ("已按「重试」重派 agora 任务 {tid}：新 worker／新凭据、"
                    "失败计数清零、环境按当前远端 tip 重建；后续评论将直达"
-                   "新 worker。")
+                   "新 worker。worker 契约（F160）：里程碑 post(kind=note) "
+                   "一句话汇报；收到 nudge 后必须 post 自检结论（板面零活动"
+                   "会被判僵误重派），禁静默。")
 
 # task 8: prompt for the post-push review phase. The spawned headless child
 # runs the REAL /review-loop command (resolved via its own user-level

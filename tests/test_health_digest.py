@@ -552,6 +552,25 @@ def test_default_probe_http_roundtrip(tmp_path):
     assert all(r["token"] == ROOT_TOKEN for r in server.requests)
 
 
+def test_default_probe_root_token_v3_json_form(tmp_path):
+    """F160：health_digest 与 agora_client 同读 root.token——v3 authsvc
+    JSON 两形读共用 parse_root_token（好形生效，坏形 ok:False 不泄漏）。"""
+    with fake_agora() as server:
+        home = write_agora_home(tmp_path, server.server_address[1])
+        with open(home + "/.agora/root.token", "w", encoding="utf-8") as f:
+            json.dump({"token": ROOT_TOKEN}, f)
+        result = health_digest._agora_probe(home, "demo-issue-agent",
+                                            [], timeout_s=5)
+        assert result["ok"] is True
+        assert all(r["token"] == ROOT_TOKEN for r in server.requests)
+
+        with open(home + "/.agora/root.token", "w", encoding="utf-8") as f:
+            json.dump({"token": 5}, f)
+        result = health_digest._agora_probe(home, "demo-issue-agent", [])
+        assert result["ok"] is False
+        assert ROOT_TOKEN not in result["error"]
+
+
 def test_default_probe_discovery_failure_no_leak(tmp_path):
     result = health_digest._agora_probe(str(tmp_path / "nowhere"),
                                         "demo-issue-agent", [])

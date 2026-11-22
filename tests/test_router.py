@@ -499,6 +499,16 @@ def test_template_carries_three_way_routing_criteria():
     assert "external_branch" in text, "代码修复类缺省交付面"
 
 
+def test_template_carries_f160_progress_visibility_contract():
+    """F160：goal 必须携带 worker 进度可见性契约——里程碑一句话
+    post(kind=note)＋nudge 自检结论必须 post（板面零活动会被僵态阶梯
+    判僵误重派）。"""
+    text = _template_text()
+    assert "post(kind=note)" in text
+    assert "nudge" in text
+    assert "禁" in text and "静默" in text
+
+
 def test_template_carries_goal_gate_before_routing():
     """goal-gate 路由层前置闸：门节必须位于 action 分流判据之前；
     任一查不过 → action=question，reason 前缀三锚（无法达成/需明确

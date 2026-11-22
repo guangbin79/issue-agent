@@ -4206,6 +4206,8 @@ def test_blocked_retry_command_redispatches_same_task_and_confirms(
         confirms = [text for _, text in h.api.posts if "ag-123" in text]
         assert confirms and "重派" in confirms[0] \
             and "新 worker" in confirms[0], h.api.posts
+        assert "post(kind=note)" in confirms[0], \
+            "F160：重派确认必须携带 worker 进度可见性契约句"
         assert 102 in h.entry(7)["processed_note_ids"], "指令消费即记账"
     finally:
         h.orch.stop()
