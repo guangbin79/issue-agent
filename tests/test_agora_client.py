@@ -188,6 +188,21 @@ def test_task_cancel_force_wire_shape(tmp_path):
     assert bodies[1]["force"] is True
 
 
+def test_reverify_wire_shape(tmp_path):
+    """ag-52d0d3：done 驻留重排——/reverify 走 dispatcher 牌任务面（同
+    task_deliver 通道），body 恰为 {task}。"""
+    routes = default_routes()
+    routes[("POST", "/reverify")] = \
+        lambda rec: (200, {"ok": True, "requeued": True})
+    with with_server(routes, tmp_path) as combo:
+        result = combo.client.reverify("ag-123")
+    assert result == {"ok": True, "requeued": True}
+    reqs = [r for r in combo.server.requests if r["path"] == "/reverify"]
+    assert len(reqs) == 1
+    assert reqs[0]["token"] == DISPATCHER_TOKEN
+    assert reqs[0]["json"] == {"task": "ag-123"}
+
+
 def test_task_update_wire_shape(tmp_path):
     """ag-fb9e5a：verify 提案执行回路——/task_update 携 dispatcher 牌，
     body 恰为 {task, verify_cmd}。"""

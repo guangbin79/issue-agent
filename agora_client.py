@@ -277,6 +277,12 @@ class AgoraClient:
             body["base"] = base
         return self._task_call("/task_deliver", body)
 
+    def reverify(self, tid) -> dict:
+        """ag-52d0d3：done 驻留任务重排回验证门（/reverify，dispatcher 牌＝
+        同 task_deliver 通道；服务端仅 done 非 in_gate 驻留可重排，worker
+        角色全局永拒）。"""
+        return self._task_call("/reverify", {"task": tid})
+
     def post(self, tid, kind, body) -> None:
         self._task_call("/post", {"task": tid, "kind": kind, "body": body})
 

@@ -35,6 +35,14 @@ Task 5：
   停摆至人工改 state.json；补登记零网络（不调 board），真相对账交给
   本轮既有 board 周期。
 
+ag-52d0d3（2026-11-23）：verify 机械失败自愈——agorad 判
+verify_infra_failed/verify_dead 后任务驻留 done＋kind=result mail 通知
+派发方，此前无消费分支（ag-aa8798 rc=137 死锁 13 小时，人工 root
+reverify 才解锁）；现消费该类 mail（文案特征锚定 gate.py 下发文案），
+board 核对 done 驻留（非 in_gate、非 awaiting_external）后登记 ≥5 分钟
+延迟复查（持久 sidecar），下轮 sweep 复查仍驻留则以 dispatcher 凭据
+reverify 重排——每任务上限 2 次（计数重启不丢），超限走 issue 报警评论。
+
 活动名额（max_active，接线 config.max_parallel）为原子 check-and-reserve
 （F3）；_run_turn 返回不释放——释放权只在本状态机（终态）与回合失败出口。
 agora 任务自身的 origin push 只经 push_verified_commit（精确 SHA、绝不动
@@ -148,6 +156,50 @@ def _stuck_store_load(state_path) -> dict:
 def _stuck_store_save(state_path, store) -> None:
     state.write_json_atomic(str(state_path) + ".agora-rulings.json", store)
 
+
+# ag-52d0d3：verify 机械失败自愈登记 store（{tid: {iid, count,
+# recheck_at}}；recheck_at 在＝待延迟复查）——计数与登记持久，daemon
+# 重启不丢；终态出账（不无界增长）。行级矫正（ag-72646a
+# _stuck_store_load 同款纪律）：坏行不抛——非 dict 行丢弃，count 坏值
+# 按预算尽口径（下次 mail 走人工报警面），recheck_at 非数值丢弃——
+# 消费面不得让 TypeError/ValueError 逃逸（毒行饿死整轮 sweep，或把
+# verify 机械失败 mail 当毒消息吞掉）。
+def _reverify_load(state_path) -> dict:
+    try:
+        raw = json.loads(
+            Path(str(state_path) + ".agora-reverify.json").read_text(
+                encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    store = {}
+    for tid, row in raw.items():
+        if not isinstance(tid, str) or not isinstance(row, dict):
+            continue
+        try:
+            count = int(row.get("count") or 0)
+        except (TypeError, ValueError, OverflowError):
+            # 终闸 B 册：json 1e999→float('inf')，int(inf) 抛
+            # OverflowError——同属坏档面，按预算尽口径走人工报警面
+            count = _MAX_AUTO_REVERIFY
+        fresh = {"iid": row.get("iid"), "count": max(count, 0)}
+        recheck = row.get("recheck_at")
+        # bool 是 int 子类（True→立即到期）：排除；NaN 恒不 due＝无害滞留
+        if isinstance(recheck, (int, float)) and not isinstance(recheck, bool):
+            fresh["recheck_at"] = recheck
+        store[tid] = fresh
+    return store
+
+
+def _reverify_save(state_path, store) -> None:
+    state.write_json_atomic(str(state_path) + ".agora-reverify.json", store)
+
+
+def _is_verify_infra_mail(body) -> bool:
+    """verify 机械失败类 result mail 识别（文案特征单源，勿按 rc 猜）。"""
+    return any(mark in body for mark in _VERIFY_INFRA_MARKS)
+
 # board 主状态（task 行 state）：这三个对本监视器是终态（名额可释放）
 _TERMINAL_STATES = ("merged", "closed", "cancelled")
 
@@ -155,6 +207,23 @@ _TERMINAL_STATES = ("merged", "closed", "cancelled")
 # retry_exhausted 终局拒——attempt 已达 3 再收到确定性 force 拒绝时不再
 # 轮转，直接 deliver(failed, force_rejected) 终局（ag-cad1d6 High-1）
 _MAX_DELIVERY_ATTEMPTS = 3
+
+# ag-52d0d3：verify 机械失败自愈面。agorad 判 verify_infra_failed
+# （signal 类 rc，判例 ag-aa8798 rc=137）/verify_dead（rc 126/127）后任务
+# 驻留 done 并以 kind=result mail 通知派发方——此前 monitor 只认终态迁移，
+# 无消费分支，死锁至人工 root reverify（13 小时）。文案特征锚定 agorad
+# core/gate.py _verify_infra/_verify_dead 下发文案（勿按 rc 猜）。
+_VERIFY_INFRA_MARKS = ("verify 机械失败", "verify 命令自身死")
+# 延迟复查窗（秒，≥5 分钟）：防与派发方/服务端兜底抢跑；窗内任务被
+# 他方重排（in_gate）则复查不动作。模块常量调用时读，测试可拨快。
+_REVERIFY_DELAY_S = 300
+# 每任务自动重排上限：计数持久 sidecar（daemon 重启不丢）；超限走既有
+# 报警面（issue 评论），不再 reverify。
+_MAX_AUTO_REVERIFY = 2
+_REVERIFY_EXHAUSTED_TEXT = (
+    "agora 任务 {tid} verify 机械失败驻留 done，自动 reverify 预算（{n} 次）"
+    "已用尽，需要人工处理。\n处置：维护者在 agora 服务面 reverify 重排，"
+    "或取消任务归档。")
 
 # ag-03f9f3：账本补登记重试节流（秒）。休眠任务（blocked/交付失败释放
 # 后无人处置）每轮补登记会制造 register→board→release 逐轮抖动（幻影
@@ -379,6 +448,10 @@ class AgoraMonitor:
             except Exception as exc:  # 防单任务病拖垮整轮
                 self._journal(f"agora-monitor: issue#{iid} task {tid} poll "
                               f"failed: {exc!r}")
+        try:
+            self._reverify_sweep()  # ag-52d0d3：verify 机械失败延迟复查
+        except Exception as exc:
+            self._journal(f"agora-monitor: reverify sweep failed: {exc!r}")
         self._heartbeat_tick()
         with self._guard:  # ag-6f53fa：轮末原子读清本轮释放数
             released = self._released
@@ -500,6 +573,7 @@ class AgoraMonitor:
                     self._record_delivery_commit(iid, commit)
                 self._report_comment(iid, tid, commit)
                 self._stuck_row_prune(tid)  # R1-F2：成功收口清死等行
+                self._reverify_row_prune(tid)  # ag-52d0d3 终闸 B：同款出账
                 self.release(iid, tid)
         # 其余（pending/integrating 与未到 done 的运行态）：本轮无动作——
         # running 且零板面活动超阈值时走僵态阶梯（ag-da7410 C）
@@ -834,6 +908,151 @@ class AgoraMonitor:
                 self._journal(f"agora-monitor: stuck store prune "
                               f"failed: {exc}")
 
+    # ---- verify 机械失败自愈（ag-52d0d3）----
+
+    @staticmethod
+    def _verify_infra_stuck(task) -> bool:
+        """board 单任务核对：done 驻留 ∧ 非 in_gate ∧ 非外部交付稳态
+        （awaiting_external 驻留是设计内稳态，处置动词是 task_deliver）。"""
+        return (task.get("state") == "done" and not task.get("in_gate")
+                and (task.get("delivery") or {}).get("status")
+                != "awaiting_external")
+
+    def _verify_requeue_register(self, iid, tid):
+        """verify 机械失败 mail 消费主分支：预算内登记延迟复查（≥5 分钟，
+        防与派发方/服务端兜底抢跑），复查交给下轮 sweep（禁内存 sleep）；
+        预算尽则报警评论（按 mark 幂等，重放不刷屏）。落盘失败抛
+        _MailDeferred 留 pending 重放（瞬态≠毒，自愈登记不丢）。"""
+        if self._state_path is None:
+            return
+        store = _reverify_load(self._state_path)
+        row = store.get(tid)
+        if not isinstance(row, dict):
+            row = {"iid": int(iid), "count": 0}
+        if int(row.get("count") or 0) >= _MAX_AUTO_REVERIFY:
+            self._journal(
+                f"agora-monitor: issue#{iid} task {tid} verify 机械失败"
+                f"驻留 done；auto-reverify budget exhausted "
+                f"({row.get('count')}/{_MAX_AUTO_REVERIFY}), alarming")
+            try:
+                self._comment_once(
+                    iid, tid,
+                    _REVERIFY_EXHAUSTED_TEXT.format(
+                        tid=tid, n=_MAX_AUTO_REVERIFY),
+                    mark="reverify_exhausted")
+            except OSError as exc:
+                # 终闸 B 册：报警落盘瞬态≠毒消息（B-3 同款）——预算尽后
+                # 无新 mail 重试，mark 写失败必须留 pending 重放防永久丢失
+                raise _MailDeferred(
+                    f"exhausted-alarm store failed for {tid}: {exc}") from exc
+            return
+        row["iid"] = int(iid)
+        row["recheck_at"] = time.time() + _REVERIFY_DELAY_S
+        store[tid] = row
+        try:
+            _reverify_save(self._state_path, store)
+        except OSError as exc:
+            raise _MailDeferred(
+                f"reverify store write failed for {tid}: {exc}") from exc
+        self._journal(
+            f"agora-monitor: issue#{iid} task {tid} verify 机械失败驻留 "
+            f"done; recheck scheduled in {_REVERIFY_DELAY_S}s "
+            f"(count {row['count']}/{_MAX_AUTO_REVERIFY})")
+
+    def _reverify_sweep(self):
+        """延迟复查扫（每轮 poll 收尾）：到期登记重读 board，仍驻留则
+        以 dispatcher 凭据（同 task_deliver 通道）reverify 重排——每任务
+        上限 _MAX_AUTO_REVERIFY 次。任务已被他方处置（非驻留/in_gate）或
+        reverify 确定性被拒 → 消费登记；瞬断 → 保留下一轮重试。"""
+        if self._state_path is None:
+            return
+        store = _reverify_load(self._state_path)
+        now = time.time()
+        due = [(tid, row) for tid, row in store.items()
+               if isinstance(row, dict) and row.get("recheck_at")
+               and now >= row["recheck_at"]]
+        for tid, row in due:
+            try:
+                task = self._board_task(tid)
+            except AgoraRejected as exc:
+                # 任务已不在服务面：毒登记，消费掉
+                self._journal(f"agora-monitor: recheck for {tid} rejected "
+                              f"(deterministic), dropped: {exc}")
+                self._reverify_row_consume(store, tid)
+                continue
+            except (AgoraUnavailable, AgoraProtocolError) as exc:
+                self._journal(f"agora-monitor: recheck board read for {tid} "
+                              f"transient, retry next sweep: {exc}")
+                continue
+            if not self._verify_infra_stuck(task):
+                # 他方已处置（in_gate/重排/交付推进）：登记消费，计数保留
+                self._journal(f"agora-monitor: issue#{row.get('iid')} task "
+                              f"{tid} moved on recheck; registration dropped")
+                self._reverify_row_consume(store, tid)
+                continue
+            if int(row.get("count") or 0) >= _MAX_AUTO_REVERIFY:
+                # ocr 复筛：到期行已超预算（坏档 count 映射尽口径／消费写
+                # 失败残留 recheck_at）——不再 reverify，消费登记，下次
+                # mail 走人工报警面（上限 2 契约不得突破）
+                self._journal(f"agora-monitor: recheck for {tid} due but "
+                              f"auto-reverify budget exhausted "
+                              f"({row.get('count')}/{_MAX_AUTO_REVERIFY}), "
+                              "dropped")
+                self._reverify_row_consume(store, tid)
+                continue
+            try:
+                self._client.reverify(tid)
+            except AgoraRejected as exc:
+                # 确定性拒绝（服务端判非 done 驻留等）：以服务口径为准，消费
+                self._journal(f"agora-monitor: reverify for {tid} rejected "
+                              f"(deterministic), dropped: {exc}")
+                self._reverify_row_consume(store, tid)
+                continue
+            except (AgoraUnavailable, AgoraProtocolError) as exc:
+                self._journal(f"agora-monitor: reverify for {tid} transient, "
+                              f"retry next sweep: {exc}")
+                continue
+            row["count"] = int(row.get("count") or 0) + 1
+            try:
+                # 预算先行固化（评审环 R1#2）：服务端已受理重排，计数增量
+                # 独立于消费写落盘——消费写失败不得回退已耗预算（上限可破）
+                _reverify_save(self._state_path, store)
+            except OSError as exc:
+                self._journal(f"agora-monitor: reverify count write "
+                              f"failed for {tid}: {exc}")
+            self._reverify_row_consume(store, tid)  # 清 recheck_at、计数落盘
+            self._journal(
+                f"agora-monitor: issue#{row.get('iid')} task {tid} verify "
+                f"机械失败驻留复查仍卡；reverify requeued "
+                f"({row['count']}/{_MAX_AUTO_REVERIFY})")
+
+    def _reverify_row_consume(self, store, tid):
+        """消费一条复查登记（清 recheck_at、保留计数）；落盘失败只
+        journal——盘上残登记下一轮 sweep 重读 board 自愈（仍驻留会再
+        reverify，服务端幂等口径拒绝重复重排，不放大）。"""
+        row = store.get(tid)
+        if isinstance(row, dict):
+            row.pop("recheck_at", None)
+        try:
+            _reverify_save(self._state_path, store)
+        except OSError as exc:
+            self._journal(f"agora-monitor: reverify store write "
+                          f"failed: {exc}")
+
+    def _reverify_row_prune(self, tid):
+        """终态出账：行随任务终局/收口删除（sidecar 不无界增长）。"""
+        if self._state_path is None:
+            return
+        store = _reverify_load(self._state_path)
+        if tid not in store:
+            return
+        del store[tid]
+        try:
+            _reverify_save(self._state_path, store)
+        except OSError as exc:
+            self._journal(f"agora-monitor: reverify store prune "
+                          f"failed: {exc}")
+
     # ---- 终态汇报（Task 5）----
 
     @staticmethod
@@ -873,6 +1092,7 @@ class AgoraMonitor:
             self._report_comment(iid, tid, delivery.get("commit"))
         self._stall_row_prune(tid)
         self._stuck_row_prune(tid)  # ag-791c36：死等行随终态出账
+        self._reverify_row_prune(tid)  # ag-52d0d3：自愈计数随终态出账
         self.release(iid, tid)
 
     def _finish_blocked(self, iid, tid, delivery):
@@ -890,6 +1110,7 @@ class AgoraMonitor:
             mark="blocked")
         self._stall_row_prune(tid)
         self._stuck_row_prune(tid)  # ag-791c36：死等行随 blocked 出账
+        self._reverify_row_prune(tid)  # ag-52d0d3：自愈计数随 blocked 出账
         self.release(iid, tid)
 
     def redispatched(self, iid, tid):
@@ -1173,6 +1394,7 @@ class AgoraMonitor:
             self._sync_agora_status(iid, status)
             self._report_comment(iid, tid, delivery.get("commit") or commit)
             self._stuck_row_prune(tid)  # R1-F2：成功收口清死等行
+            self._reverify_row_prune(tid)  # ag-52d0d3 终闸 B：同款出账
             self.release(iid, tid)
             return
         self._journal(f"agora-monitor: issue#{iid} board moved after "
@@ -1526,6 +1748,11 @@ class AgoraMonitor:
         task_state = task.get("state")
         delivery = task.get("delivery") or {}
         if task_state not in _TERMINAL_STATES:
+            # ag-52d0d3：verify 机械失败类驻留 done——轮询面对该形态无
+            # 消费分支（ag-aa8798 死锁判例），唯一自愈入口在此
+            if _is_verify_infra_mail(body) \
+                    and self._verify_infra_stuck(task):
+                self._verify_requeue_register(iid, tid)
             return  # 非 terminal（如 blocked 迁移本身）：轮询面已覆盖
         try:
             self._sync_agora_status(iid, self._status_text(task_state,

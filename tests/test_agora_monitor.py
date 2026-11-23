@@ -244,6 +244,7 @@ class FakeAgoraClient:
         # ag-da7410 C：僵态阶梯面——task_nudge/dispatch 记账
         self.nudges = []
         self.dispatch_calls = []
+        self.reverify_calls = []  # ag-52d0d3：done 驻留重排记账
 
     def message_pull(self):
         self.check_mail_calls += 1
@@ -280,6 +281,10 @@ class FakeAgoraClient:
 
     def dispatch(self, tid):
         self.dispatch_calls.append(tid)
+
+    def reverify(self, tid):
+        self.reverify_calls.append(tid)
+        return {"ok": True, "requeued": True}
 
     def board(self, tid):
         self.board_calls.append(tid)
@@ -2213,3 +2218,250 @@ def test_panel_redispatch_injection_reads_ledger_commit(tmp_path,
     assert len(client.posts) == 1
     assert client.posts[0]["kind"] == "note"
     assert hex40("b")[:12] in client.posts[0]["body"]
+
+
+# --- ag-52d0d3: verify 机械失败自愈（mail 消费→延迟复查→reverify） ---------------
+
+
+def reverify_path_of(state_path):
+    return str(state_path) + ".agora-reverify.json"
+
+
+INFRA_BODY = (f"任务 {TID} verify 机械失败（exit 137：signal 类——"
+              "SIGKILL/SIGSEGV/SIGABRT，疑似 OOM/基础设施）——"
+              "机械失败/基础设施疑点，非质量败：不计连败、无需 worker "
+              "重试，任务驻留 done 待处置")
+DEAD_BODY = (f"任务 {TID} verify 命令自身死（exit 127：命令不存在/不可执行）"
+             "——非活不达标，已升级派发方处置")
+
+
+def infra_stuck_client(state="done", in_gate=False, delivery_status="pending",
+                       commit=None):
+    """verify 机械失败驻留形态客户端：board 行＝done＋门已走完＋交付面
+    未到 awaiting_external（gate 死在门内，delivery 停 pending）。"""
+    client = FakeAgoraClient()
+    client.tasks[TID] = {
+        "state": state, "in_gate": in_gate,
+        "deliverable": "external_branch",
+        "created": time.time(), "last_seen": None,
+        "delivery": {"mode": "external_branch", "status": delivery_status,
+                     "commit": commit, "base": None, "attempt": 0,
+                     "error": None, "target_branch": "issue/7-fix",
+                     "local_status": "pending"}}
+    return client
+
+
+def age_reverify_window(state_path, tid=TID, age_s=600.0):
+    """把待复查登记拨到期（模拟 ≥5 分钟延迟窗流逝）。"""
+    from agora_monitor import _reverify_load, _reverify_save  # 测试缝
+    store = _reverify_load(state_path)
+    store[tid]["recheck_at"] = time.time() - age_s
+    _reverify_save(state_path, store)
+
+
+def reverify_store(state_path):
+    return json.loads(
+        Path(reverify_path_of(state_path)).read_text(encoding="utf-8"))
+
+
+def test_verify_infra_mail_stuck_done_requeues_via_reverify_once(
+        tmp_path, monkeypatch):
+    """① verify_infra mail＋board done 驻留 → 登记延迟复查，到期复查仍
+    驻留 → reverify 恰调一次（复查窗内与消费后都不抢跑）。"""
+    client = infra_stuck_client()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    client.mail = [mail_msg(30, kind="result", body=INFRA_BODY)]
+
+    monitor.poll_once()  # 消费 mail：board 核对驻留 → 登记复查（窗内）
+
+    assert client.reverify_calls == [], "延迟窗内不抢跑"
+    assert reverify_store(state_path)[TID]["recheck_at"] > 0, "复查登记落盘"
+
+    age_reverify_window(state_path)
+    monitor.poll_once()  # 到期复查：board 仍驻留 → reverify 恰一次
+
+    assert client.reverify_calls == [TID]
+    monitor.poll_once()  # 登记已消费（无 recheck_at）：不再重排
+    assert client.reverify_calls == [TID]
+    store = reverify_store(state_path)
+    assert store[TID]["count"] == 1 and "recheck_at" not in store[TID]
+
+
+def test_verify_infra_mail_non_done_board_no_action(tmp_path, monkeypatch):
+    """② board 返回非 done 态（他方已处置/在飞）→ 不登记不重排。"""
+    client = infra_stuck_client(state="running")
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    client.mail = [mail_msg(31, kind="result", body=INFRA_BODY)]
+
+    monitor.poll_once()
+
+    assert client.reverify_calls == []
+    assert not Path(reverify_path_of(state_path)).exists()
+
+
+def test_verify_infra_mail_awaiting_external_no_action(tmp_path, monkeypatch):
+    """③ done＋awaiting_external＝外部交付驻留设计内稳态 → 不动作。"""
+    client = infra_stuck_client(delivery_status="awaiting_external",
+                                commit=hex40("a"))
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    client.mail = [mail_msg(32, kind="result", body=INFRA_BODY)]
+
+    monitor.poll_once()
+
+    assert client.reverify_calls == []
+    assert not Path(reverify_path_of(state_path)).exists()
+
+
+def test_verify_infra_budget_exhausted_alarms_instead(tmp_path, monkeypatch):
+    """④ 自动重排计数已达 2 → 不再登记/重排，产生报警动作（issue 评论）。"""
+    client = infra_stuck_client()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    from agora_monitor import _reverify_save
+    _reverify_save(state_path, {TID: {"iid": 7, "count": 2}})
+    client.mail = [mail_msg(33, kind="result", body=DEAD_BODY)]
+
+    monitor.poll_once()
+
+    assert client.reverify_calls == []
+    assert "recheck_at" not in reverify_store(state_path)[TID]
+    assert any("人工" in text for _, text in face.posts), face.posts
+
+
+def test_verify_infra_delay_window_in_gate_no_action(tmp_path, monkeypatch):
+    """⑤ 延迟窗内任务转 in_gate（他方已处置）→ 复查不动作、登记消费。"""
+    client = infra_stuck_client()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    client.mail = [mail_msg(34, kind="result", body=INFRA_BODY)]
+    monitor.poll_once()  # 登记
+    client.tasks[TID]["in_gate"] = True  # 派发方/服务端兜底已重排进 gate
+
+    age_reverify_window(state_path)
+    monitor.poll_once()  # 到期复查：board 已非驻留 → 不 reverify
+
+    assert client.reverify_calls == []
+    assert "recheck_at" not in reverify_store(state_path).get(TID, {})
+
+
+def test_verify_infra_corrupt_sidecar_rows_sanitized(tmp_path, monkeypatch):
+    """评审环 R1（ocr 1+3）：坏档行在 loader 矫正——非 dict 行丢弃、坏
+    count 按预算尽、坏 recheck_at 丢弃；毒行不得饿死 sweep 或把
+    verify 机械失败 mail 当毒消息吞掉。"""
+    from agora_monitor import _reverify_load, _reverify_save
+    client = infra_stuck_client()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    _reverify_save(state_path, {"ag-bad": "not-a-dict",
+                                TID: {"iid": 7, "count": "abc",
+                                      "recheck_at": "soon"}})
+
+    store = _reverify_load(state_path)
+    assert store == {TID: {"iid": 7, "count": 2}}, \
+        "非 dict 行丢弃；坏 count 按预算尽；坏 recheck_at 丢弃"
+
+    client.mail = [mail_msg(37, kind="result", body=INFRA_BODY)]
+    monitor.poll_once()  # mail 不被当毒消息吞掉：坏 count 走报警面
+    assert client.reverify_calls == []
+    assert any("人工" in text for _, text in face.posts), face.posts
+
+
+def test_verify_infra_loader_sanitizes_infinite_negative_and_bool(
+        tmp_path, monkeypatch):
+    """终闸 B/C 册：loader 矫正闸口径补全——count=1e999（int(inf) 抛
+    OverflowError）不得逃逸、负 count 钳 0、recheck_at=True（bool 是
+    int 子类→立即到期）丢弃。"""
+    from agora_monitor import _reverify_load, _reverify_save
+    client = infra_stuck_client()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    _reverify_save(state_path, {
+        "ag-inf": {"iid": 9, "count": 1e999},
+        "ag-neg": {"iid": 9, "count": -5, "recheck_at": True},
+        TID: {"iid": 7, "count": 1}})
+
+    store = _reverify_load(state_path)
+    assert store["ag-inf"]["count"] == 2, "inf 按预算尽口径，不抛"
+    assert store["ag-neg"] == {"iid": 9, "count": 0}, \
+        "负 count 钳 0；bool recheck_at 丢弃"
+
+    monitor.poll_once()  # 矫正后 sweep 不炸不误排
+    assert client.reverify_calls == []
+
+
+def test_verify_infra_exhausted_alarm_store_failure_defers(
+        tmp_path, monkeypatch):
+    """终闸 B 册：预算尽报警的落盘瞬态≠毒消息（B-3 同款）——mark 写
+    失败抛 _MailDeferred 留 pending 重放，报警评论不永久丢失。"""
+    client = infra_stuck_client()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    from agora_monitor import _reverify_save
+    _reverify_save(state_path, {TID: {"iid": 7, "count": 2}})
+    client.mail = [mail_msg(38, kind="result", body=INFRA_BODY)]
+
+    orig = monitor._comment_once
+
+    def boom(iid, tid, text, mark="final"):
+        raise OSError("disk full (fake)")
+
+    monkeypatch.setattr(monitor, "_comment_once", boom)
+    monitor.poll_once()
+    pending = json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8"))["pending"]
+    assert len(pending) == 1, "报警写失败必须留 pending 重放"
+
+    monkeypatch.setattr(monitor, "_comment_once", orig)
+    monitor.poll_once()  # 重放：报警照常发出
+    assert any("人工" in text for _, text in face.posts), face.posts
+    assert json.loads(
+        Path(mail_path_of(state_path)).read_text(encoding="utf-8")
+    )["pending"] == []
+
+
+def test_verify_infra_sweep_gates_exhausted_budget(tmp_path, monkeypatch):
+    """终闸 ocr 复筛：到期行已超预算（坏档 count 映射尽口径／消费写
+    失败残 recheck_at）→ sweep 不再 reverify，消费登记——下次 mail 走
+    人工报警面（上限 2 契约不得突破）。"""
+    client = infra_stuck_client()
+    monitor, state_path, journal, face = conversation_monitor(
+        tmp_path, monkeypatch, client)
+    from agora_monitor import _reverify_load, _reverify_save
+    _reverify_save(state_path, {TID: {"iid": 7, "count": 2,
+                                      "recheck_at": time.time() - 600}})
+
+    monitor.poll_once()
+
+    assert client.reverify_calls == []
+    store = _reverify_load(state_path)
+    assert "recheck_at" not in store[TID] and store[TID]["count"] == 2, \
+        "登记消费、计数保留"
+    assert any("exhausted" in m for m in journal), journal
+
+
+def test_verify_infra_state_survives_restart(tmp_path, monkeypatch):
+    """⑥ sidecar 重载后计数与待复查登记保留——重启（同 state_path 新
+    monitor）后续走复查且计数从在案值续加。"""
+    client_a = infra_stuck_client()
+    monitor_a, state_path, _, _ = conversation_monitor(
+        tmp_path, monkeypatch, client_a)
+    client_a.mail = [mail_msg(35, kind="result", body=INFRA_BODY)]
+    monitor_a.poll_once()
+
+    client_b = infra_stuck_client()  # 重启：同 state_path、新客户端新 monitor
+    monitor_b, _, _, _ = conversation_monitor(tmp_path, monkeypatch, client_b)
+    age_reverify_window(state_path)
+    monitor_b.poll_once()
+
+    assert client_b.reverify_calls == [TID], "重启后复查登记照常消费"
+    assert reverify_store(state_path)[TID]["count"] == 1
+
+    client_b.mail = [mail_msg(36, kind="result", body=INFRA_BODY)]
+    monitor_b.poll_once()  # 第二次机械失败：count=1 在案 → 续登计复查
+    age_reverify_window(state_path)
+    monitor_b.poll_once()
+    assert len(client_b.reverify_calls) == 2
+    assert reverify_store(state_path)[TID]["count"] == 2
