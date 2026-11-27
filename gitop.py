@@ -676,7 +676,13 @@ def push_fix_branch_resilient(repo: PathLike, iid, remote_url: str,
     against the observed remote tip and retry ONCE with --force-with-lease.
     Anything uncertain re-raises the original PushFailed (blocked + human
     note); a proven-lossy rewrite raises PermanentPushFailed (deterministic,
-    same chain same verdict). Returns "pushed" | "force-pushed".
+    same chain same verdict). Returns "pushed" | "force-pushed" |
+    "behind-remote" — behind-remote means the local tip was strictly behind
+    the remote (a stale ref, zero local-only commits): the remote already
+    contains every local commit and is never touched; the local branch is
+    fast-forwarded to the remote tip as a best-effort self-heal (a
+    worktree-held checkout deterministically degrades to a no-op, same
+    contract as ensure_fix_branch).
     """
     try:
         push_fix_branch(repo, iid, remote_url, ssl_verify)
@@ -692,6 +698,21 @@ def push_fix_branch_resilient(repo: PathLike, iid, remote_url: str,
             _scrub("non-fast-forward but remote tip vanished; refusing "
                    "force push", remote_url)
         )
+    # issue#393 假债形态：本地严格落后＝本地 tip 是远端 tip 的祖先，远端已
+    # 含本地全部提交——不是重写风险。FF 本地到远端 tip 自愈（零独有提交，
+    # 无损；worktree 持有 checkout 时 branch -f 拒绝即降级不动，自愈是优化
+    # 不是前提，同 ensure_fix_branch 契约），远端零接触，返回 behind-remote
+    # 交上游免债免求助。
+    if local_tip != remote_tip and is_ancestor(repo, local_tip, remote_tip):
+        try:
+            point_branch(repo, branch, remote_tip)
+        except GitopError as exc:
+            # 分支被 worktree 持有：同 ensure_fix_branch 降级契约——只降级
+            # 该确定性拒绝形态；其他环境病（ref 锁竞争等）照旧上抛由调用
+            # 方重试，绝不静默吞＋假 journal（ocr 轮2 #2，ag-a5472a 同判）
+            if "cannot force update the branch" not in str(exc).lower():
+                raise
+        return "behind-remote"
     ok, reason = rebase_safe_to_force(repo, branch, remote_tip, local_tip)
     if not ok:
         raise PermanentPushFailed(

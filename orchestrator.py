@@ -2252,12 +2252,25 @@ class Orchestrator:
                         self.repo_path, self.remote_url, gitop.fix_branch(iid),
                         self.ssl_verify)
                     with self._branch_lock(iid):  # P2-10 单写者
-                        gitop.push_fix_branch_resilient(self.repo_path, iid,
-                                                        self.remote_url, self.ssl_verify)
-                    changed_origin = remote_tip != sha
-                    self._journal(f"sweep: issue#{iid} push {gitop.fix_branch(iid)} "
-                                  f"({count} ahead, origin "
-                                  f"{'updated' if changed_origin else 'unchanged'})")
+                        push_result = gitop.push_fix_branch_resilient(
+                            self.repo_path, iid,
+                            self.remote_url, self.ssl_verify)
+                    if push_result == "behind-remote":
+                        # issue#393：本地陈旧落后非债——gitop 已自愈 FF 本地
+                        # （best-effort：分支被 worktree 持有则降级不动），
+                        # 远端未变；禁发「补推」留言（changed_origin 保持
+                        # False）
+                        self._journal(
+                            f"sweep: issue#{iid} local {gitop.fix_branch(iid)} "
+                            f"behind remote (stale ref); self-heal is "
+                            f"best-effort (FF or worktree-held no-op), "
+                            f"no push owed")
+                    else:
+                        changed_origin = remote_tip != sha
+                        self._journal(
+                            f"sweep: issue#{iid} push {gitop.fix_branch(iid)} "
+                            f"({count} ahead, origin "
+                            f"{'updated' if changed_origin else 'unchanged'})")
                 except gitop.PermanentPushFailed as exc:
                     # 确定性失败：投一条求助留言（留言落地才记旗，否则下轮连
                     # 留言一起重试）并把 sha 记入 unsafe_flags，同 sha 不再推

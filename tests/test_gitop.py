@@ -675,6 +675,66 @@ def test_resilient_unsafe_rewrite_failure_is_permanent(repo, remote_url,
     assert "rewrite unsafe" in str(excinfo.value)
 
 
+def test_resilient_push_local_strictly_behind_self_heals(repo, remote_url,
+                                                         bare_remote,
+                                                         monkeypatch):
+    """issue#393 sweep 假债形态：本地 issue/N-fix 严格落后远端（外部交付
+    已推、本地 ref 从未对账）——本地 tip 是远端 tip 的祖先，远端已含本地
+    全部提交，非重写风险。落后推送被 non-FF 拒后不得升级
+    PermanentPushFailed（假「变基丢失远端已推提交」求助），应 FF 本地到
+    远端 tip 自愈（零独有提交，无损）并返回 behind-remote，远端零接触。"""
+    import gitop
+    git("checkout", "-B", fix_branch(7), cwd=repo)
+    commit_file(repo, "fix.py", "fix\n", "fix")
+    push_fix_branch(repo, 7, remote_url)
+    delivered = commit_file(repo, "more.py", "more\n", "delivered")
+    push_fix_branch(repo, 7, remote_url)          # 远端＝交付 tip
+    git("reset", "--hard", "HEAD~1", cwd=repo)    # 本地拨回旧位＝严格落后
+    git("checkout", "--detach", cwd=repo)  # 主仓形态：ref 未被本仓 checkout
+    # （不 detach 则 branch -f 拒绝拨当前分支，测不到自愈路径本身）
+
+    monkeypatch.setattr("gitop._run",
+                        _reject_first_push_run(gitop._run, fix_branch(7)))
+    assert push_fix_branch_resilient(repo, 7, remote_url) == "behind-remote"
+    assert git("rev-parse", fix_branch(7), cwd=repo) == delivered, \
+        "本地应自愈 FF 到远端 tip"
+    assert git("rev-parse", f"refs/heads/{fix_branch(7)}", cwd=bare_remote) \
+        == delivered, "远端零接触"
+
+
+def test_resilient_push_local_behind_heal_failure_not_swallowed(
+        repo, remote_url, bare_remote, monkeypatch):
+    """issue#393 自愈的非确定性失败（如 branch -f 撞 ref 锁）不得静默吞
+    ——同 ensure_fix_branch 契约只降级 worktree 持有的确定性拒绝，其他
+    环境病上抛交调用方重试；静默吞＝假「已自愈」journal＋防抖掩埋（B 册
+    终闸 F1）。"""
+    import gitop
+    git("checkout", "-B", fix_branch(7), cwd=repo)
+    commit_file(repo, "fix.py", "fix\n", "fix")
+    push_fix_branch(repo, 7, remote_url)
+    delivered = commit_file(repo, "more.py", "more\n", "delivered")
+    push_fix_branch(repo, 7, remote_url)
+    git("reset", "--hard", "HEAD~1", cwd=repo)
+    git("checkout", "--detach", cwd=repo)
+
+    def locked_branch(repo_, branch_, to_sha):
+        raise gitop.GitopError(
+            "git branch -f failed: fatal: cannot lock ref "
+            "'refs/heads/issue/7-fix': Unable to create "
+            "'.git/refs/heads/issue/7-fix.lock': File exists")
+
+    monkeypatch.setattr(gitop, "point_branch", locked_branch)
+    monkeypatch.setattr("gitop._run",
+                        _reject_first_push_run(gitop._run, fix_branch(7)))
+    with pytest.raises(gitop.GitopError) as excinfo:
+        push_fix_branch_resilient(repo, 7, remote_url)
+    assert "lock" in str(excinfo.value), "上抛的是真实环境病而非静默吞"
+    assert git("rev-parse", fix_branch(7), cwd=repo) != delivered, \
+        "自愈未发生，本地保持旧位"
+    assert git("rev-parse", f"refs/heads/{fix_branch(7)}", cwd=bare_remote) \
+        == delivered, "远端零接触"
+
+
 def test_push_force_with_lease_argv_shape_and_sha_gate(repo, monkeypatch):
     fake = FakeRun()
     monkeypatch.setattr("gitop._run", fake)
@@ -888,10 +948,15 @@ def test_rebase_safe_to_force_remote_ancestor_is_safe(repo, remote_url,
     assert ok and "ancestor" in reason
 
 
-def test_resilient_push_refuses_when_local_behind(repo, remote_url,
-                                                  bare_remote, monkeypatch):
-    """远端被别处推进（严格领先本地）时，普通 push 的回卷尝试同样带
-    non-FF 标记；rescue 必须以「本地落后」拒绝而非空 range 崩溃（B-F1）。"""
+def test_resilient_push_local_behind_degrades_when_branch_held(
+        repo, remote_url, bare_remote, monkeypatch):
+    """契约演化：issue#38 B-F1——远端被别处推进（严格领先本地）时 rescue
+    不得空 range 崩溃（曾以「本地落后」raise 作护栏）→ issue#393——本地
+    严格落后＝远端已含本地全部提交，非重写风险，重分类 behind-remote 免
+    债免假求助（2026-11-27 TitanNavi 假求助事故实证）。本测试 setup 的
+    repo 自身 checkout 持有 issue/7-fix＝worktree-held 形态：自愈降级不
+    FF、分支保持旧位，与 test_resilient_push_local_strictly_behind_
+    self_heals（ref 未被持有→自愈 FF 到远端 tip）分别锁降级/自愈两形态。"""
     import gitop
     git("checkout", "-B", fix_branch(7), cwd=repo)
     commit_file(repo, "fix.py", "fix\n", "fix")
@@ -907,14 +972,15 @@ def test_resilient_push_refuses_when_local_behind(repo, remote_url,
     git("fetch", "origin", fix_branch(7), cwd=repo)  # 主仓获知远端推进
     new_remote = git("rev-parse", fix_branch(7), cwd=bare_remote)
     assert new_remote != old
+    local_before = git("rev-parse", fix_branch(7), cwd=repo)
 
     monkeypatch.setattr("gitop._run",
                         _reject_first_push_run(gitop._run, fix_branch(7)))
-    with pytest.raises(PushFailed) as excinfo:
-        push_fix_branch_resilient(repo, 7, remote_url)
-    assert "local is behind remote" in str(excinfo.value)
+    assert push_fix_branch_resilient(repo, 7, remote_url) == "behind-remote"
+    assert git("rev-parse", fix_branch(7), cwd=repo) == local_before, \
+        "分支被本仓 checkout 持有：自愈降级不 FF，保持旧位"
     assert git("rev-parse", f"refs/heads/{fix_branch(7)}", cwd=bare_remote) == \
-        new_remote
+        new_remote, "远端零接触"
 
 
 def test_resilient_push_subject_quoting_no_false_refusal(repo, remote_url,

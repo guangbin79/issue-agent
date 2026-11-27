@@ -97,6 +97,7 @@ class Harness:
         # git seams
         self.pushes = []        # iids passed to push_fix_branch_resilient
         self.push_error = None
+        self.push_result = "pushed"  # faked push_fix_branch_resilient return
         self.remote_tips = {}   # {iid: sha, "" = branch absent on origin}
         self.branches = []      # [(iid, sha)] for the for-each-ref seam
         self.counts = {}        # {iid: rev-list count}
@@ -106,7 +107,7 @@ class Harness:
             self.pushes.append(int(iid))
             if self.push_error is not None:
                 raise self.push_error
-            return "pushed"
+            return self.push_result
 
         def fake_remote_tip(repo, remote_url, branch, ssl_verify=True):
             iid = int(branch.removeprefix("issue/").removesuffix("-fix"))
@@ -472,6 +473,30 @@ class TestPermanentPushFailure:
         assert h.pushes == [7], "旗标 sha 不得再推"
         assert len(h.api.posts) == 2, "求助留言不重发，欠账照常补发"
         assert "被丢弃的老回复" in h.api.posts[1][1]
+
+
+# --------------------------------------------------------------------------
+# local strictly behind remote: stale ref is not push debt (issue#393)
+# --------------------------------------------------------------------------
+
+class TestBehindRemoteNoDebt:
+    def test_sweep_local_behind_remote_heals_without_escalation(
+            self, tmp_path, monkeypatch):
+        """issue#393 假债：本地分支陈旧落后远端（交付已推、本地 ref 未对
+        账）。sweep 判债（基线计数>0）后推送返回 behind-remote——远端未变，
+        不得发求助/补推留言，记 swept 防抖照常，journal 如实描述。"""
+        h = Harness(tmp_path, monkeypatch)
+        h.branches = [(7, SHA_A)]
+        h.counts = {7: 2}
+        h.remote_tips = {7: SHA_B}
+        h.push_result = "behind-remote"
+        h.sweep()
+        assert h.pushes == [7]
+        assert h.api.posts == [], "非债：零求助零补推留言"
+        store = h.store()
+        assert store["swept_shas"] == {"7": SHA_A}, "防抖记账照常"
+        assert store["unsafe_flags"] == {}
+        assert h.journal("behind"), "journal 如实描述自愈"
 
 
 # --------------------------------------------------------------------------
