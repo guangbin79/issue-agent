@@ -55,6 +55,7 @@ goal 必须包含：需求分析（要解决什么、为什么）、改动范围
    - ① 知识沉淀——在 env 内执行 `project-compound` 收尾 ingest（非 Trivial 写入/追加 `./docs/agents/knowledge/`，Trivial 走 log-only/不适用豁免），知识文件改动在交付分支上单独提交，提交信息 `docs(issue-agent): <一句话主题>`，trailer `Issue: #{{IID}}`；
    - ② 经验捕获——按 `agent-experience` capture 流程（dedup→gen ID→写 `{id}.md` status: draft→追加 INDEX.md）写全局经验库，project 字段＝从 `git remote get-url origin` 提取的 owner/repo，tags 含 `issue-agent` 与 `issue#{{IID}}`。
 4. 最终报告契约：结束时输出简明中文汇报，含根因、改动文件清单、验证方式；**含断言清单的任务必须逐条给出断言结果（pass/fail＋证据一行）**，且每条断言已落成可执行检查（测试/脚本/浏览器断言）并实际运行——禁只有 build/lint/全量测试的笼统验证。末行附「坑位：<给下轮的提示>」——worker 读码发现的隐含认知（慎动文件、不可信测试、隐藏耦合等）写给下轮；没有则省略整行（不要留空行）。这段报告会原样回评 issue 并进入下轮 Router 上下文。
+5. 冲突消解/分支同步类任务（仅当目标涉及 fix 分支 MR 与集成分支的冲突消解或分支同步）附加硬规则——merge 嫁接法：解冲突只允许构造双亲 merge 提交（父1＝远端 fix 分支 tip、父2＝集成分支 tip），禁 rebase、禁历史重写、禁 cherry-pick 重放；交付提交须为远端目标分支 tip 的后代；推送前必须以 `git merge-base --is-ancestor <远端目标分支 tip> HEAD` 自检通过方可交付。（溯源：ag-7391cb——上轮规格教 cherry-pick 方式引入，worker 照做致 external_branch 交付 non-FF(diverged) 失败。）
 
 ## 安全边界
 

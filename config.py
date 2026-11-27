@@ -84,6 +84,10 @@ class Config:
     # ag-72646a：评论批准白名单（「批准 <裁定id>」面板指令的作者面）；
     # 缺省回落 [gitea_user]（bot 账号即默认批准人）
     approvers: tuple = ()
+    # ag-464a1b：整行命令作者域闸白名单（暂停/恢复/重发汇报/重试/解决
+    # 冲突/重派/取消任务）——issue 提出人之外的追加授权面；缺省空表
+    # （bot 自身 gitea_user 由 fsm 闸一律拒绝，不入缺省）
+    commanders: tuple = ()
 
     @property
     def note_marker(self) -> str:
@@ -161,6 +165,12 @@ def load_config(path: "str | Path | None" = None) -> Config:
         raise ConfigError(
             "config field approvers must be a list of login names, "
             f"got {type(raw['approvers']).__name__}")
+    if raw.get("commanders") is not None \
+            and not isinstance(raw["commanders"], (list, tuple)):
+        # 同 approvers 纪律（ag-464a1b）：裸字符串拆字符即越权命令面
+        raise ConfigError(
+            "config field commanders must be a list of login names, "
+            f"got {type(raw['commanders']).__name__}")
     cfg = Config(
         api_base=str(raw["api_base"]).rstrip("/"),
         pat=str(raw["pat"]),
@@ -214,6 +224,9 @@ def load_config(path: "str | Path | None" = None) -> Config:
                    if "approvers" in raw  # 显式 []＝空表 fail-closed（关闭批准）
                    else ((str(raw["gitea_user"]),)  # 缺省回落 [gitea_user]
                          if raw.get("gitea_user") else ())),
+        # ag-464a1b：缺省空表（不回落 gitea_user——bot 自身由闸一律拒绝）
+        commanders=tuple(str(c) for c in raw.get("commanders", ()) or ()
+                         if str(c)),
     )
     # Canonical-path pin: after all parsing so every pre-existing error
     # contract (missing fields, bad numerics) fires unchanged. Both sides

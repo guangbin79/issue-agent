@@ -187,9 +187,12 @@ def test_list_open_issues_paginates_until_short_page_and_normalizes():
         assert r["query"]["type"] == "issues"  # MUST filter PRs out
         assert r["query"]["limit"] == "50"
         assert r["auth"] == "token dummy-pat"  # Gitea auth header form
-    assert issues[0] == {"number": 1, "title": "t1", "body": "b1", "state": "open"}
-    assert issues[62] == {"number": 63, "title": "t63", "body": "", "state": "open"}
-    assert all(set(i) == {"number", "title", "body", "state"} for i in issues)
+    assert issues[0] == {"number": 1, "title": "t1", "body": "b1", "state": "open",
+                         "user": {"login": "alice"}}
+    assert issues[62] == {"number": 63, "title": "t63", "body": "", "state": "open",
+                          "user": {"login": ""}}  # ag-464a1b: 提出人缺失归空串
+    assert all(set(i) == {"number", "title", "body", "state", "user"}
+               for i in issues)
 
 
 def test_list_issue_comments_normalizes_shape():

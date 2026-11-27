@@ -98,12 +98,14 @@ class GitLabClient:
     Normalized return shapes (the contract consumed by the orchestrator and
     the webhook lane — keep exact):
       list_open_issues(project) ->
-          [{"number": N, "title": str, "body": str, "state": "open"}]
+          [{"number": N, "title": str, "body": str, "state": "open",
+            "user": {"login": str}}]
       list_issue_comments(project, number) ->
           [{"id": M, "body": str, "user": {"login": str}}]
       get_issue_comment(project, comment_id) ->
           {"id": M, "body": str, "user": {"login": str}}
-    with *project* an "owner/repo" string.
+    with *project* an "owner/repo" string. The issue "user" login feeds the
+    fsm command author gate (ag-464a1b) via the polling lane's _note_event.
     """
 
     def __init__(self, api_base: str, pat: str, ssl_verify: bool = False,
@@ -143,8 +145,11 @@ class GitLabClient:
         """
         raw = self._get_all_pages(f"/api/v1/repos/{_repo_path(project)}/issues",
                                   {"state": "open", "type": "issues"})
+        # user.login：issue 提出人（ag-464a1b 作者域闸——轮询路径经
+        # orchestrator._note_event 注入合成事件的 issue.user）
         return [{"number": i.get("number"), "title": i.get("title") or "",
-                 "body": i.get("body") or "", "state": i.get("state") or "open"}
+                 "body": i.get("body") or "", "state": i.get("state") or "open",
+                 "user": {"login": (i.get("user") or {}).get("login") or ""}}
                 for i in raw]
 
     def list_issue_comments(self, project, number, since_iso=None):

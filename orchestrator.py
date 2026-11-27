@@ -239,6 +239,8 @@ class Orchestrator:
                  worktree_path: str = "",
                  machine_id: str = "",
                  approvers: tuple = (),
+                 commanders: tuple = (),
+                 gitea_user: str = "",
                  teardown: Optional[Callable[[], None]] = None,
                  agora_client=None,
                  router=None,
@@ -270,6 +272,11 @@ class Orchestrator:
         # every posted note; service_name namespaces evidence dirs.
         self.note_marker = note_marker or _DEFAULT_NOTE_MARKER
         self._fsm_markers = (self.note_marker,)
+        # ag-464a1b 作者域闸注入面：整行命令白名单追加（config.commanders，
+        # issue 提出人为缺省白名单）＋bot 自身身份（config.gitea_user——
+        # 一律拒发命令）——随每一次 fsm.decide 注入。
+        self._commanders = tuple(c for c in (commanders or ()) if c)
+        self._gitea_user = gitea_user or ""
         self.service_name = service_name
         self.verify_command = verify_command or DEFAULT_VERIFY_COMMAND
         self.reconcile_interval = reconcile_interval
@@ -700,7 +707,10 @@ class Orchestrator:
         """One webhook-shaped event -> fsm decision -> side effects."""
         with self._ledger_lock:
             ledger = state.load_state(self.state_path, warn=self._journal)
-            decision = fsm.decide(event, ledger["issues"], markers=self._fsm_markers)
+            decision = fsm.decide(event, ledger["issues"],
+                                  markers=self._fsm_markers,
+                                  commanders=self._commanders,
+                                  bot_user=self._gitea_user)
             action, iid = decision["action"], decision["iid"]
             if action == "ignore":
                 self._journal(f"event ignored: {decision['reason']} (iid={iid})")
@@ -2640,6 +2650,12 @@ class Orchestrator:
         #     他机持有标记；只对账，绝不发认领评论。
         self._reconcile_ownership(open_notes, open_issues)
 
+        # ag-464a1b：issue 提出人面（list_open_issues 投影）——喂给合成
+        # 事件的 issue.user，供 fsm 整行命令作者域闸作缺省白名单。
+        issue_authors = {
+            int(i["number"]): (i.get("user") or {}).get("login") or ""
+            for i in open_issues if i.get("number") is not None}
+
         # 4. feed every note through the SAME fsm + per-note-id path; issues
         #    with a live claim are skipped entirely (their owner will finish)
         #    协议 v2：yielded（他机持有）与 candidate（裁决窗内）不重放——
@@ -2664,8 +2680,11 @@ class Orchestrator:
                 if fresh:
                     feedable[iid] = fresh
         for iid, notes in feedable.items():
+            # ag-464a1b：轮询合成事件注入 issue 提出人（作者域闸的缺省
+            # 白名单面）；number 缺席的脏行按未知提出人处理（fail-closed）。
+            author = issue_authors.get(int(iid), "")
             for note in notes:
-                self._handle_event(self._note_event(iid, note))
+                self._handle_event(self._note_event(iid, note, author))
 
         # 5. advisory-1 set-difference close: active/paused/defer/pending but
         #    no longer in the open set -> done
@@ -2957,12 +2976,19 @@ class Orchestrator:
         return issues, open_notes
 
     @staticmethod
-    def _note_event(iid, comment):
-        """API comment -> the exact Gitea issue_comment shape the fsm expects."""
+    def _note_event(iid, comment, issue_author=""):
+        """API comment -> the exact Gitea issue_comment shape the fsm expects.
+
+        issue_author（ag-464a1b 作者域闸）：轮询路径合成事件须补 issue
+        提出人（webhook 原生载荷自带 issue.user；此处由 list_open_issues
+        投影的 user.login 提供）——缺省空串＝提出人未知，闸收窄为
+        commanders（fail-closed）。
+        """
         user = comment.get("user") or {}
         return {
             "action": "created",
-            "issue": {"number": iid, "state": "open"},
+            "issue": {"number": iid, "state": "open",
+                      "user": {"login": issue_author}},
             "comment": {
                 "id": comment.get("id"),
                 "body": comment.get("body") or "",

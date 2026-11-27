@@ -60,10 +60,12 @@ def issue_open_event(iid=11, title="构建失败", body="master 上跑不过测�
 
 
 def comment_event(iid=11, body="请尽快修复", comment_id=101, issue_state="open"):
+    # ag-464a1b：issue.user＝提出人，与评论者同 login——命令驱动用例走
+    # 作者域闸正象限（提出人触发）
     return {
         "action": "created",
         "issue": {"number": iid, "title": "构建失败", "body": "master 上跑不过测试",
-                  "state": issue_state},
+                  "state": issue_state, "user": {"login": "someone"}},
         "comment": {"id": comment_id, "body": body, "user": {"login": "someone"}},
         "sender": {"login": "someone"},
     }
@@ -990,6 +992,41 @@ def test_pause_unpause_command_notes(harness):
     total = len(harness.runner.new_calls) + len(harness.runner.cont_calls)
     assert total == 1, "unpause itself runs no turn"
     assert 104 in harness.entry(11)["processed_note_ids"]
+
+
+# --------------------------------------------------------------------------
+# 12.5 作者域闸轮询通道（ag-464a1b）：reconcile 合成事件注入 issue 提出人
+# --------------------------------------------------------------------------
+
+def test_reconcile_command_gate_injects_issue_author(tmp_path, monkeypatch):
+    """正例：list_open_issues 投影携带提出人 user.login → 其整行命令
+    （经 _note_event 合成事件）照常触发 pause。"""
+    harness = Harness(tmp_path, monkeypatch, start=False)
+    seed_active(harness, iid=11)
+    harness.api.issue_records[11] = {"user": {"login": "someone"}}
+    harness.api.issues = {11: [api_comment(551, "暂停")]}
+    harness.orch.reconcile()
+    try:
+        assert harness.entry(11)["status"] == "paused", "提出人命令经轮询通道触发"
+        assert 551 in harness.entry(11)["processed_note_ids"], "命令评论被消费"
+        assert not harness.journal("non-commander"), harness.journal("non-commander")
+    finally:
+        harness.orch.stop()
+
+
+def test_reconcile_command_gate_unknown_author_fails_closed(tmp_path, monkeypatch):
+    """负例：投影无提出人（issue.user 缺席）→ 白名单收窄为 commanders
+    （空）→ 命令 ignore 且 journal 留痕 non-commander，不落账不消费。"""
+    harness = Harness(tmp_path, monkeypatch, start=False)
+    seed_active(harness, iid=11)
+    harness.api.issues = {11: [api_comment(552, "暂停")]}
+    harness.orch.reconcile()
+    try:
+        assert harness.entry(11)["status"] == "active", "未知提出人命令被闸忽略"
+        assert 552 not in harness.entry(11)["processed_note_ids"], "未消费"
+        assert harness.journal("non-commander"), "journal 留痕含 non-commander"
+    finally:
+        harness.orch.stop()
 
 
 def test_untracked_close_and_reopen_tolerated(harness):

@@ -70,6 +70,8 @@ def test_daemon_passes_default_branch_to_orchestrator(tmp_path, monkeypatch):
     assert captured["worktree_path"] == "", "legacy default: no worktree"
     assert captured["review_enabled"] is True, "task 8: review config threaded"
     assert captured["review_timeout"] == 3600
+    assert captured["commanders"] == (), "ag-464a1b: 缺省空表线程入闸面"
+    assert captured["gitea_user"] == "", "ag-464a1b: bot 自身身份线程入闸面"
 
 
 def test_daemon_passes_worktree_path_to_orchestrator(tmp_path, monkeypatch):

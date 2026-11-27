@@ -15,7 +15,7 @@ noteable_type / system flag — those were GitLab.
                             "issue": {"number", "title", "body", "state"},
                             "sender": {"login"}}
     issue_comment payload: {"action": "created"|"edited",
-                            "issue": {"number", "state", ...},
+                            "issue": {"number", "state", "user": {"login"}},
                             "comment": {"id", "body", "user": {"login"}},
                             "sender": {"login"}}
 
@@ -84,6 +84,16 @@ Rules (in evaluation order)
     重派 -> "redispatch"; 取消任务 / 取消 -> "cancel_task"; 批准 <8 位小写
     hex> -> "approve" (ag-72646a). Containment
     ("这个暂停逻辑有 bug") must NOT trigger.
+    Command author gate (ag-464a1b): after a whole-line command hits, the
+    comment author (comment.user.login) must be the issue author
+    (issue.user.login — the default whitelist, carried by the payload;
+    the polling lane injects it via the orchestrator's _note_event) or a
+    member of the injected commanders set (config.commanders, default
+    empty); the local bot login (bot_user = gitea_user) is ALWAYS rejected;
+    non-whitelist -> ignore with reason containing "non-commander" (the
+    orchestrator's ignore path journals it). "approve" is exempt — its
+    author domain stays with the approval executor's approvers whitelist
+    (ag-72646a, unchanged).
     General rule: ledger status paused -> ignore; adopted -> "new";
     anything else -> "continue".
 
@@ -157,11 +167,15 @@ def triage(entry, fresh_note_ids):
     return DORMANT  # paused / blocked / done：永不自动唤醒
 
 
-def decide(event, ledger, markers=None):
+def decide(event, ledger, markers=None, commanders=None, bot_user=""):
     """Map one webhook payload + ledger view to a decision dict. Pure.
 
     *markers* (optional iterable of strings) adds instance-specific agent
     note markers to the universal _AGENT_MARKERS filter set.
+    *commanders* (optional iterable of login strings) extends the
+    whole-line command author gate (the issue author is the default
+    whitelist); *bot_user* (the local gitea_user login) is always rejected
+    by the gate — the bot itself is never a commander (ag-464a1b).
     """
     if not isinstance(event, dict):
         return _ignore()
@@ -174,7 +188,8 @@ def decide(event, ledger, markers=None):
     if isinstance(iid, bool) or not isinstance(iid, int):
         return _ignore("malformed issue number")
     if "comment" in event:
-        return _decide_comment(event, ledger, _effective_markers(markers))
+        return _decide_comment(event, ledger, _effective_markers(markers),
+                               _effective_commanders(commanders), bot_user)
     return _decide_issue(event, ledger)
 
 
@@ -182,6 +197,18 @@ def _effective_markers(markers):
     """Universal emoji markers + the injected instance markers (deduped)."""
     extra = tuple(m for m in (markers or ()) if m)
     return tuple(dict.fromkeys(_AGENT_MARKERS + extra))
+
+
+def _effective_commanders(commanders):
+    """Commander logins as a frozenset; non-str/empty entries dropped."""
+    return frozenset(c for c in (commanders or ())
+                     if isinstance(c, str) and c)
+
+
+def _login(block):
+    """user block -> login str ("" on missing/garbage); never raises."""
+    login = block.get("login") if isinstance(block, dict) else None
+    return login if isinstance(login, str) else ""
 
 
 def _decide_issue(event, ledger):
@@ -205,7 +232,7 @@ def _decide_issue(event, ledger):
     return _ignore("unsupported issue action: %r" % (action,), iid)
 
 
-def _decide_comment(event, ledger, agent_markers):
+def _decide_comment(event, ledger, agent_markers, commanders, bot_user):
     comment = event.get("comment")
     issue = event.get("issue")
     if not isinstance(comment, dict) or not isinstance(issue, dict):
@@ -232,6 +259,12 @@ def _decide_comment(event, ledger, agent_markers):
         return _ignore("duplicate comment delivery", iid)
     command = _command(body)
     if command:
+        # ag-464a1b 作者域闸：approve 豁免（其作者域由 approval 执行器
+        # approvers 白名单既有机制把守），其余整行命令过闸。
+        if command != "approve" and not _commander_ok(
+                comment, issue, commanders, bot_user):
+            return _ignore("non-commander: %r" % (_login(comment.get("user")),),
+                           iid)
         return {"action": command, "iid": iid, "reason": "%s command" % command}
     status = entry.get("status")
     if status == "paused":
@@ -239,6 +272,22 @@ def _decide_comment(event, ledger, agent_markers):
     if status == "adopted":
         return {"action": "new", "iid": iid, "reason": "adopted issue woken by comment"}
     return {"action": "continue", "iid": iid, "reason": "new comment"}
+
+
+def _commander_ok(comment, issue, commanders, bot_user):
+    """整行命令作者域闸判定（ag-464a1b）。
+
+    允许＝issue 提出人（缺省白名单，issue.user.login）＋commanders 成员；
+    bot 自身（bot_user＝本机 gitea_user）一律拒绝；载荷缺提出人时白名单
+    收窄为 commanders（fail-closed）。垃圾载荷按空 login 处理（空 login
+    永不入白名单）。纯函数，永不抛。
+    """
+    author = _login(comment.get("user"))
+    if bot_user and author == bot_user:
+        return False
+    if author and author == _login(issue.get("user")):
+        return True
+    return author in commanders
 
 
 def _command(body):

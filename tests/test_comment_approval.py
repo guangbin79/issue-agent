@@ -400,3 +400,25 @@ def test_config_approvers_default_and_explicit(tmp_path, monkeypatch):
         config.load_config(write_config(tmp_path, approvers="alice"))
     with pytest.raises(config.ConfigError, match="approvers"):
         config.load_config(write_config(tmp_path, approvers=True))
+
+
+# --- config：commanders 缺省空表／显式列表（ag-464a1b 作者域闸） --------------
+
+
+def test_config_commanders_default_and_explicit(tmp_path, monkeypatch):
+    for var in ("ISSUE_AGENT_CONFIG", "AGORA_HOME", "ISSUE_AGENT_SSL_VERIFY"):
+        monkeypatch.delenv(var, raising=False)
+    cfg = config.load_config(write_config(tmp_path, gitea_user="bot1"))
+    assert cfg.commanders == (), "缺省空表（不回落 gitea_user——bot 由闸一律拒绝）"
+    cfg = config.load_config(write_config(
+        tmp_path, gitea_user="bot1", commanders=["alice", "bob"]))
+    assert cfg.commanders == ("alice", "bob")
+    cfg = config.load_config(write_config(tmp_path, commanders=[]))
+    assert cfg.commanders == (), "显式空表照常空"
+    cfg = config.load_config(write_config(
+        tmp_path, commanders=["alice", "", "bob"]))
+    assert cfg.commanders == ("alice", "bob"), "空串条目不入白名单"
+    with pytest.raises(config.ConfigError, match="commanders"):
+        config.load_config(write_config(tmp_path, commanders="alice"))
+    with pytest.raises(config.ConfigError, match="commanders"):
+        config.load_config(write_config(tmp_path, commanders=True))

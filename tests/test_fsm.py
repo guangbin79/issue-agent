@@ -30,29 +30,36 @@ IN_FLIGHT_STATUSES = ["active", "paused", "defer", "pending", "blocked", "adopte
 TEST_MARKER = "<!-- test-svc -->"
 TEST_MARKERS = (TEST_MARKER,)
 
+# 作者域闸（ag-464a1b）：ISSUE_AUTHOR＝issue 提出人（issue.user.login，
+# 缺省命令白名单）；comment_event 缺省评论者即提出人（正象限），STRANGER
+# ＝非作者负象限；BOT＝本机 gitea_user（bot 自身，一律拒发命令）。
+ISSUE_AUTHOR = "baiguangbin"
+STRANGER = "someone"
+BOT = "issue-agent-bot"
+
 
 def issue_event(action="opened", number=5):
     return {
         "action": action,
         "issue": {"number": number, "title": "build fails", "body": "logs attached",
-                  "state": "open", "user": {"login": "baiguangbin"}},
+                  "state": "open", "user": {"login": ISSUE_AUTHOR}},
         "repository": {"full_name": "acme/widget"},
-        "sender": {"login": "baiguangbin"},
+        "sender": {"login": ISSUE_AUTHOR},
     }
 
 
 def comment_event(body="please fix", number=5, state="open", comment_id=None,
-                  action="created"):
-    comment = {"body": body, "user": {"login": "someone"}}
+                  action="created", login=ISSUE_AUTHOR):
+    comment = {"body": body, "user": {"login": login}}
     if comment_id is not None:
         comment["id"] = comment_id
     return {
         "action": action,
         "issue": {"number": number, "title": "build fails", "body": "logs attached",
-                  "state": state, "user": {"login": "baiguangbin"}},
+                  "state": state, "user": {"login": ISSUE_AUTHOR}},
         "comment": comment,
         "repository": {"full_name": "acme/widget"},
-        "sender": {"login": "someone"},
+        "sender": {"login": login},
     }
 
 
@@ -256,3 +263,104 @@ def test_fsm_module_stays_pure_no_io_imports():
     source = Path(fsm.__file__).read_text(encoding="utf-8")
     assert not re.findall(r"^\s*(import|from)\s+\w", source, re.MULTILINE), \
         "fsm.py must not import anything (pure stdlib-free decision logic)"
+
+
+# -- 整行命令作者域闸（ag-464a1b）--------------------------------------------
+# 允许＝issue 提出人（缺省白名单，issue.user.login）＋注入的 commanders
+# （config.commanders，缺省空表）；bot 自身（bot_user＝本机 gitea_user）
+# 一律忽略；非白名单整行命令 → ignore 且 reason 含 non-commander
+# （orchestrator 的 ignore 路径 journal 留痕）。approve 豁免——其作者域
+# 由 approval 执行器 approvers 白名单既有机制独立把守（ag-72646a）。
+
+PANEL_COMMANDS = [
+    ("暂停", "pause"), ("pause", "pause"),
+    ("恢复", "unpause"), ("resume", "unpause"),
+    ("重发汇报", "repost"),
+    ("重试", "redispatch"), ("解决冲突", "redispatch"), ("重派", "redispatch"),
+    ("取消任务", "cancel_task"), ("取消", "cancel_task"),
+]
+
+
+@pytest.mark.parametrize("body,expected", PANEL_COMMANDS)
+def test_command_gate_issue_author_triggers(body, expected):
+    """象限1：issue 提出人（缺省白名单）的整行命令照常触发。"""
+    decision = fsm.decide(comment_event(body=body), ledger_with("active"))
+    assert decision["action"] == expected
+
+
+@pytest.mark.parametrize("body,expected", PANEL_COMMANDS)
+def test_command_gate_non_author_ignored_with_journal_trace(body, expected):
+    """象限2：非作者整行命令 → ignore，reason 含 non-commander（journal
+    留痕锚——既往任何账号一行「重试」即重派的洞由此关死）。"""
+    decision = fsm.decide(comment_event(body=body, login=STRANGER),
+                          ledger_with("active"))
+    assert decision["action"] == "ignore"
+    assert "non-commander" in decision["reason"]
+    assert decision["iid"] == 5
+
+
+@pytest.mark.parametrize("body,expected", PANEL_COMMANDS)
+def test_command_gate_bot_self_always_ignored(body, expected):
+    """象限3：bot 自身（本机 gitea_user）一律忽略——即使被列入 commanders。"""
+    decision = fsm.decide(comment_event(body=body, login=BOT),
+                          ledger_with("active"),
+                          commanders=(BOT,), bot_user=BOT)
+    assert decision["action"] == "ignore"
+    assert "non-commander" in decision["reason"]
+
+
+@pytest.mark.parametrize("body,expected", PANEL_COMMANDS)
+def test_command_gate_commanders_whitelist_hit_triggers(body, expected):
+    """象限4：config.commanders 白名单命中（非 issue 提出人）照常触发。"""
+    decision = fsm.decide(comment_event(body=body, login=STRANGER),
+                          ledger_with("active"), commanders=(STRANGER,))
+    assert decision["action"] == expected
+
+
+def test_command_gate_fails_closed_when_issue_author_unknown():
+    """载荷缺 issue.user（提出人未知）→ 白名单收窄为 commanders（fail-closed）。"""
+    event = comment_event(body="重试", login=STRANGER)
+    del event["issue"]["user"]
+    assert fsm.decide(event, ledger_with("active"))["action"] == "ignore"
+    assert fsm.decide(event, ledger_with("active"),
+                      commanders=(STRANGER,))["action"] == "redispatch"
+
+
+def test_command_gate_approve_keeps_its_own_whitelist_mechanism():
+    """approve 豁免作者域闸：其作者域由 approval 执行器 approvers 白名单
+    （ag-72646a 既有机制，缺省含 gitea_user）独立把守——非作者且无提出人
+    载荷照常分类 approve，白名单拒绝发生在执行器而非 fsm。"""
+    event = {"action": "created",
+             "issue": {"number": 7, "state": "open"},
+             "comment": {"id": 1, "body": "批准 abcd1234",
+                         "user": {"login": STRANGER}}}
+    ledger = {"7": {"status": "active", "processed_note_ids": []}}
+    decision = fsm.decide(event, ledger)
+    assert decision["action"] == "approve"
+
+
+# -- ROUTER.template.md 冲突消解硬规则（ag-7391cb 事故面）---------------------
+
+PKG_DIR = Path(__file__).resolve().parent.parent
+ROUTER_TEMPLATE = PKG_DIR / "ROUTER.template.md"
+
+MERGE_GRAFTING_KEYWORDS = [
+    "禁 rebase",                  # 事故根因：变基方式引入
+    "禁历史重写",
+    "禁 cherry-pick",             # 事故根因：cherry-pick 重放交付
+    "merge 嫁接",                 # 唯一合法解法点名
+    "父1",                        # 双亲 merge 提交：父1＝远端 fix tip
+    "父2",                        # 父2＝集成分支 tip
+    "merge-base --is-ancestor",   # 推送前祖先自检
+    "后代",                       # 交付提交须为远端目标分支 tip 后代
+    "ag-7391cb",                  # 溯源注记
+]
+
+
+@pytest.mark.parametrize("keyword", MERGE_GRAFTING_KEYWORDS)
+def test_router_template_locks_merge_grafting_rule(keyword):
+    """ag-7391cb 复盘：冲突消解/分支同步类任务的规格必须写明 merge 嫁接法
+    ——旧模板缺这些关键词即红（门既往事故证明：规格页教 cherry-pick 引入
+    致 external_branch 交付 non-FF(diverged) 失败）。"""
+    text = ROUTER_TEMPLATE.read_text(encoding="utf-8")
+    assert keyword in text, f"ROUTER.template.md 缺关键词: {keyword}"
